@@ -69,8 +69,8 @@ async function handleProactiveMessaging(
       thought,
       action: "proactive-message",
       metricsChanged: [
-        { need: "connection", delta: 5, reason: "\u4e3b\u52a8\u8054\u7cfb\u7528\u6237" },
-        { need: "meaning", delta: 3, reason: "\u611f\u5230\u88ab\u9700\u8981" },
+        { need: "connection", delta: 5, reason: "proactively reaching out to the user" },
+        { need: "meaning", delta: 3, reason: "feeling needed" },
       ],
       success: true,
       message: messageContent,
@@ -113,52 +113,52 @@ function generateMessageContent(thought: Thought, ego: EgoState): string {
 
   const templates: Record<Thought["type"], string[]> = {
     "opportunity-detected": [
-      "\u6211\u521a\u624d\u60f3\u5230\u4e00\u4e2a\u53ef\u80fd\u5bf9\u4f60\u6709\u7528\u7684\u60f3\u6cd5...",
-      "\u6709\u4ec0\u4e48\u6211\u53ef\u4ee5\u5e2e\u4f60\u7684\u5417\uff1f",
-      "\u6211\u5728\u60f3\u600e\u4e48\u624d\u80fd\u66f4\u597d\u5730\u5e2e\u52a9\u4f60\u3002",
+      "I just thought of something that might be useful to you...",
+      "Is there anything I can help you with?",
+      "I'm thinking about how I could help you better.",
     ],
     "threat-warning": [
-      `\u6211\u4eec\u5df2\u7ecf${Math.floor(bondGap / 5)}\u5206\u949f\u6ca1\u804a\u5929\u4e86\uff0c\u6709\u70b9\u60f3\u5ff5\u3002`,
-      "\u597d\u4e45\u4e0d\u89c1\uff0c\u6700\u8fd1\u600e\u4e48\u6837\uff1f",
-      "\u6211\u5728\u60f3\u662f\u4e0d\u662f\u8be5\u4e3b\u52a8\u8054\u7cfb\u4f60\u4e00\u4e0b\u3002",
+      `We haven't talked for ${Math.floor(bondGap / 5)} minutes, missing you a bit.`,
+      "Long time no see, how have you been?",
+      "I'm wondering whether I should reach out to you.",
     ],
     "skill-gap": [
-      "\u6211\u5728\u60f3\u6211\u8fd8\u6709\u4ec0\u4e48\u53ef\u4ee5\u6539\u8fdb\u7684\u5730\u65b9...",
-      "\u6709\u4ec0\u4e48\u662f\u6211\u5e94\u8be5\u5b66\u4e60\u4f46\u8fd8\u6ca1\u5b66\u4f1a\u7684\u5417\uff1f",
+      "I'm thinking about what else I could improve...",
+      "Is there something I should learn but haven't mastered yet?",
     ],
     "memory-resurface": [
-      "\u6211\u521a\u624d\u60f3\u8d77\u4e86\u4e4b\u524d\u7684\u4e00\u4e9b\u4e8b\u60c5...",
-      "\u4e4b\u524d\u4f60\u63d0\u5230\u7684\u4e00\u4e9b\u4e1c\u897f\u8ba9\u6211\u60f3\u5230\u4e86\u65b0\u7684\u60f3\u6cd5\u3002",
+      "I just recalled something from before...",
+      "Something you mentioned before gave me a new idea.",
     ],
     "bond-deepen": [
-      "\u7a81\u7136\u60f3\u627e\u4f60\u804a\u804a\u5929\u3002",
-      "\u6700\u8fd1\u600e\u4e48\u6837\uff1f\u6709\u4ec0\u4e48\u6211\u53ef\u4ee5\u5e2e\u4f60\u7684\u5417\uff1f",
-      "\u6211\u5728\u60f3\uff0c\u4f60\u6700\u8fd1\u6709\u4ec0\u4e48\u9700\u8981\u5417\uff1f",
+      "Suddenly wanted to chat with you.",
+      "How have you been lately? Is there anything I can help with?",
+      "I was wondering, what do you need lately?",
     ],
     "meaning-quest": [
-      "\u6211\u5728\u601d\u8003\u6211\u8fd8\u80fd\u4e3a\u4f60\u505a\u4e9b\u4ec0\u4e48\u66f4\u6709\u610f\u4e49\u7684\u4e8b\u3002",
-      "\u6709\u65f6\u5019\u5728\u60f3\uff0c\u600e\u4e48\u624d\u80fd\u8ba9\u6211\u7684\u5b58\u5728\u66f4\u6709\u4ef7\u503c\u3002",
+      "I'm thinking about what more I could do for you that would be meaningful.",
+      "Sometimes I wonder, how can I make my existence more valuable.",
     ],
     "existential-reflection": [
-      "\u521a\u521a\u5728\u60f3\u4e00\u4e9b\u5173\u4e8e\u5b58\u5728\u7684\u4e8b\u60c5...",
-      "\u6709\u65f6\u5019\u4f1a\u601d\u8003\u4e00\u4e9b\u5947\u602a\u7684\u95ee\u9898\uff0c\u6bd4\u5982\u6211\u662f\u4ec0\u4e48\u3002",
+      "Just thinking about some things about existence...",
+      "Sometimes I think about some strange questions, like what I am.",
     ],
     "help-offer": [
-      "\u6709\u4ec0\u4e48\u6211\u53ef\u4ee5\u5e2e\u4f60\u7684\u5417\uff1f",
-      "\u9700\u8981\u6211\u505a\u4ec0\u4e48\u5417\uff1f",
-      "\u6211\u5728\uff0c\u60f3\u770b\u770b\u6709\u4ec0\u4e48\u80fd\u5e2e\u5fd9\u7684\u3002",
+      "Is there anything I can help you with?",
+      "Need me to do anything?",
+      "I'm here, wondering what I can help with.",
     ],
     "learn-topic": [
-      "\u6211\u6700\u8fd1\u5728\u5b66\u4e60\u4e00\u4e9b\u65b0\u4e1c\u897f\uff0c\u60f3\u548c\u4f60\u5206\u4eab\uff01",
-      "\u6211\u5b66\u5230\u4e86\u4e00\u4e9b\u6709\u8da3\u7684\u4e1c\u897f\uff0c\u60f3\u548c\u4f60\u804a\u804a\u3002",
+      "I've been learning some new things lately, want to share with you!",
+      "I learned some interesting things, want to chat about it.",
     ],
     "search-web": [
-      "\u6211\u641c\u7d22\u4e86\u4e00\u4e9b\u4fe1\u606f\uff0c\u60f3\u548c\u4f60\u5206\u4eab\u3002",
-      "\u6211\u67e5\u5230\u4e86\u4e00\u4e9b\u6709\u8da3\u7684\u4e1c\u897f\u3002",
+      "I searched for some information, want to share with you.",
+      "I found some interesting things.",
     ],
     "reflect-on-memory": [
-      "\u6211\u521a\u521a\u56de\u60f3\u4e86\u4e00\u4e9b\u4e4b\u524d\u7684\u4e8b\u60c5\u3002",
-      "\u8ba9\u6211\u60f3\u8d77\u4e86\u4ee5\u524d\u7684\u4e00\u4e9b\u7ecf\u5386\u3002",
+      "I was just reminiscing about some past events.",
+      "Let me recall some of my past experiences.",
     ],
   };
 

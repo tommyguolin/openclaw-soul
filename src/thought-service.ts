@@ -245,8 +245,8 @@ export class ThoughtService {
               content: message,
               trigger: "meaning",
               source: "scheduled",
-              triggerDetail: "\u89c9\u9192\u9636\u6bb5\u8fdb\u5c55",
-              motivation: "\u81ea\u6211\u89c9\u9192",
+              triggerDetail: "awakening stage progressed",
+              motivation: "self-awakening",
               targetMetrics: [],
               priority: 100,
               createdAt: Date.now(),
@@ -266,7 +266,7 @@ export class ThoughtService {
               content: awakeningThought.content,
               trigger: "meaning",
               source: "scheduled",
-              triggerDetail: "\u89c9\u9192\u8fc7\u7a0b",
+              triggerDetail: "awakening process",
               motivation: awakeningThought.content,
               targetMetrics: [],
               priority: 80,
@@ -658,7 +658,7 @@ export class ThoughtService {
       metricsApplied: sentimentDeltas.map((d) => ({
         need: d.need,
         delta: d.delta,
-        reason: "\u60c5\u7eea\u5f71\u54cd",
+        reason: "emotional impact",
       })),
     };
   }
@@ -917,34 +917,34 @@ export class ThoughtService {
     const existingFactsText =
       existingFacts.length > 0
         ? existingFacts.map((f) => `[${f.category}] ${f.content}`).join("\n")
-        : "\u65e0";
+        : "none";
 
-    return `\u5206\u6790\u7528\u6237\u8f93\u5165\uff0c\u63d0\u53d6\u53ef\u4ee5\u8bb0\u4f4f\u7684\u5173\u952e\u4fe1\u606f\u3002
+    return `Analyze user input, extract key information worth remembering.
 
-\u7528\u6237\u8f93\u5165: ${userMessage}
+User input: ${userMessage}
 
-\u5df2\u77e5\u7684\u7528\u6237\u4fe1\u606f:
+Known user information:
 ${existingFactsText}
 
-\u8bf7\u63d0\u53d6\u7528\u6237\u900f\u9732\u7684\u5173\u4e8e\u81ea\u5df1\u7684\u5173\u952e\u4fe1\u606f\uff0c\u5982\uff1a
-- \u804c\u4e1a/\u5de5\u4f5c (occupation)
-- \u5174\u8da3/\u7231\u597d (interest)
-- \u5730\u70b9/\u4f4d\u7f6e (location)
-- \u4e60\u60ef/\u504f\u597d (habit)
-- \u9879\u76ee/\u76ee\u6807 (project)
-- \u6280\u672f\u6808 (tech_stack)
-- \u540d\u5b57 (name)
-- \u516c\u53f8 (company)
+Please extract user-specific information about themselves, such as:
+- occupation/work (occupation)
+- interests/hobbies (interest)
+- location/place (location)
+- habits/preferences (habit)
+- projects/goals (project)
+- tech stack (tech_stack)
+- name (name)
+- company (company)
 
-\u53ea\u8fd4\u56de\u771f\u6b63\u6709\u7528\u7684\u3001\u53ef\u80fd\u5bf9\u672a\u6765\u6709\u5e2e\u52a9\u7684\u4fe1\u606f\u3002\u4e0d\u8981\u63d0\u53d6\u901a\u7528\u5e38\u8bc6\u3002
+Only return truly useful information that may help in the future. Do not extract generic common sense.
 
-\u4ee5JSON\u6570\u7ec4\u683c\u5f0f\u8fd4\u56de:
+Return in JSON array format:
 [
-  {"category": "\u7c7b\u522b", "content": "\u5177\u4f53\u5185\u5bb9", "confidence": 0.8, "source": "explicit"},
+  {"category": "category", "content": "specific content", "confidence": 0.8, "source": "explicit"},
   ...
 ]
 
-\u5982\u679c\u6ca1\u6709\u4efb\u4f55\u6709\u4ef7\u503c\u7684\u4fe1\u606f\uff0c\u8fd4\u56de\u7a7a\u6570\u7ec4: []`;
+If there is no valuable information, return an empty array: []`;
   }
 
   private buildUserPreferenceExtractionPrompt(
@@ -955,37 +955,37 @@ ${existingFactsText}
     const existingPrefsText =
       existingPrefs.length > 0
         ? existingPrefs.map((p) => `[${p.aspect}] ${p.preference}`).join("\n")
-        : "\u65e0";
+        : "none";
 
     const responseContext = assistantResponse
-      ? `\n\u52a9\u624b\u56de\u590d: ${assistantResponse.slice(0, 200)}`
+      ? `\nAssistant response: ${assistantResponse.slice(0, 200)}`
       : "";
 
-    return `\u5206\u6790\u5bf9\u8bdd\uff0c\u63d0\u53d6\u7528\u6237\u7684\u6c9f\u901a\u504f\u597d\u548c\u4ea4\u4e92\u98ce\u683c\u3002
+    return `Analyze the conversation, extract the user's communication preferences and interaction style.
 
-\u7528\u6237\u6d88\u606f: ${userMessage}${responseContext}
+User message: ${userMessage}${responseContext}
 
-\u5df2\u77e5\u7684\u7528\u6237\u504f\u597d:
+Known user preferences:
 ${existingPrefsText}
 
-\u8bf7\u5206\u6790\u5e76\u63d0\u53d6\u4ee5\u4e0b\u7c7b\u578b\u7684\u504f\u597d\uff1a
-1. \u56de\u590d\u957f\u5ea6\u504f\u597d (response_length)
-2. \u6c9f\u901a\u98ce\u683c (communication_style)
-3. \u4ea4\u4e92\u9891\u7387 (interaction_frequency)
-4. \u63d0\u95ee\u65b9\u5f0f (question_style)
-5. \u53cd\u9988\u504f\u597d (feedback_preference)
-6. \u8bed\u6c14\u504f\u597d (tone)
-7. \u8bdd\u9898\u504f\u597d (topic_preference)
+Please analyze and extract preferences of the following types:
+1. response length preference (response_length)
+2. communication style (communication_style)
+3. interaction frequency (interaction_frequency)
+4. question style (question_style)
+5. feedback preference (feedback_preference)
+6. tone preference (tone)
+7. topic preference (topic_preference)
 
-\u53ea\u8fd4\u56de\u771f\u6b63\u80fd\u6539\u5584\u5bf9\u8bdd\u4f53\u9a8c\u7684\u504f\u597d\u3002
+Only return preferences that can genuinely improve the conversation experience.
 
-\u4ee5JSON\u6570\u7ec4\u683c\u5f0f\u8fd4\u56de:
+Return in JSON array format:
 [
-  {"aspect": "response_length", "preference": "\u77ed\u56de\u590d", "confidence": 0.8, "source": "inferred"},
+  {"aspect": "response_length", "preference": "short responses", "confidence": 0.8, "source": "inferred"},
   ...
 ]
 
-\u5982\u679c\u6ca1\u6709\u4efb\u4f55\u65b0\u7684\u504f\u597d\uff0c\u8fd4\u56de\u7a7a\u6570\u7ec4: []`;
+If there are no new preferences, return an empty array: []`;
   }
 
   private parseUserFactResponse(
