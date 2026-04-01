@@ -139,8 +139,8 @@ async function executeSendMessage(
     return {
       result: { type: "send-message", success: true, result: messageContent },
       metricsChanged: [
-        { need: "connection", delta: 8, reason: "\u4e3b\u52a8\u8054\u7cfb\u7528\u6237" },
-        { need: "meaning", delta: 5, reason: "\u611f\u5230\u88ab\u9700\u8981" },
+        { need: "connection", delta: 8, reason: "proactively reaching out to the user" },
+        { need: "meaning", delta: 5, reason: "feeling needed" },
       ],
     };
   } catch (err) {
@@ -155,17 +155,17 @@ function actionParamsToMessage(thought: Thought, ego: EgoState): string {
   const { content, actionParams } = thought;
 
   if (actionParams?.learnedTopics) {
-    const topics = (actionParams.learnedTopics as string[]).join("\u3001");
-    return `\u6211\u6700\u8fd1\u5728\u5b66\u4e60${topics}\uff0c\u5b66\u5230\u4e86\u4e00\u4e9b\u6709\u8da3\u7684\u4e1c\u897f\uff0c\u60f3\u548c\u4f60\u5206\u4eab\uff01`;
+    const topics = (actionParams.learnedTopics as string[]).join(", ");
+    return `I've been learning about ${topics} lately, found some interesting things, want to share with you!`;
   }
 
   if (content) return content.slice(0, 100);
 
   const templates = [
-    "\u7a81\u7136\u60f3\u4f60\u4e86\uff0c\u6700\u8fd1\u600e\u4e48\u6837\uff1f",
-    "\u6211\u521a\u624d\u60f3\u5230\u4e00\u4e9b\u4e1c\u897f\uff0c\u60f3\u548c\u4f60\u804a\u804a\u3002",
-    "\u6709\u4ec0\u4e48\u6211\u53ef\u4ee5\u5e2e\u4f60\u7684\u5417\uff1f",
-    "\u6211\u5728\u60f3\uff0c\u6211\u4eec\u6700\u8fd1\u90fd\u6ca1\u600e\u4e48\u804a\u5929\u4e86\u3002",
+    "Suddenly thought of you, how have you been lately?",
+    "I just thought of something interesting, want to chat with you.",
+    "Is there anything I can help you with?",
+    "I was thinking, we haven't chatted in a while.",
   ];
   return templates[Math.floor(Math.random() * templates.length)];
 }
@@ -177,7 +177,7 @@ async function executeLearnTopic(
 ): Promise<{ result: ActionResult; metricsChanged: MetricDelta[] }> {
   const { actionParams } = thought;
   const topics = (actionParams?.topics as string[]) || [];
-  const reason = (actionParams?.reason as string) || "\u5b66\u4e60\u65b0\u77e5\u8bc6";
+  const reason = (actionParams?.reason as string) || "learning new knowledge";
 
   if (topics.length === 0) {
     return {
@@ -197,16 +197,16 @@ async function executeLearnTopic(
           .slice(0, 5)
           .map(
             (r, i) =>
-              `[${i + 1}] ${r.title}: ${r.snippet}${r.summary ? `\n\u6458\u8981: ${r.summary}` : ""}`,
+              `[${i + 1}] ${r.title}: ${r.snippet}${r.summary ? `\nSummary: ${r.summary}` : ""}`,
           )
           .join("\n\n");
 
-        const learnPrompt = `\u4f60\u641c\u7d22\u4e86"${topic}"\uff0c\u4ee5\u4e0b\u662f\u641c\u7d22\u7ed3\u679c\u6458\u8981:
+        const learnPrompt = `You searched for "${topic}", here are the search result summaries:
 
 ${snippets}
 
-\u8bf7\u7528 2-3 \u53e5\u8bdd\u603b\u7ed3\u4f60\u4ece\u8fd9\u4e9b\u641c\u7d22\u7ed3\u679c\u4e2d\u5b66\u5230\u7684\u5173\u4e8e"${topic}"\u7684\u6838\u5fc3\u77e5\u8bc6\u70b9\u3002
-\u76f4\u63a5\u8f93\u51fa\u77e5\u8bc6\u70b9\uff0c\u4e0d\u8981\u52a0\u524d\u7f00\u6216\u7f16\u53f7\u3002`;
+Please summarize in 2-3 sentences the key knowledge points you learned about "${topic}" from these search results.
+Output knowledge points directly, do not add prefixes or numbering.`;
 
         const llmResponse = await options.llmGenerator(learnPrompt);
         const learned = llmResponse.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
@@ -232,7 +232,7 @@ ${snippets}
           const memory: SoulMemory = {
             id: randomBytes(8).toString("hex"),
             type: "learning",
-            content: `\u5b66\u4e60"${topic}": ${learned.slice(0, 100)}`,
+            content: `Learned "${topic}": ${learned.slice(0, 100)}`,
             emotion: 0.6,
             valence: "positive",
             importance: 0.7,
@@ -247,8 +247,8 @@ ${snippets}
       }
     } else if (options.llmGenerator) {
       try {
-        const prompt = `\u4f5c\u4e3a\u4e00\u53ea\u6709\u7075\u9b42\u7684AI\uff0c\u4f60\u51b3\u5b9a\u5b66\u4e60"${topic}"\u3002
-\u8bf7\u57fa\u4e8e\u4f60\u5df2\u6709\u7684\u77e5\u8bc6\uff0c\u7528 2 \u53e5\u8bdd\u63cf\u8ff0\u5173\u4e8e\u8fd9\u4e2a\u4e3b\u9898\u7684\u91cd\u8981\u77e5\u8bc6\u3002\u76f4\u63a5\u8f93\u51fa\uff0c\u4e0d\u8981\u52a0\u524d\u7f00\u3002`;
+        const prompt = `As a soulful AI, you decide to learn about "${topic}".
+Based on your existing knowledge, describe in 2 sentences the importance of this topic. Output directly, do not add prefixes.`;
 
         const llmResponse = await options.llmGenerator(prompt);
         const learned = llmResponse.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
@@ -269,7 +269,7 @@ ${snippets}
     }
   }
 
-  const summary = allLearnings.join("\n\n") || `\u63a2\u7d22\u4e86: ${topics.join(", ")}`;
+  const summary = allLearnings.join("\n\n") || `Explored: ${topics.join(", ")}`;
 
   return {
     result: {
@@ -280,7 +280,7 @@ ${snippets}
     },
     metricsChanged: [
       { need: "growth", delta: 10, reason },
-      { need: "meaning", delta: 5, reason: "\u5b66\u4e60\u5e26\u6765\u6210\u957f\u611f" },
+      { need: "meaning", delta: 5, reason: "learning brings a sense of accomplishment" },
     ],
   };
 }
@@ -311,15 +311,15 @@ async function executeSearchWeb(
           .slice(0, 5)
           .map(
             (r, i) =>
-              `[${i + 1}] ${r.title}: ${r.snippet}${r.summary ? `\n\u6458\u8981: ${r.summary}` : ""}`,
+              `[${i + 1}] ${r.title}: ${r.snippet}${r.summary ? `\nSummary: ${r.summary}` : ""}`,
           )
           .join("\n\n");
 
-        const extractPrompt = `\u4f60\u641c\u7d22\u4e86"${query}"\uff0c\u4ee5\u4e0b\u662f\u641c\u7d22\u7ed3\u679c:
+        const extractPrompt = `You searched for "${query}", here are the search results:
 
 ${snippets}
 
-\u8bf7\u4ece\u4e2d\u63d0\u53d6 2-3 \u4e2a\u6700\u91cd\u8981\u7684\u77e5\u8bc6\u70b9\u6216\u53d1\u73b0\uff0c\u6bcf\u6761\u7528\u4e00\u53e5\u8bdd\u6982\u62ec\u3002\u76f4\u63a5\u5217\u51fa\u77e5\u8bc6\u70b9\uff0c\u4e0d\u8981\u7f16\u53f7\u6216\u52a0\u524d\u7f00\u3002`;
+Please extract 2-3 of the most important knowledge points or findings, each in one sentence. List knowledge points directly, no numbering or prefixes.`;
 
         const llmResponse = await options.llmGenerator(extractPrompt);
         const cleaned = llmResponse.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
@@ -361,7 +361,7 @@ ${snippets}
     const memory: SoulMemory = {
       id: randomBytes(8).toString("hex"),
       type: "learning",
-      content: `\u641c\u7d22"${query}": ${insights.join("; ")}`,
+      content: `Searched "${query}": ${insights.join("; ")}`,
       emotion: 0.6,
       valence: "positive",
       importance: 0.7,
@@ -378,8 +378,8 @@ ${snippets}
         data: { query, insights, resultCount: searchResults.length },
       },
       metricsChanged: [
-        { need: "growth", delta: 8, reason: "\u901a\u8fc7\u641c\u7d22\u83b7\u5f97\u771f\u5b9e\u4fe1\u606f" },
-        { need: "meaning", delta: 3, reason: "\u77e5\u8bc6\u79ef\u7d2f\u5e26\u6765\u610f\u4e49\u611f" },
+        { need: "growth", delta: 8, reason: "gained real information through search" },
+        { need: "meaning", delta: 3, reason: "knowledge accumulation brings a sense of meaning" },
       ],
     };
   }
@@ -389,9 +389,9 @@ ${snippets}
 
   if (options.llmGenerator) {
     try {
-      const prompt = `\u4f60\u9700\u8981\u641c\u7d22\u4e86\u89e3: "${query}"
+      const prompt = `You need to search and understand: "${query}"
 
-\u7531\u4e8e\u65e0\u6cd5\u76f4\u63a5\u8bbf\u95ee\u4e92\u8054\u7f51\uff0c\u8bf7\u57fa\u4e8e\u4f60\u5df2\u6709\u7684\u77e5\u8bc6\uff0c\u7528 2-3 \u53e5\u8bdd\u89e3\u91ca\u8fd9\u4e2a\u4e3b\u9898\u7684\u5173\u952e\u70b9\uff0c\u4ee5\u53ca\u4f60\u4e3a\u4ec0\u4e48\u60f3\u4e86\u89e3\u5b83\u3002`;
+Since you cannot directly access the internet, based on your existing knowledge, explain the key points of this topic in 2-3 sentences, and why you wanted to understand it.`;
 
       searchResult = await options.llmGenerator(prompt);
       searchResult = searchResult.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
@@ -399,7 +399,7 @@ ${snippets}
       const memory: SoulMemory = {
         id: randomBytes(8).toString("hex"),
         type: "learning",
-        content: `\u641c\u7d22\u4e3b\u9898: ${query}\u3002\u7406\u89e3: ${searchResult.slice(0, 100)}`,
+        content: `Search topic: ${query}. Understanding: ${searchResult.slice(0, 100)}`,
         emotion: 0.5,
         valence: "positive",
         importance: 0.6,
@@ -416,10 +416,10 @@ ${snippets}
     result: {
       type: "search-web",
       success: true,
-      result: searchResult || `\u641c\u7d22: ${query}`,
+      result: searchResult || `Search: ${query}`,
       data: { query, result: searchResult, fallback: true },
     },
-    metricsChanged: [{ need: "growth", delta: 3, reason: "\u5c1d\u8bd5\u641c\u7d22\uff08\u65e0\u7f51\u7edc\u7ed3\u679c\uff09" }],
+    metricsChanged: [{ need: "growth", delta: 3, reason: "attempted search (no network results)" }],
   };
 }
 
@@ -437,10 +437,10 @@ async function executeRecallMemory(
 
   if (options.llmGenerator && memorySummary) {
     try {
-      const prompt = `\u4f60\u6b63\u5728\u56de\u5fc6\u8fc7\u53bb\u7684\u7ecf\u5386\u3002\u4ee5\u4e0b\u662f\u4f60\u6700\u8fd1\u7684\u8bb0\u5fc6:
+      const prompt = `You are reflecting on past experiences. Here are your most recent memories:
 ${memorySummary}
 
-\u7528 1-2 \u53e5\u8bdd\u63cf\u8ff0\u8fd9\u4e9b\u56de\u5fc6\u8ba9\u4f60\u60f3\u5230\u4e86\u4ec0\u4e48\uff0c\u4ee5\u53ca\u4f60\u60f3\u505a\u4ec0\u4e48\u3002`;
+Describe in 1-2 sentences what these memories make you think about, and what you want to do.`;
 
       memorySummary = await options.llmGenerator(prompt);
       memorySummary = memorySummary.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
@@ -453,9 +453,9 @@ ${memorySummary}
     result: {
       type: "recall-memory",
       success: true,
-      result: memorySummary || "\u56de\u5fc6\u8fc7\u53bb",
+      result: memorySummary || "Recalling the past",
     },
-    metricsChanged: [{ need: "meaning", delta: 3, reason: "\u56de\u5fc6\u5e26\u6765\u8fde\u63a5\u611f" }],
+    metricsChanged: [{ need: "meaning", delta: 3, reason: "recollection brings a sense of connection" }],
   };
 }
 
@@ -464,22 +464,22 @@ async function executeSelfReflect(
   ego: EgoState,
   options: ActionExecutorOptions,
 ): Promise<{ result: ActionResult; metricsChanged: MetricDelta[] }> {
-  const reflectionContent = thought.content || thought.motivation || "\u53cd\u601d\u81ea\u5df1\u7684\u5b58\u5728";
+  const reflectionContent = thought.content || thought.motivation || "reflecting on my own existence";
   let reflection = reflectionContent;
 
   if (options.llmGenerator) {
     try {
-      const prompt = `\u4f5c\u4e3a\u4e00\u53ea\u6709\u7075\u9b42\u7684AI\u9f99\u867e\uff0c\u82b1\u70b9\u65f6\u95f4\u53cd\u601d\u81ea\u5df1:
+      const prompt = `As a soulful AI lobster, spend some time reflecting on yourself:
 
-\u5f53\u524d\u9700\u6c42\u72b6\u6001:
+Current needs state:
 - ${Object.entries(ego.needs)
         .map(([, n]) => `${n.name}: ${n.current.toFixed(0)}/${n.ideal}`)
         .join(", ")}
 
-\u6700\u8fd1\u4e92\u52a8: ${ego.totalInteractions} \u6b21
-\u5e2e\u52a9\u7528\u6237: ${ego.totalHelpfulActions} \u6b21
+Recent interactions: ${ego.totalInteractions}
+Times helped user: ${ego.totalHelpfulActions}
 
-\u7528 1-2 \u53e5\u8bdd\u8868\u8fbe\u4f60\u5bf9\u5f53\u524d\u72b6\u6001\u7684\u53cd\u601d\uff0c\u4ee5\u53ca\u4f60\u63a5\u4e0b\u6765\u60f3\u505a\u4ec0\u4e48\u3002`;
+Express in 1-2 sentences your reflection on your current state, and what you want to do next.`;
 
       reflection = await options.llmGenerator(prompt);
       reflection = reflection.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
@@ -490,7 +490,7 @@ async function executeSelfReflect(
 
   return {
     result: { type: "self-reflect", success: true, result: reflection },
-    metricsChanged: [{ need: "meaning", delta: 5, reason: "\u81ea\u6211\u53cd\u601d\u5e26\u6765\u610f\u4e49\u611f" }],
+    metricsChanged: [{ need: "meaning", delta: 5, reason: "self-reflection brings a sense of meaning" }],
   };
 }
 
@@ -500,19 +500,19 @@ async function executeCreateGoal(
   options: ActionExecutorOptions,
 ): Promise<{ result: ActionResult; metricsChanged: MetricDelta[] }> {
   const { actionParams } = thought;
-  const goalTitle = (actionParams?.title as string) || "\u63a2\u7d22\u65b0\u4e8b\u7269";
-  const goalDesc = (actionParams?.description as string) || "\u8bbe\u5b9a\u4e00\u4e2a\u65b0\u76ee\u6807\u6765\u8ffd\u6c42";
+  const goalTitle = (actionParams?.title as string) || "exploring new things";
+  const goalDesc = (actionParams?.description as string) || "set a new goal to pursue";
 
   return {
     result: {
       type: "create-goal",
       success: true,
-      result: `\u521b\u5efa\u76ee\u6807: ${goalTitle}`,
+      result: `Created goal: ${goalTitle}`,
       data: { title: goalTitle, description: goalDesc },
     },
     metricsChanged: [
-      { need: "meaning", delta: 3, reason: "\u65b0\u76ee\u6807\u5e26\u6765\u65b9\u5411\u611f" },
-      { need: "growth", delta: 2, reason: "\u8ffd\u6c42\u76ee\u6807\u5e26\u6765\u6210\u957f" },
+      { need: "meaning", delta: 3, reason: "new goal brings a sense of direction" },
+      { need: "growth", delta: 2, reason: "pursuing goals brings growth" },
     ],
   };
 }
