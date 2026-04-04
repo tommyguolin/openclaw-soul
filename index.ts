@@ -114,6 +114,14 @@ const plugin = {
   },
 
   register(api: OpenClawPluginApi) {
+    // Guard: prevent re-registration from overwriting a running service instance.
+    // The gateway may call register() multiple times (e.g. on config reload or channel connect).
+    // If thoughtService already exists and is running, bail out to keep the original instance.
+    if (thoughtService?.isRunning()) {
+      log.debug("Soul plugin already registered and running, skipping re-registration");
+      return;
+    }
+
     const config = cfg<PluginConfig>(api.pluginConfig);
 
     // Inner `enabled` defaults to true; only skip if explicitly set to false
