@@ -1,5 +1,5 @@
 {
-  "name": "openclaw-soul",
+  "name": "openclaw-soul-plugin",
   "version": "1.2.0",
   "description": "Autonomous thinking, emotional awareness, and memory system for OpenClaw",
   "keywords": [
@@ -41,8 +41,15 @@
   },
   "openclaw": {
     "extensions": ["./index.ts"],
+    "compat": {
+      "pluginApi": ">=2025.0.0"
+    },
+    "build": {
+      "openclawVersion": "2026.3.14",
+      "pluginSdkVersion": "2026.3.14"
+    },
     "install": {
-      "npmSpec": "openclaw-soul",
+      "npmSpec": "openclaw-soul-plugin",
       "localPath": "extensions/soul",
       "defaultChoice": "npm"
     }
