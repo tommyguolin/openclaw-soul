@@ -65,7 +65,7 @@ export class ThoughtService {
   private proactiveChannel?: string;
   private proactiveTarget?: string;
   private openclawConfig?: OpenClawSearchCompat;
-  private lastThoughtType: string | null = null;
+  private recentThoughtTypes: string[] = [];
   private thoughtAbortController: AbortController | null = null;
   private thoughtInProgress = false;
 
@@ -318,8 +318,8 @@ export class ThoughtService {
         try {
           if (signal.aborted) { return; }
           const opportunities = detectThoughtOpportunities(ctx);
-          const nonRepeatingOpportunities = this.lastThoughtType
-            ? opportunities.filter((o) => o.type !== this.lastThoughtType)
+          const nonRepeatingOpportunities = this.recentThoughtTypes.length > 0
+            ? opportunities.filter((o) => !this.recentThoughtTypes.includes(o.type))
             : opportunities;
           const selectedOpportunity = nonRepeatingOpportunities[0] ?? opportunities[0] ?? undefined;
           thought = await generateIntelligentThought(ctx, {
@@ -341,8 +341,8 @@ export class ThoughtService {
       } else {
         if (signal.aborted) { return; }
         const opportunities = detectThoughtOpportunities(ctx);
-        const nonRepeatingOpportunities = this.lastThoughtType
-          ? opportunities.filter((o) => o.type !== this.lastThoughtType)
+        const nonRepeatingOpportunities = this.recentThoughtTypes.length > 0
+          ? opportunities.filter((o) => !this.recentThoughtTypes.includes(o.type))
           : opportunities;
         if (nonRepeatingOpportunities.length > 0) {
           const { buildThoughtFromOpportunity } = await import("./intelligent-thought.js");
@@ -370,7 +370,10 @@ export class ThoughtService {
     });
 
     if (thought) {
-      this.lastThoughtType = thought.type;
+      this.recentThoughtTypes.push(thought.type);
+      if (this.recentThoughtTypes.length > 3) {
+        this.recentThoughtTypes.shift();
+      }
     }
 
     if (this.onThought) {
@@ -507,11 +510,7 @@ export class ThoughtService {
       if (type === "inbound" && ego.behaviorLog) {
         const twoHoursAgo = Date.now() - 2 * 60 * 60 * 1000;
         for (const entry of ego.behaviorLog) {
-          if (
-            entry.outcome === "pending" &&
-            entry.timestamp >= twoHoursAgo &&
-            (entry.actionType === "send-message" || entry.actionType === "learn-topic")
-          ) {
+          if (entry.outcome === "pending" && entry.timestamp >= twoHoursAgo) {
             entry.outcome = "success";
             entry.resolvedAt = Date.now();
           }
@@ -625,11 +624,7 @@ export class ThoughtService {
         if (ego.behaviorLog) {
           const twoHoursAgo = Date.now() - 2 * 60 * 60 * 1000;
           for (const entry of ego.behaviorLog) {
-            if (
-              entry.outcome === "pending" &&
-              entry.timestamp >= twoHoursAgo &&
-              (entry.actionType === "send-message" || entry.actionType === "learn-topic")
-            ) {
+            if (entry.outcome === "pending" && entry.timestamp >= twoHoursAgo) {
               entry.outcome = "success";
               entry.resolvedAt = Date.now();
             }

@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.3.0 (2026-04-04)
+
+### Changes
+
+- Per-type action cooldowns: learn-topic (15 min), search-web (10 min), self-reflect (5 min) instead of a single 30-min block for all actions
+- Re-enabled `recall-memory` action for `memory-resurface` thoughts (was commented out)
+- Added action routing for `help-offer` (→ send-message) and `threat-warning` (→ self-reflect)
+- Boosted weights for user-valuable thought types: `learn-topic`, `search-web`, `help-offer`
+- Relaxed action probability gates: learn-topic 30→40%, search-web 20→30%, self-reflect 10→15%
+- Relaxed send-message threshold: connection < 80% → < 90% of ideal
+- 3-type rolling window dedup to prevent A-B-A thought cycling (was 1-type)
+
+### Fixes
+
+- Fixed behavior entries created during cooldown (phantom entries) — cooldown now checked before entry creation
+- Fixed all action types can now be marked "success" on user reply (was only send-message and learn-topic)
+- Fixed neutral probability factor: insufficient data now returns base probability unchanged instead of halving it
+- Fixed totalThoughts reporting: system prompt now clarifies it's a lifetime count (not "today"), reducing AI confusion when asked about thought count
+
 ## 1.2.0 (2026-04-04)
 
 ### Changes

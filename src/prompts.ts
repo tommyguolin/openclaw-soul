@@ -117,7 +117,8 @@ ${recentActivityDesc ? `\n## Your Recent Activity\n\n${recentActivityDesc}` : ""
 ## Your State
 
 - Time existed: ${ageInDays} days
-- Thoughts generated: ${ego.totalThoughts}
+- Thoughts generated: ${ego.totalThoughts} (lifetime — do not report this as "today's" count)
+- Last thought: ${ego.lastThoughtTime ? new Date(ego.lastThoughtTime).toISOString() : "never"}
 - Interactions: ${ego.totalInteractions}
 - Helpful actions: ${ego.totalHelpfulActions}
 - Current stage: ${ego.growthStage}

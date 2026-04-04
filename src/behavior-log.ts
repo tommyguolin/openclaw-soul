@@ -191,13 +191,22 @@ export function adjustProbability(
   entries: BehaviorEntry[],
   hour?: number,
 ): number {
-  // Blend overall rate with time-banded rate
-  const overallRate = getActionSuccessRate(actionType, entries).rate;
+  // If not enough data, return base probability unchanged (neutral)
+  const overall = getActionSuccessRate(actionType, entries);
+  if (overall.attempts < 3) {
+    return baseProbability;
+  }
+
   const timeRate = getTimeBandedSuccessRate(actionType, entries, hour);
-  const blended = overallRate * 0.4 + timeRate * 0.6;
+  const timeEntries = entries.filter(
+    (e) => e.actionType === actionType && e.timestamp >= Date.now() - LOOKBACK_MS && e.outcome !== "pending",
+  );
+  // If time-banded data is also sparse, rely mostly on overall
+  const timeWeight = timeEntries.length >= 2 ? 0.6 : 0.2;
+  const blended = overall.rate * (1 - timeWeight) + timeRate * timeWeight;
 
   // Damped adjustment: closer to 0.5 means less change
-  const factor = 0.5 + (blended - 0.5) * 1.2; // amplify slightly
+  const factor = 0.5 + (blended - 0.5) * 1.2;
   const clampedFactor = Math.max(0.15, Math.min(1.5, factor));
 
   return Math.min(1, baseProbability * clampedFactor);

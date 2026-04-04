@@ -28,7 +28,7 @@ const thoughtWeights: Record<ThoughtType, (ctx: ThoughtGenerationContext) => num
     return 20;
   },
   "memory-resurface": (ctx) => {
-    if (ctx.recentMemories.length > 3) return 50;
+    if (ctx.recentMemories.length > 3) return 40;
     return 10;
   },
   "bond-deepen": (ctx) => {
@@ -44,24 +44,24 @@ const thoughtWeights: Record<ThoughtType, (ctx: ThoughtGenerationContext) => num
   },
   "existential-reflection": (ctx) => {
     const hour = ctx.currentHour;
-    if (hour >= 20 || hour <= 6) return 40;
-    if (ctx.ego.totalThoughts % 20 === 0) return 30;
+    if (hour >= 20 || hour <= 6) return 30;
+    if (ctx.ego.totalThoughts % 20 === 0) return 20;
     return 10;
   },
   "help-offer": (ctx) => {
     const connectionNeed = ctx.ego.needs.connection;
-    if (connectionNeed.current > connectionNeed.ideal * 0.7) return 60;
-    return 30;
+    if (connectionNeed.current > connectionNeed.ideal * 0.7) return 70;
+    return 40;
   },
   "learn-topic": (ctx) => {
     const growthNeed = ctx.ego.needs.growth;
-    if (growthNeed.current < growthNeed.ideal * 0.6) return 60;
-    return 30;
+    if (growthNeed.current < growthNeed.ideal * 0.6) return 70;
+    return 40;
   },
   "search-web": (ctx) => {
     const growthNeed = ctx.ego.needs.growth;
-    if (growthNeed.current < growthNeed.ideal * 0.5) return 50;
-    return 20;
+    if (growthNeed.current < growthNeed.ideal * 0.5) return 60;
+    return 35;
   },
   "reflect-on-memory": (ctx) => {
     if (ctx.recentMemories.length > 2) return 40;

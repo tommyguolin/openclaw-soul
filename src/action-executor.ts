@@ -26,7 +26,17 @@ import {
 
 const log = createSoulLogger("action-executor");
 
-let lastProactiveMessageTime = 0;
+const ACTION_COOLDOWNS_MS: Record<ActionType, number> = {
+  none: 0,
+  "send-message": 30 * 60 * 1000,
+  "learn-topic": 15 * 60 * 1000,
+  "search-web": 10 * 60 * 1000,
+  "self-reflect": 5 * 60 * 1000,
+  "recall-memory": 10 * 60 * 1000,
+  "create-goal": 60 * 60 * 1000,
+};
+
+const lastActionTime: Record<string, number> = {};
 
 export interface ActionExecutorOptions {
   channel?: string;
@@ -51,9 +61,11 @@ export async function executeThoughtAction(
     };
   }
 
-  const cooldownMs = 30 * 60 * 1000;
-  if (Date.now() - lastProactiveMessageTime < cooldownMs) {
-    log.debug("Action cooldown active, skipping");
+  // Check per-type cooldown BEFORE creating behavior entry
+  const cooldownMs = ACTION_COOLDOWNS_MS[actionType] ?? 30 * 60 * 1000;
+  const lastTime = lastActionTime[actionType] ?? 0;
+  if (Date.now() - lastTime < cooldownMs) {
+    log.debug(`Action cooldown active for ${actionType}, skipping`);
     return {
       result: { type: actionType, success: true, result: "cooldown" },
       metricsChanged: [],
@@ -117,6 +129,11 @@ export async function executeThoughtAction(
   }
 }
 
+/** Mark an action type as having just completed successfully (for cooldown tracking). */
+export function markActionExecuted(actionType: ActionType): void {
+  lastActionTime[actionType] = Date.now();
+}
+
 async function executeSendMessage(
   thought: Thought,
   ego: EgoState,
@@ -135,7 +152,7 @@ async function executeSendMessage(
 
   try {
     await sendMessage({ to: target, content: messageContent, channel });
-    lastProactiveMessageTime = Date.now();
+    lastActionTime["send-message"] = Date.now();
     log.info(`Proactive message sent via ${channel}: ${messageContent.slice(0, 50)}...`);
     return {
       result: { type: "send-message", success: true, result: messageContent },

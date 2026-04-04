@@ -527,9 +527,8 @@ function determineActionForOpportunity(
     type === "skill-gap" ||
     (type === "opportunity-detected" && relatedNeeds.includes("growth"))
   ) {
-    // Only learn when growth is very low AND random gate (adjusted by behavior history)
-    const learnProbability = adjustProbability(0.3, "learn-topic", ego.behaviorLog ?? []);
-    if (growthNeed.current < growthNeed.ideal * 0.5 && Math.random() < learnProbability) {
+    const learnProbability = adjustProbability(0.4, "learn-topic", ego.behaviorLog ?? []);
+    if (growthNeed.current < growthNeed.ideal * 0.7 && Math.random() < learnProbability) {
       const topics = extractLearningTopics(
         opportunity.triggerDetail + " " + opportunity.motivation,
       );
@@ -546,20 +545,32 @@ function determineActionForOpportunity(
     type === "bond-deepen" ||
     (type === "opportunity-detected" && relatedNeeds.includes("connection"))
   ) {
-    if (connectionNeed.current < connectionNeed.ideal * 0.8) {
+    if (connectionNeed.current < connectionNeed.ideal * 0.9) {
       return { actionType: "send-message" };
     }
   }
 
-  // recall-memory is a no-op loop — don't trigger it
-  // if (type === "memory-resurface") {
-  //   return { actionType: "recall-memory" };
-  // }
+  // help-offer: proactively reach out to offer help
+  if (type === "help-offer") {
+    if (connectionNeed.current < connectionNeed.ideal * 0.9) {
+      return { actionType: "send-message" };
+    }
+  }
+
+  // threat-warning: self-reflect to process the threat
+  if (type === "threat-warning" && relatedNeeds.includes("survival")) {
+    return { actionType: "self-reflect" };
+  }
+
+  // memory-resurface: recall and reflect on memories
+  if (type === "memory-resurface") {
+    return { actionType: "recall-memory" };
+  }
 
   if (type === "meaning-quest" || type === "existential-reflection") {
     // Adjusted by behavior history
-    const searchProb = adjustProbability(0.2, "search-web", ego.behaviorLog ?? []);
-    const reflectProb = adjustProbability(0.1, "self-reflect", ego.behaviorLog ?? []);
+    const searchProb = adjustProbability(0.3, "search-web", ego.behaviorLog ?? []);
+    const reflectProb = adjustProbability(0.15, "self-reflect", ego.behaviorLog ?? []);
     const roll = Math.random();
     if (roll < reflectProb) {
       return { actionType: "self-reflect" };
