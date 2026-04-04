@@ -89,7 +89,7 @@ openclaw plugins install openclaw-soul-plugin
 ```bash
 git clone https://github.com/tommyguolin/openclaw-soul.git
 cd openclaw-soul
-openclaw plugins install openclaw-soul-plugin
+openclaw plugins install .
 ```
 
 ## Configuration
