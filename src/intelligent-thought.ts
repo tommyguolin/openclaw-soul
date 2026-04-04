@@ -541,20 +541,19 @@ function determineActionForOpportunity(
     }
   }
 
-  if (
-    type === "bond-deepen" ||
-    (type === "opportunity-detected" && relatedNeeds.includes("connection"))
-  ) {
-    if (connectionNeed.current < connectionNeed.ideal * 0.9) {
-      return { actionType: "send-message" };
-    }
+  // help-offer: proactively reach out to offer help (value-driven)
+  // Note: bond-deepen no longer routes to send-message — only value-carrying
+  // thought types (help-offer) should trigger proactive messaging
+  if (type === "help-offer") {
+    return { actionType: "send-message" };
   }
 
-  // help-offer: proactively reach out to offer help
-  if (type === "help-offer") {
-    if (connectionNeed.current < connectionNeed.ideal * 0.9) {
-      return { actionType: "send-message" };
-    }
+  // opportunity-detected with connection need: only message if there's
+  // specific context to share (e.g. learned something relevant)
+  if (type === "opportunity-detected" && relatedNeeds.includes("connection")) {
+    // Don't send generic "I want to connect" messages
+    // Only send if the opportunity has specific, actionable content
+    return { actionType: "none" };
   }
 
   // threat-warning: self-reflect to process the threat

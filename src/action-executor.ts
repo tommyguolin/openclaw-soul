@@ -28,7 +28,7 @@ const log = createSoulLogger("action-executor");
 
 const ACTION_COOLDOWNS_MS: Record<ActionType, number> = {
   none: 0,
-  "send-message": 30 * 60 * 1000,
+  "send-message": 15 * 60 * 1000,
   "learn-topic": 15 * 60 * 1000,
   "search-web": 10 * 60 * 1000,
   "self-reflect": 5 * 60 * 1000,
@@ -148,7 +148,16 @@ async function executeSendMessage(
     };
   }
 
-  const messageContent = actionParamsToMessage(thought, ego);
+  // Generate message content — only send if there's something valuable to say
+  const messageContent = await generateValuableMessage(thought, ego, options);
+
+  if (!messageContent) {
+    log.info("Proactive message skipped: no valuable content to share");
+    return {
+      result: { type: "send-message", success: true, result: "skipped-no-value" },
+      metricsChanged: [],
+    };
+  }
 
   try {
     await sendMessage({ to: target, content: messageContent, channel });
@@ -169,23 +178,96 @@ async function executeSendMessage(
   }
 }
 
-function actionParamsToMessage(thought: Thought, ego: EgoState): string {
-  const { content, actionParams } = thought;
+/**
+ * Generate a proactive message only if there's something valuable to share.
+ * Returns null if there's no specific, useful content — in which case the
+ * message should NOT be sent.
+ */
+async function generateValuableMessage(
+  thought: Thought,
+  ego: EgoState,
+  options: ActionExecutorOptions,
+): Promise<string | null> {
+  // Use LLM to craft a personalized, specific message
+  if (options.llmGenerator) {
+    try {
+      const userFacts = ego.userFacts.slice(0, 5);
+      const recentInteractions = ego.memories
+        .filter((m) => m.type === "interaction")
+        .slice(-3);
+      const recentKnowledge = ego.memories
+        .filter((m) => m.type === "learning")
+        .slice(-3);
 
-  if (actionParams?.learnedTopics) {
-    const topics = (actionParams.learnedTopics as string[]).join(", ");
-    return `I've been learning about ${topics} lately, found some interesting things, want to share with you!`;
+      const userInfo = userFacts.length > 0
+        ? userFacts.map((f) => `[${f.category}] ${f.content}`).join("; ")
+        : "I don't know much about the user yet";
+
+      const interactionContext = recentInteractions.length > 0
+        ? recentInteractions.map((m) => m.content.slice(0, 60)).join("; ")
+        : "no recent conversations";
+
+      const knowledgeContext = recentKnowledge.length > 0
+        ? recentKnowledge.map((m) => m.content.slice(0, 80)).join("; ")
+        : "no recent learnings";
+
+      const prompt = `You are a thoughtful AI assistant deciding whether to proactively message the user.
+
+**Trigger reason**: ${thought.motivation}
+**Detail**: ${thought.triggerDetail}
+
+**What you know about the user**: ${userInfo}
+**Recent conversations**: ${interactionContext}
+**Recent knowledge gained**: ${knowledgeContext}
+
+**Critical rules**:
+1. Only write a message if you have SPECIFIC, USEFUL information to share with the user
+2. Good reasons to message: you learned something relevant to the user's interests/projects, you found an answer to a question they asked before, you discovered something time-sensitive
+3. BAD reasons (DO NOT message): "I miss you", "we haven't talked in a while", "just checking in", "thinking about you"
+4. If you have nothing valuable to say, respond with exactly: NO_MESSAGE
+5. If you do message, be specific — reference what you learned and why it matters to this user
+6. Keep it to 1-2 sentences, natural tone
+
+Output your message or NO_MESSAGE directly.`;
+
+      const response = await options.llmGenerator(prompt);
+      const cleaned = response
+        .replace(/<think[\s\S]*?<\/think>/gi, "")
+        .replace(/<think[\s\S]*?$/gi, "")
+        .trim();
+
+      if (!cleaned || cleaned.toUpperCase() === "NO_MESSAGE" || cleaned.length < 10) {
+        return null;
+      }
+
+      return cleaned.slice(0, 200);
+    } catch (err) {
+      log.warn("LLM proactive message generation failed", String(err));
+    }
   }
 
-  if (content) return content.slice(0, 100);
+  // No LLM: only send if the thought itself has specific, actionable content
+  if (thought.content && thought.content.length > 20) {
+    // Check it's not a generic template
+    const genericPhrases = [
+      "suddenly thought of you",
+      "haven't chatted",
+      "how have you been",
+      "want to chat",
+      "突然想到你",
+      "好久没聊",
+      "最近怎么样",
+    ];
+    const isGeneric = genericPhrases.some(
+      (p) => thought.content.toLowerCase().includes(p.toLowerCase()),
+    );
+    if (!isGeneric) {
+      return thought.content.slice(0, 200);
+    }
+  }
 
-  const templates = [
-    "Suddenly thought of you, how have you been lately?",
-    "I just thought of something interesting, want to chat with you.",
-    "Is there anything I can help you with?",
-    "I was thinking, we haven't chatted in a while.",
-  ];
-  return templates[Math.floor(Math.random() * templates.length)];
+  // No valuable content — don't send
+  return null;
 }
 
 async function executeLearnTopic(

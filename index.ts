@@ -203,11 +203,7 @@ const plugin = {
       proactiveTarget,
       sendMessage,
       openclawConfig,
-      onThought: createSoulActionHandler(
-        proactiveMessaging ? proactiveChannel : undefined,
-        proactiveMessaging ? proactiveTarget : undefined,
-        sendMessage,
-      ),
+      onThought: createSoulActionHandler(),
     });
 
     api.registerService({

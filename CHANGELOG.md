@@ -4,20 +4,25 @@
 
 ### Changes
 
-- Per-type action cooldowns: learn-topic (15 min), search-web (10 min), self-reflect (5 min) instead of a single 30-min block for all actions
+- **Proactive messaging redesign**: Soul now only sends messages when it has something valuable to share (learned something relevant, found answer to user's question). No more generic "I miss you" / "好久没聊" messages
+- LLM-driven message generation: proactive messages are crafted by LLM using user facts, recent conversations, and acquired knowledge — no generic templates
+- Value gate: if LLM determines there's nothing worth saying, the message is not sent (responds `NO_MESSAGE`)
+- Removed dual send-path: proactive messaging now handled exclusively by `action-executor.ts` (removed competing path in `soul-actions.ts`)
+- `bond-deepen` thoughts no longer trigger send-message — only value-carrying types (`help-offer`) should proactively message
+- Per-type action cooldowns: learn-topic (15 min), search-web (10 min), self-reflect (5 min) instead of a single block
 - Re-enabled `recall-memory` action for `memory-resurface` thoughts (was commented out)
 - Added action routing for `help-offer` (→ send-message) and `threat-warning` (→ self-reflect)
 - Boosted weights for user-valuable thought types: `learn-topic`, `search-web`, `help-offer`
 - Relaxed action probability gates: learn-topic 30→40%, search-web 20→30%, self-reflect 10→15%
-- Relaxed send-message threshold: connection < 80% → < 90% of ideal
 - 3-type rolling window dedup to prevent A-B-A thought cycling (was 1-type)
+- Lowered send-message cooldown from 30 min to 15 min
 
 ### Fixes
 
 - Fixed behavior entries created during cooldown (phantom entries) — cooldown now checked before entry creation
 - Fixed all action types can now be marked "success" on user reply (was only send-message and learn-topic)
 - Fixed neutral probability factor: insufficient data now returns base probability unchanged instead of halving it
-- Fixed totalThoughts reporting: system prompt now clarifies it's a lifetime count (not "today"), reducing AI confusion when asked about thought count
+- Fixed totalThoughts reporting: system prompt now clarifies it's a lifetime count (not "today")
 
 ## 1.2.0 (2026-04-04)
 
