@@ -101,6 +101,11 @@ Add to your `openclaw.yaml`:
 plugins:
   soul:
     enabled: true
+
+# Required for proactive messaging (Soul sending messages to you)
+hooks:
+  enabled: true
+  token: "your-secret-token-here"
 ```
 
 That's it — Soul auto-detects everything else:
@@ -125,6 +130,11 @@ plugins:
     #   model: gpt-4o
     #   apiKeyEnv: OPENAI_API_KEY
     #   baseUrl: https://api.openai.com/v1
+
+# Required for proactive messaging (Soul sending messages to you)
+hooks:
+  enabled: true
+  token: "your-secret-token-here"   # Used by Soul to send messages via gateway
 ```
 
 ### Environment Variables

@@ -1,4 +1,3 @@
-import { execSync } from "node:child_process";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type PluginEvent = any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -13,40 +12,73 @@ import { ThoughtService } from "./src/thought-service.js";
 import { createSoulActionHandler, type MessageSender } from "./src/soul-actions.js";
 import { createSoulLogger } from "./src/logger.js";
 import { resolveLLMConfigFromOpenClaw, type SoulLLMConfig } from "./src/soul-llm.js";
+import { getGatewayPort } from "./src/env.js";
 
 const log = createSoulLogger("plugin");
 
 /**
- * Build a sendMessage function that uses `openclaw message send` CLI.
+ * Build a sendMessage function that delivers a proactive message through
+ * the gateway hooks agent endpoint (POST /hooks/agent with deliver: true).
  *
- * This works for ALL channels (telegram, discord, slack, feishu, etc.)
- * without needing channel-specific SDK imports.
- * Throws on failure so action-executor can catch and handle the error.
+ * This avoids using child_process.execSync which triggers OpenClaw's
+ * security scanner. The gateway handles all channel routing transparently.
+ * Requires hooks.enabled: true and hooks.token in openclaw.yaml.
  */
 function buildSendMessage(opts: {
+  openclawConfig: Record<string, unknown>;
   getChannel: () => string | undefined;
   getTarget: () => string | undefined;
 }): MessageSender {
+  // Pre-resolve hooks config at build time (not per-call)
+  const hooks = (opts.openclawConfig.hooks ?? {}) as Record<string, unknown>;
+  const hooksEnabled = hooks.enabled === true;
+  const hooksToken = typeof hooks.token === "string" ? hooks.token.trim() : "";
+  const gatewayPort = getGatewayPort(opts.openclawConfig);
+
+  if (!hooksEnabled || !hooksToken) {
+    log.warn(
+      "Proactive messaging requires hooks config. Add to openclaw.yaml:\n" +
+        '  hooks:\n    enabled: true\n    token: "<your-secret-token>"',
+    );
+  }
+
   return async (params) => {
+    if (!hooksEnabled || !hooksToken) {
+      throw new Error(
+        "sendMessage: hooks not configured. Set hooks.enabled=true and hooks.token in openclaw.yaml",
+      );
+    }
+
     const channel = params.channel || opts.getChannel();
     const target = params.to || opts.getTarget();
     if (!channel || !target) {
       throw new Error("sendMessage: no channel/target resolved yet");
     }
 
-    const escapedContent = params.content.replace(/'/g, "'\\''");
-    const cmd = `openclaw message send --channel ${channel} --target ${target} --message '${escapedContent}'`;
+    const url = `http://127.0.0.1:${gatewayPort}/hooks/agent`;
+    const body = {
+      message: params.content,
+      deliver: true,
+      channel,
+      to: target,
+      name: "Soul",
+    };
 
-    try {
-      execSync(cmd, {
-        timeout: 30_000,
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-      log.info(`Proactive message delivered via ${channel} to ${target}`);
-    } catch (err) {
-      const stderr = (err as { stderr?: Buffer })?.stderr?.toString().trim() ?? "";
-      throw new Error(`sendMessage failed (channel=${channel}): ${stderr || String(err)}`);
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${hooksToken}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`sendMessage via hooks failed: ${res.status} - ${text.slice(0, 200)}`);
     }
+    log.info(`Proactive message delivered via ${channel} to ${target} (hooks)`);
   };
 }
 
@@ -212,6 +244,7 @@ const plugin = {
       const sendMessage: MessageSender | undefined =
         proactiveMessaging
           ? buildSendMessage({
+              openclawConfig,
               getChannel: () => proactiveChannel,
               getTarget: () => proactiveTarget,
             })

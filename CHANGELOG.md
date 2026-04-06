@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.6.0 (2026-04-07)
+
+### Changes
+
+- **Replace child_process with fetch for proactive messaging**: Removed `execSync`/`child_process` dependency that triggered OpenClaw's security scanner ("dangerous code patterns detected"). Proactive messages are now sent via gateway's `/hooks/agent` HTTP endpoint, which requires `hooks.enabled: true` and `hooks.token` in `openclaw.yaml`
+- **Rename package to `openclaw-soul-plugin`**: Package name now matches ClawHub plugin entry for consistent identification
+- **Remove SKILL.md**: Removed incorrectly created SKILL.md file (soul is a plugin, not a skill)
+
 ## 1.5.0 (2026-04-07)
 
 ### Changes
