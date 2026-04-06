@@ -13,7 +13,8 @@ export type ThoughtType =
   | "help-offer"
   | "learn-topic"
   | "search-web"
-  | "reflect-on-memory";
+  | "reflect-on-memory"
+  | "conversation-replay";
 
 export type ActionType =
   | "none"
@@ -236,6 +237,8 @@ export interface EgoState {
   coreIdentity: string;
   establishedRoutines: string[];
   behaviorLog: BehaviorEntry[];
+  pendingShareMessage: string | null;
+  userLanguage: string | null;
 }
 
 export interface ThoughtGenerationContext {

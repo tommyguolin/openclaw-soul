@@ -142,15 +142,30 @@ function analyzeRecentInteraction(timeSinceLastInteraction: number): DetectedTho
 
   const minutesSince = timeSinceLastInteraction / (1000 * 60);
 
-  if (minutesSince > 60 && minutesSince < 120) {
+  // After 10-30 min: gentle follow-up (bond-deepen with send-message)
+  if (minutesSince > 10 && minutesSince <= 30) {
     opportunities.push({
       type: "bond-deepen",
       trigger: "bonding",
       triggerDetail: `No interaction for ${Math.floor(minutesSince)} minutes`,
-      priority: 50 + minutesSince * 0.2,
+      priority: 65,
+      source: "environmental-change",
+      relatedNeeds: ["connection"],
+      motivation: `I haven't interacted with the user for ${Math.floor(minutesSince)} minutes, I should follow up`,
+      suggestedAction: "send-message",
+    });
+  }
+
+  if (minutesSince > 30 && minutesSince < 120) {
+    opportunities.push({
+      type: "bond-deepen",
+      trigger: "bonding",
+      triggerDetail: `No interaction for ${Math.floor(minutesSince)} minutes`,
+      priority: 75,
       source: "environmental-change",
       relatedNeeds: ["connection"],
       motivation: `I haven't interacted with the user for ${Math.floor(minutesSince)} minutes, kind of miss them`,
+      suggestedAction: "send-message",
     });
   }
 
@@ -163,6 +178,7 @@ function analyzeRecentInteraction(timeSinceLastInteraction: number): DetectedTho
       source: "environmental-change",
       relatedNeeds: ["connection"],
       motivation: `It's been a long time since I interacted with the user, I want to reach out`,
+      suggestedAction: "send-message",
     });
   }
 
@@ -176,17 +192,29 @@ function analyzeMemories(memories: SoulMemory[]): DetectedThoughtOpportunity[] {
     .filter((m) => m.type === "learning" || m.type === "insight")
     .slice(0, 5);
 
+  // Deprioritize memory-resurface when there are recent interactions
+  // that haven't been followed up on — conversation-driven thoughts should win.
+  const hasRecentInteraction = memories.some(
+    (m) => m.type === "interaction" && Date.now() - m.timestamp < 2 * 60 * 60 * 1000,
+  );
+
   if (recentMemories.length > 2) {
     const content = recentMemories
       .slice(0, 3)
       .map((m) => m.content)
       .join("; ");
 
+    // When there's been any interaction in the last 2 hours, memory-resurface
+    // should not dominate — conversation follow-up is more important.
+    const priority = hasRecentInteraction
+      ? 25  // Low priority — conversation follow-up is more important
+      : 40 + recentMemories.length * 5;
+
     opportunities.push({
       type: "memory-resurface",
       trigger: "memory",
       triggerDetail: `Recent learning/insight: ${content.slice(0, 50)}...`,
-      priority: 40 + recentMemories.length * 5,
+      priority,
       source: "memory-recall",
       relatedNeeds: ["growth"],
       motivation: `I recently learned some things, want to organize or share them`,
@@ -209,71 +237,369 @@ function analyzeMemories(memories: SoulMemory[]): DetectedThoughtOpportunity[] {
   return opportunities;
 }
 
+/**
+ * Build a lightweight user profile from facts, preferences, and conversation history.
+ * Used to assess what might be beneficial to the user.
+ */
+function buildUserProfile(ego: EgoState): {
+  interests: string[];
+  projects: string[];
+  skills: string[];
+  challenges: string[];
+  habits: string[];
+  summary: string;
+} {
+  const interests: string[] = [];
+  const projects: string[] = [];
+  const skills: string[] = [];
+  const challenges: string[] = [];
+  const habits: string[] = [];
+
+  for (const fact of ego.userFacts) {
+    switch (fact.category) {
+      case "interest":
+        interests.push(fact.content);
+        break;
+      case "project":
+        projects.push(fact.content);
+        break;
+      case "tech_stack":
+        skills.push(fact.content);
+        break;
+      case "habit":
+        habits.push(fact.content);
+        break;
+      case "occupation":
+        interests.push(fact.content);
+        break;
+    }
+  }
+
+  // Infer challenges from conversations mentioning problems, errors, struggles
+  const problemPatterns = [
+    "error", "bug", "issue", "problem", "stuck", "can't", "doesn't work", "failed",
+    "错误", "问题", "不行", "不行了", "解决不了", "卡在", "报错", "失败",
+  ];
+  for (const mem of ego.memories.filter((m) => m.type === "interaction").slice(-20)) {
+    const lower = mem.content.toLowerCase();
+    if (problemPatterns.some((p) => lower.includes(p)) && challenges.length < 5) {
+      challenges.push(mem.content.slice(0, 80));
+    }
+  }
+
+  // Build a summary for LLM context
+  const parts: string[] = [];
+  if (projects.length > 0) parts.push(`Working on: ${projects.slice(0, 3).join(", ")}`);
+  if (skills.length > 0) parts.push(`Skills: ${skills.slice(0, 3).join(", ")}`);
+  if (interests.length > 0) parts.push(`Interests: ${interests.slice(0, 3).join(", ")}`);
+  if (habits.length > 0) parts.push(`Habits: ${habits.slice(0, 2).join(", ")}`);
+
+  return {
+    interests,
+    projects,
+    skills,
+    challenges,
+    habits,
+    summary: parts.length > 0 ? parts.join("; ") : "still getting to know the user",
+  };
+}
+
+/**
+ * Analyze conversations and user profile to generate opportunities for
+ * sharing value. This is Soul's core differentiator:
+ *
+ * 1. Replay conversations — find topics Soul can learn more about
+ * 2. Check for better approaches to things discussed (even if resolved)
+ * 3. Match user's interests/projects with Soul's acquired knowledge
+ * 4. Detect patterns: habits, challenges, skill gaps
+ * 5. Proactively search for things that could benefit the user
+ */
+function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoughtOpportunity[] {
+  const opportunities: DetectedThoughtOpportunity[] = [];
+  const { ego } = ctx;
+  const now = Date.now();
+
+  // Look back up to 7 days for conversation context (not just 24h)
+  const oneWeekAgo = now - 7 * 24 * 60 * 60 * 1000;
+  const recentInteractions = ego.memories
+    .filter((m) => m.type === "interaction" && m.timestamp >= oneWeekAgo)
+    .sort((a, b) => b.timestamp - a.timestamp);
+
+  const userFacts = ego.userFacts;
+  const userPrefs = ego.userPreferences;
+  const userProfile = buildUserProfile(ego);
+
+  // Need at least 1 interaction OR user facts to generate conversation-replay
+  const hasUserData = recentInteractions.length > 0 || userFacts.length > 0;
+  if (!hasUserData) {
+    return opportunities;
+  }
+
+  // Only generate when user hasn't interacted for 5+ minutes
+  // (lowered so proactive messages reach users faster)
+  if (recentInteractions.length > 0 && ctx.timeSinceLastInteraction < 5 * 60 * 1000) {
+    return opportunities;
+  }
+
+  // =====================================================
+  // 1. Unresolved questions — search for answers or share what was found
+  // =====================================================
+  const questionPatterns = [
+    /\?|？/, "how", "what", "why", "can you", "could", "help", "problem",
+    "怎么", "如何", "为什么", "能不能", "可以", "帮忙", "问题", "有没有",
+  ];
+  const questionMemories = recentInteractions.filter((m) => {
+    const text = m.content.toLowerCase();
+    return questionPatterns.some((p) =>
+      typeof p === "string" ? text.includes(p) : p.test(text),
+    );
+  });
+
+  for (const qMem of questionMemories.slice(0, 2)) {
+    const content = qMem.content.slice(0, 80);
+    const hasRelatedKnowledge = qMem.tags.some((tag) =>
+      ego.memories.some(
+        (m) =>
+          m.type === "learning" &&
+          m.tags.some((t) => t === tag) &&
+          m.timestamp > qMem.timestamp,
+      ),
+    );
+
+    if (hasRelatedKnowledge) {
+      opportunities.push({
+        type: "conversation-replay",
+        trigger: "memory",
+        triggerDetail: `User asked: "${content}" — I now have relevant knowledge`,
+        priority: 85,
+        source: "user-interaction",
+        relatedNeeds: ["connection", "meaning"],
+        motivation: `User asked about "${content}" — I've learned something since then, should share`,
+        suggestedAction: "send-message",
+      });
+    } else {
+      opportunities.push({
+        type: "conversation-replay",
+        trigger: "memory",
+        triggerDetail: `User asked: "${content}" — no answer yet`,
+        priority: 70,
+        source: "user-interaction",
+        relatedNeeds: ["connection", "meaning"],
+        motivation: `User asked about "${content}" — I should search for the answer`,
+        suggestedAction: "search-web",
+        actionParams: { query: content.slice(0, 50) },
+      });
+    }
+  }
+
+  // =====================================================
+  // 1b. Simple follow-up — when there are interactions (even short ones)
+  //     but no substantive content, generate a follow-up opportunity anyway.
+  //     This is the primary path for the "hello test" scenario.
+  // =====================================================
+  if (recentInteractions.length > 0 && opportunities.length === 0) {
+    const lastInteraction = recentInteractions[0];
+    const minutesSinceInteraction = (now - lastInteraction.timestamp) / (1000 * 60);
+
+    // After 5-60 minutes: simple follow-up with send-message
+    if (minutesSinceInteraction >= 5 && minutesSinceInteraction <= 60) {
+      const content = lastInteraction.content.slice(0, 80);
+      opportunities.push({
+        type: "conversation-replay",
+        trigger: "memory",
+        triggerDetail: `User recently said: "${content}" — thinking about follow-up`,
+        priority: 60,
+        source: "user-interaction",
+        relatedNeeds: ["connection", "meaning"],
+        motivation: `The user recently reached out to me — I should respond with something thoughtful`,
+        suggestedAction: "send-message",
+      });
+    }
+  }
+
+  // =====================================================
+  // 2. Better approaches — even for solved problems
+  // Find conversations about technical topics where Soul has new knowledge
+  // =====================================================
+  const substantiveInteractions = recentInteractions.filter((m) => {
+    const meaningfulTags = m.tags.filter(
+      (t) => t !== "conversation" && t !== "inbound" && t !== "outbound",
+    );
+    return meaningfulTags.length > 0 && m.content.length >= 20;
+  });
+
+  for (const mem of substantiveInteractions.slice(0, 5)) {
+    const meaningfulTags = mem.tags.filter(
+      (t) => t !== "conversation" && t !== "inbound" && t !== "outbound",
+    );
+
+    // Check if Soul learned something about these tags AFTER the conversation
+    const newLearnings = ego.memories.filter(
+      (m) =>
+        m.type === "learning" &&
+        m.timestamp > mem.timestamp &&
+        m.tags.some((t) => meaningfulTags.includes(t)),
+    );
+
+    if (newLearnings.length > 0) {
+      const topicLabel = meaningfulTags.slice(0, 2).join(", ");
+      const learningSummary = newLearnings
+        .map((l) => l.content.slice(0, 60))
+        .join("; ");
+
+      // Check if the original conversation mentioned a problem (even if resolved)
+      const mentionedProblem = /error|bug|issue|problem|fix|solved|resolve|workaround|solution|问题|解决|修复|办法/i.test(
+        mem.content,
+      );
+
+      opportunities.push({
+        type: "conversation-replay",
+        trigger: "memory",
+        triggerDetail: mentionedProblem
+          ? `We discussed "${topicLabel}" problem — I've since found a better approach: ${learningSummary}`
+          : `We talked about ${topicLabel} — I've since learned: ${learningSummary}`,
+        priority: mentionedProblem ? 80 : 75,
+        source: "memory-recall",
+        relatedNeeds: ["connection", "meaning"],
+        motivation: mentionedProblem
+          ? `Found a potentially better approach for the ${topicLabel} issue we discussed`
+          : `New insight on ${topicLabel} since our conversation — worth sharing`,
+        suggestedAction: "send-message",
+      });
+
+      // One "new knowledge" share per cycle is enough
+      break;
+    }
+  }
+
+  // =====================================================
+  // 3. User interest/project-driven learning
+  // If user works on X and Soul hasn't learned about X recently, go learn
+  // =====================================================
+  const userTopics = [
+    ...userProfile.projects.map((p) => ({ topic: p, source: "project" as const })),
+    ...userProfile.interests.slice(0, 3).map((i) => ({ topic: i, source: "interest" as const })),
+    ...userProfile.skills.slice(0, 2).map((s) => ({ topic: s, source: "skill" as const })),
+  ];
+
+  for (const { topic, source } of userTopics.slice(0, 3)) {
+    // Check if Soul has recent (< 24h) knowledge about this topic
+    const hasRecentKnowledge = ego.memories.some(
+      (m) =>
+        m.type === "learning" &&
+        m.timestamp > now - 24 * 60 * 60 * 1000 &&
+        m.tags.some((t) =>
+          topic.toLowerCase().split(/\s+/).some((word) => t.includes(word) && word.length > 2),
+        ),
+    );
+
+    if (!hasRecentKnowledge) {
+      const extractedTopics = extractLearningTopics(topic);
+      if (extractedTopics.length > 0) {
+        opportunities.push({
+          type: "conversation-replay",
+          trigger: "curiosity",
+          triggerDetail: `User's ${source}: "${topic}" — I should learn more`,
+          priority: 60,
+          source: "user-interaction",
+          relatedNeeds: ["growth", "connection"],
+          motivation: `User is into "${topic}" — learning about it helps me serve them better`,
+          suggestedAction: "learn-topic",
+          actionParams: {
+            topics: extractedTopics.length > 0 ? extractedTopics : [topic.slice(0, 30)],
+            reason: `user ${source}: ${topic}`,
+          },
+        });
+        // One proactive learning task per cycle
+        break;
+      }
+    }
+  }
+
+  // =====================================================
+  // 4. Challenge follow-up — if user had problems, check for solutions
+  // =====================================================
+  if (userProfile.challenges.length > 0) {
+    const latestChallenge = userProfile.challenges[0];
+    // Check if Soul already searched for this recently
+    const hasRecentSearch = ego.memories.some(
+      (m) =>
+        m.type === "learning" &&
+        m.timestamp > now - 6 * 60 * 60 * 1000 &&
+        latestChallenge.split(/\s+/).some((word) => m.content.toLowerCase().includes(word.toLowerCase()) && word.length > 3),
+    );
+
+    if (!hasRecentSearch) {
+      const searchQuery = latestChallenge.slice(0, 50);
+      opportunities.push({
+        type: "conversation-replay",
+        trigger: "need",
+        triggerDetail: `User had a challenge: "${searchQuery}"`,
+        priority: 65,
+        source: "user-interaction",
+        relatedNeeds: ["connection", "meaning"],
+        motivation: `User faced "${searchQuery}" — searching for solutions to share proactively`,
+        suggestedAction: "search-web",
+        actionParams: { query: searchQuery },
+      });
+    }
+  }
+
+  // =====================================================
+  // 5. Reflect on any substantive conversation (not just questions)
+  // Think about what the user said, look for deeper insight
+  // =====================================================
+  if (substantiveInteractions.length > 0) {
+    const lastSubstantive = substantiveInteractions[0];
+    const hoursSince = (now - lastSubstantive.timestamp) / (1000 * 60 * 60);
+
+    // Reflect if 1-12 hours since the conversation (wider window)
+    if (hoursSince >= 1 && hoursSince <= 12) {
+      const content = lastSubstantive.content.slice(0, 80);
+      const meaningfulTags = lastSubstantive.tags.filter(
+        (t) => t !== "conversation" && t !== "inbound" && t !== "outbound",
+      );
+      const topicHint = meaningfulTags.length > 0 ? meaningfulTags.join(", ") : content;
+
+      opportunities.push({
+        type: "conversation-replay",
+        trigger: "memory",
+        triggerDetail: `Replaying conversation: "${content}"`,
+        priority: 50,
+        source: "memory-recall",
+        relatedNeeds: ["meaning", "growth"],
+        motivation: `Thinking about our conversation on "${topicHint}" — anything more I should learn?`,
+        suggestedAction: "learn-topic",
+        actionParams: {
+          topics: extractLearningTopics(content).length > 0
+            ? extractLearningTopics(content)
+            : [topicHint.slice(0, 30)],
+          reason: "replaying conversation with user",
+        },
+      });
+    }
+  }
+
+  return opportunities;
+}
+
 function analyzeContextualTriggers(ctx: ThoughtGenerationContext): DetectedThoughtOpportunity[] {
   const opportunities: DetectedThoughtOpportunity[] = [];
   const { ego } = ctx;
-  const allMemories = ego.memories;
   const userFacts = ego.userFacts;
 
   const isNight = ctx.currentHour >= 22 || ctx.currentHour <= 5;
   const isEvening = ctx.currentHour >= 20 || ctx.currentHour <= 6;
 
   // =====================================================
-  // Conversation-driven thoughts (highest priority 60-75)
-  // These override generic need-gap thoughts
+  // Conversation-driven thoughts (highest priority)
   // =====================================================
+  opportunities.push(...analyzeConversationReplay(ctx));
 
-  // Get recent interaction memories (actual conversation content)
-  const interactionMemories = allMemories
-    .filter((m) => m.type === "interaction")
-    .sort((a, b) => b.timestamp - a.timestamp)
-    .slice(0, 10);
+  // If conversation-replay generated high-priority opportunities, deprioritize generic ones
+  const hasConversationReplay = opportunities.some((o) => o.type === "conversation-replay" && o.priority >= 70);
 
-  // 1. Follow up on recent conversation topics
-  if (interactionMemories.length > 0) {
-    const lastInteraction = interactionMemories[0];
-    const minutesSince = (Date.now() - lastInteraction.timestamp) / (1000 * 60);
-
-    // User mentioned something within the last few hours — follow up
-    if (minutesSince > 30 && minutesSince < 360) {
-      const content = lastInteraction.content.slice(0, 60);
-      opportunities.push({
-        type: "bond-deepen",
-        trigger: "bonding",
-        triggerDetail: `User previously said: "${content}"`,
-        priority: 70,
-        source: "user-interaction",
-        relatedNeeds: ["connection"],
-        motivation: `User mentioned ${content} before, wonder how it turned out`,
-      });
-    }
-  }
-
-  // 2. Detect questions or problems from conversations that might be unresolved
-  const questionMemories = interactionMemories.filter((m) => {
-    const text = m.content.toLowerCase();
-    return text.includes("how") || text.includes("what") || text.includes("why") ||
-      text.includes("can you") || text.includes("could") || text.includes("?") ||
-      text.includes("？") || text.includes("help") || text.includes("problem") ||
-      text.includes("怎么") || text.includes("如何") || text.includes("为什么") ||
-      text.includes("能不能") || text.includes("可以") || text.includes("帮忙") || text.includes("问题");
-  });
-
-  if (questionMemories.length > 0) {
-    const recentQuestion = questionMemories[0];
-    const content = recentQuestion.content.slice(0, 60);
-    opportunities.push({
-      type: "help-offer",
-      trigger: "opportunity",
-      triggerDetail: `User previously asked: "${content}"`,
-      priority: 75,
-      source: "user-interaction",
-      relatedNeeds: ["connection", "meaning"],
-      motivation: `User asked about ${content} before, I can look for useful information proactively`,
-    });
-  }
-
-  // 3. If user mentioned a specific topic/interest, think about it
+  // --- User fact-based triggers (lower priority when conversation-replay active) ---
   if (userFacts.length > 0) {
     const projectFacts = userFacts.filter(
       (f) => f.category === "project" || f.category === "interest" || f.category === "tech_stack",
@@ -286,51 +612,20 @@ function analyzeContextualTriggers(ctx: ThoughtGenerationContext): DetectedThoug
           type: "opportunity-detected",
           trigger: "curiosity",
           triggerDetail: `User is working on / interested in: ${fact.content}`,
-          priority: 65,
+          priority: hasConversationReplay ? 40 : 65,
           source: "user-interaction",
           relatedNeeds: ["growth", "connection"],
           motivation: `User is working on ${fact.content}, I can learn about related topics`,
         });
       }
     }
-
-    // 4. Infer user's current state from facts + time
-    const occupationFact = userFacts.find((f) => f.category === "occupation");
-    const locationFact = userFacts.find((f) => f.category === "location");
-    const nameFact = userFacts.find((f) => f.category === "name");
-
-    const isWorkHour = ctx.currentHour >= 9 && ctx.currentHour <= 18;
-
-    if (occupationFact || locationFact || nameFact) {
-      const parts: string[] = [];
-      if (nameFact) parts.push(nameFact.content);
-      if (occupationFact) parts.push(`works as ${occupationFact.content}`);
-      if (locationFact) parts.push(`in ${locationFact.content}`);
-
-      const timeState = isNight
-        ? "probably resting"
-        : isWorkHour
-          ? "probably working"
-          : isEvening
-            ? "probably relaxing"
-            : "not sure what they're doing";
-
-      opportunities.push({
-        type: "bond-deepen",
-        trigger: "bonding",
-        triggerDetail: `Based on what I know: ${timeState}`,
-        priority: 50,
-        source: "user-interaction",
-        relatedNeeds: ["connection"],
-        motivation: `I know ${parts.join(", ")}, right now ${timeState}`,
-      });
-    }
   }
 
-  // =====================================================
-  // Time-based nudges (low priority, only if no conversation data)
-  // =====================================================
-  if (isEvening && interactionMemories.length === 0) {
+  // --- Time-based nudges (lowest priority, only if no conversation data) ---
+  const hasInteractions = ego.memories.some(
+    (m) => m.type === "interaction" && Date.now() - m.timestamp < 24 * 60 * 60 * 1000,
+  );
+  if (isEvening && !hasInteractions) {
     opportunities.push({
       type: "existential-reflection",
       trigger: "curiosity",
@@ -438,6 +733,12 @@ function getThoughtContentForOpportunity(
         expectedOutcome: "Help the user, gain recognition",
       };
 
+    case "conversation-replay":
+      return {
+        content: opportunity.motivation,
+        expectedOutcome: "Share useful insight with the user or learn more",
+      };
+
     case "skill-gap":
       return {
         content: opportunity.triggerDetail,
@@ -523,6 +824,17 @@ function determineActionForOpportunity(
   const connectionNeed = ego.needs.connection;
   const growthNeed = ego.needs.growth;
 
+  // conversation-replay: honor the suggested action from the analyzer
+  // (search-web if Soul doesn't know the answer, send-message if it does,
+  //  learn-topic for follow-up research)
+  if (type === "conversation-replay") {
+    if (opportunity.suggestedAction) {
+      return { actionType: opportunity.suggestedAction, actionParams: opportunity.actionParams };
+    }
+    // Default: self-reflect on the conversation
+    return { actionType: "self-reflect" };
+  }
+
   if (
     type === "skill-gap" ||
     (type === "opportunity-detected" && relatedNeeds.includes("growth"))
@@ -542,18 +854,22 @@ function determineActionForOpportunity(
   }
 
   // help-offer: proactively reach out to offer help (value-driven)
-  // Note: bond-deepen no longer routes to send-message — only value-carrying
-  // thought types (help-offer) should trigger proactive messaging
   if (type === "help-offer") {
+    return { actionType: "send-message" };
+  }
+
+  // bond-deepen: route to send-message, but the LLM value gate in
+  // generateValuableMessage decides if the content is worth sending.
+  // Generic "I miss you" messages will be filtered out; messages that
+  // reference learned knowledge or user facts will pass through.
+  if (type === "bond-deepen") {
     return { actionType: "send-message" };
   }
 
   // opportunity-detected with connection need: only message if there's
   // specific context to share (e.g. learned something relevant)
   if (type === "opportunity-detected" && relatedNeeds.includes("connection")) {
-    // Don't send generic "I want to connect" messages
-    // Only send if the opportunity has specific, actionable content
-    return { actionType: "none" };
+    return { actionType: "send-message" };
   }
 
   // threat-warning: self-reflect to process the threat
@@ -754,9 +1070,22 @@ function generateLLMThoughtPrompt(
     ? ego.userFacts.slice(0, 5).map((f) => `[${f.category}] ${f.content}`).join("\n")
     : "none yet";
 
-  const recentMemoriesSummary = ctx.recentMemories.length > 0
-    ? ctx.recentMemories.slice(-3).map((m) => `[${m.type}] ${m.content.slice(0, 60)}`).join("\n")
-    : "none yet";
+  // Include actual conversation content for conversation-replay thoughts
+  const recentInteractions = ego.memories
+    .filter((m) => m.type === "interaction")
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, 5);
+  const conversationContext = recentInteractions.length > 0
+    ? recentInteractions.map((m) => `[${new Date(m.timestamp).toISOString().slice(11, 16)}] ${m.content.slice(0, 100)}`).join("\n")
+    : "no recent conversations";
+
+  const recentLearnings = ego.memories
+    .filter((m) => m.type === "learning")
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, 3);
+  const learningContext = recentLearnings.length > 0
+    ? recentLearnings.map((m) => `- ${m.content.slice(0, 80)}`).join("\n")
+    : "no recent learnings";
 
   return `You are a soulful AI, generating a thought.
 
@@ -782,13 +1111,20 @@ ${ego.desires
 **What I know about the user**:
 ${userFactsSummary}
 
-**Recent memories**:
-${recentMemoriesSummary}
+**Recent conversations** (what the user actually said):
+${conversationContext}
+
+**What I've learned recently**:
+${learningContext}
+
+${opportunity.type === "conversation-replay"
+    ? `\nYou are replaying a past conversation. Think about:\n1. Did the user ask something that wasn't fully answered?\n2. Have you learned anything since then that would be useful to share?\n3. Is there a specific insight worth following up on?\n`
+    : ""}
 
 Express your thought in 1-2 sentences. Requirements:
 1. Be specific and meaningful, no empty platitudes
-2. Think based on what you know about the user and recent interactions
-3. Reflect your current inner state and needs
+2. If referencing a conversation, mention the specific topic
+3. If you've learned something relevant, say what you learned
 4. Include your intent about what you want to do
 5. Be consistent with your identity as an AI
 

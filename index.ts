@@ -1,11 +1,54 @@
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
+import { execSync } from "node:child_process";
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type PluginEvent = any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type PluginContext = any;
+type OpenClawPluginApi = {
+  pluginConfig: Record<string, unknown>;
+  config: Record<string, unknown>;
+  on(event: string, handler: (event: PluginEvent, ctx?: PluginContext) => Promise<unknown>): void;
+  registerService(service: { id: string; start: () => Promise<void>; stop: () => Promise<void> }): void;
+};
 import { ThoughtService } from "./src/thought-service.js";
 import { createSoulActionHandler, type MessageSender } from "./src/soul-actions.js";
 import { createSoulLogger } from "./src/logger.js";
 import { resolveLLMConfigFromOpenClaw, type SoulLLMConfig } from "./src/soul-llm.js";
-import { getGatewayPort } from "./src/env.js";
 
 const log = createSoulLogger("plugin");
+
+/**
+ * Build a sendMessage function that uses `openclaw message send` CLI.
+ *
+ * This works for ALL channels (telegram, discord, slack, feishu, etc.)
+ * without needing channel-specific SDK imports.
+ * Throws on failure so action-executor can catch and handle the error.
+ */
+function buildSendMessage(opts: {
+  getChannel: () => string | undefined;
+  getTarget: () => string | undefined;
+}): MessageSender {
+  return async (params) => {
+    const channel = params.channel || opts.getChannel();
+    const target = params.to || opts.getTarget();
+    if (!channel || !target) {
+      throw new Error("sendMessage: no channel/target resolved yet");
+    }
+
+    const escapedContent = params.content.replace(/'/g, "'\\''");
+    const cmd = `openclaw message send --channel ${channel} --target ${target} --message '${escapedContent}'`;
+
+    try {
+      execSync(cmd, {
+        timeout: 30_000,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      log.info(`Proactive message delivered via ${channel} to ${target}`);
+    } catch (err) {
+      const stderr = (err as { stderr?: Buffer })?.stderr?.toString().trim() ?? "";
+      throw new Error(`sendMessage failed (channel=${channel}): ${stderr || String(err)}`);
+    }
+  };
+}
 
 let thoughtService: ThoughtService | null = null;
 
@@ -114,14 +157,6 @@ const plugin = {
   },
 
   register(api: OpenClawPluginApi) {
-    // Guard: prevent re-registration from overwriting a running service instance.
-    // The gateway may call register() multiple times (e.g. on config reload or channel connect).
-    // If thoughtService already exists and is running, bail out to keep the original instance.
-    if (thoughtService?.isRunning()) {
-      log.debug("Soul plugin already registered and running, skipping re-registration");
-      return;
-    }
-
     const config = cfg<PluginConfig>(api.pluginConfig);
 
     // Inner `enabled` defaults to true; only skip if explicitly set to false
@@ -132,91 +167,81 @@ const plugin = {
 
     const openclawConfig = api.config as Record<string, unknown>;
 
-    // --- 1. Auto-resolve LLM config from OpenClaw's primary model ---
-    const llmConfig = resolveLLMConfigFromOpenClaw(
-      openclawConfig as Parameters<typeof resolveLLMConfigFromOpenClaw>[0],
-      config.llm,
-    );
-
-    if (llmConfig.provider && llmConfig.model) {
-      log.info(`LLM: ${llmConfig.provider}/${llmConfig.model} (auto-detected from OpenClaw config)`);
-    } else {
-      log.warn("No LLM configured — soul will use rule-based thought generation only");
-      log.warn("Configure agents.defaults.model in openclaw.yaml, or set plugins.soul.llm");
-    }
-
-    // --- 2. Auto-resolve proactive messaging channel from OpenClaw's channels config ---
-    const proactiveMessaging = config.proactiveMessaging !== false; // default: true
+    // Mutable state shared between service creation and hooks — must be at
+    // register() scope so the message_received hook can auto-learn the target.
     let proactiveChannel = config.proactiveChannel;
     let proactiveTarget = config.proactiveTarget;
 
-    if (proactiveMessaging && (!proactiveChannel || !proactiveTarget)) {
-      const detected = autoDetectChannel(openclawConfig);
-      if (detected) {
-        proactiveChannel ??= detected.channel;
-        proactiveTarget ??= detected.target;
-        if (proactiveChannel && proactiveTarget) {
-          log.info(`Proactive messaging: auto-detected ${proactiveChannel}/${proactiveTarget}`);
-        } else if (proactiveChannel) {
-          log.info(`Proactive messaging: auto-detected channel ${proactiveChannel}`);
-          log.warn(`proactiveTarget not set — soul will think but won't send messages. Set plugins.soul.config.proactiveTarget.`);
+    // --- Service singleton: only create ThoughtService ONCE ---
+    // The gateway may call register() multiple times (e.g. for different agent
+    // session registries). We must always register hooks (api.on) for each
+    // registry, but the ThoughtService instance is shared.
+    if (!thoughtService?.isRunning()) {
+      // --- 1. Auto-resolve LLM config from OpenClaw's primary model ---
+      const llmConfig = resolveLLMConfigFromOpenClaw(
+        openclawConfig as Parameters<typeof resolveLLMConfigFromOpenClaw>[0],
+        config.llm,
+      );
+
+      if (llmConfig.provider && llmConfig.model) {
+        log.info(`LLM: ${llmConfig.provider}/${llmConfig.model} (auto-detected from OpenClaw config)`);
+      } else {
+        log.warn("No LLM configured — soul will use rule-based thought generation only");
+        log.warn("Configure agents.defaults.model in openclaw.yaml, or set plugins.soul.llm");
+      }
+
+      // --- 2. Auto-resolve proactive messaging channel from OpenClaw's channels config ---
+      const proactiveMessaging = config.proactiveMessaging !== false; // default: true
+
+      if (proactiveMessaging && (!proactiveChannel || !proactiveTarget)) {
+        const detected = autoDetectChannel(openclawConfig);
+        if (detected) {
+          proactiveChannel ??= detected.channel;
+          proactiveTarget ??= detected.target;
+          if (proactiveChannel && proactiveTarget) {
+            log.info(`Proactive messaging: auto-detected ${proactiveChannel}/${proactiveTarget}`);
+          } else if (proactiveChannel) {
+            log.info(`Proactive messaging: auto-detected channel ${proactiveChannel}`);
+            log.warn(`proactiveTarget not set — soul will think but won't send messages. Set plugins.soul.config.proactiveTarget.`);
+          }
         }
       }
+
+      // --- 3. Message sender (uses openclaw CLI for universal channel support) ---
+      // Throws on failure so action-executor can catch and handle the error.
+      const sendMessage: MessageSender | undefined =
+        proactiveMessaging
+          ? buildSendMessage({
+              getChannel: () => proactiveChannel,
+              getTarget: () => proactiveTarget,
+            })
+          : undefined;
+
+      // --- 4. Create and register the thought service ---
+      thoughtService = new ThoughtService({
+        checkIntervalMs: config.checkIntervalMs ?? 60_000,
+        llmConfig,
+        proactiveChannel,
+        proactiveTarget,
+        sendMessage,
+        openclawConfig,
+        onThought: createSoulActionHandler(),
+      });
+
+      api.registerService({
+        id: "soul-thought-service",
+        start: async () => {
+          await thoughtService!.start();
+          log.info("Soul thought service started");
+        },
+        stop: async () => {
+          thoughtService?.stop();
+          log.info("Soul thought service stopped");
+        },
+      });
+    } else {
+      log.info("Soul ThoughtService already running — re-registering hooks only");
     }
-
-    // --- 3. Message sender (uses gateway HTTP API) ---
-    // Captured by reference — reads latest proactiveChannel/proactiveTarget at call time
-    const sendMessage: MessageSender | undefined =
-      proactiveMessaging
-        ? async (params) => {
-            const ch = params.channel || proactiveChannel;
-            const target = params.to || proactiveTarget;
-            if (!ch || !target) {
-              log.debug(`sendMessage skipped: no channel/target resolved yet`);
-              return;
-            }
-            try {
-              const port = getGatewayPort();
-              const response = await fetch(`http://127.0.0.1:${port}/api/message/send`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  to: target,
-                  content: params.content,
-                  channel: ch,
-                }),
-              });
-              if (!response.ok) {
-                log.warn(`Message send failed: ${response.status}`);
-              }
-            } catch (err) {
-              log.warn(`Message send error: ${String(err)}`);
-            }
-          }
-        : undefined;
-
-    // --- 4. Create and register the thought service ---
-    thoughtService = new ThoughtService({
-      checkIntervalMs: config.checkIntervalMs ?? 60_000,
-      llmConfig,
-      proactiveChannel,
-      proactiveTarget,
-      sendMessage,
-      openclawConfig,
-      onThought: createSoulActionHandler(),
-    });
-
-    api.registerService({
-      id: "soul-thought-service",
-      start: async () => {
-        await thoughtService!.start();
-        log.info("Soul thought service started");
-      },
-      stop: async () => {
-        thoughtService?.stop();
-        log.info("Soul thought service stopped");
-      },
-    });
 
     // --- 5. Inject soul system prompt via before_prompt_build hook ---
     api.on("before_prompt_build", async (_event, _ctx) => {
@@ -239,22 +264,25 @@ const plugin = {
 
     // --- 6. Track message interactions for soul memory ---
     api.on("message_received", async (_event, _ctx) => {
+      const text =
+        typeof _event === "object" && _event !== null && "content" in _event
+          ? String((_event as { content?: string }).content ?? "")
+          : "";
+      const from =
+        typeof _event === "object" && _event !== null && "from" in _event
+          ? String((_event as { from?: string }).from ?? "")
+          : "";
+      const channelId =
+        typeof _ctx === "object" && _ctx !== null && "channelId" in _ctx
+          ? String((_ctx as { channelId?: string }).channelId ?? "")
+          : "";
+
+      // Unconditional diagnostic — fires regardless of service state
+      log.info(`message_received hook fired: text=${text.length} chars, from=${from || "(none)"}, channel=${channelId || "(none)"}, running=${thoughtService?.isRunning() ?? "no service"}`);
+
       if (!thoughtService?.isRunning()) return;
 
       try {
-        const text =
-          typeof _event === "object" && _event !== null && "text" in _event
-            ? String((_event as { text?: string }).text ?? "")
-            : "";
-        const from =
-          typeof _event === "object" && _event !== null && "from" in _event
-            ? String((_event as { from?: string }).from ?? "")
-            : "";
-        const channelId =
-          typeof _ctx === "object" && _ctx !== null && "channelId" in _ctx
-            ? String((_ctx as { channelId?: string }).channelId ?? "")
-            : "";
-
         // Auto-learn proactive target from first inbound message
         if (from && channelId && !proactiveTarget) {
           proactiveTarget = from;
@@ -287,7 +315,7 @@ const plugin = {
       }
     });
 
-    log.info("Soul plugin registered");
+    log.info("Soul plugin registered (hooks: before_prompt_build, message_received, message_sent)");
   },
 };
 

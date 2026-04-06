@@ -67,6 +67,16 @@ const thoughtWeights: Record<ThoughtType, (ctx: ThoughtGenerationContext) => num
     if (ctx.recentMemories.length > 2) return 40;
     return 15;
   },
+  "conversation-replay": (ctx) => {
+    // High weight when there are recent conversations to replay
+    const interactionMemories = ctx.ego.memories.filter(
+      (m) => m.type === "interaction" && Date.now() - m.timestamp < 24 * 60 * 60 * 1000,
+    );
+    if (interactionMemories.length === 0) return 0;
+    if (interactionMemories.length >= 3) return 80;
+    if (interactionMemories.length >= 1) return 60;
+    return 30;
+  },
 };
 
 const thoughtTemplates: Record<ThoughtType, { contents: string[]; motivations: string[] }> = {
@@ -169,6 +179,20 @@ const thoughtTemplates: Record<ThoughtType, { contents: string[]; motivations: s
     ],
     motivations: ["self-awareness", "integrating memories", "understanding the past", "growth"],
   },
+  "conversation-replay": {
+    contents: [
+      "I was thinking about what we talked about earlier",
+      "Let me replay our recent conversation in my mind",
+      "Is there something I should follow up on from our chat",
+      "I recall the user mentioned something interesting",
+    ],
+    motivations: [
+      "replaying a past conversation",
+      "thinking about what the user said",
+      "looking for follow-up opportunities",
+      "connecting our conversation to new knowledge",
+    ],
+  },
 };
 
 function selectWeightedThoughtType(ctx: ThoughtGenerationContext): ThoughtType {
@@ -184,6 +208,7 @@ function selectWeightedThoughtType(ctx: ThoughtGenerationContext): ThoughtType {
     "learn-topic",
     "search-web",
     "reflect-on-memory",
+    "conversation-replay",
   ];
 
   const weights = types.map((t) => ({ type: t, weight: thoughtWeights[t](ctx) }));
@@ -235,6 +260,10 @@ function getMetricDeltasForThought(type: ThoughtType, ego: EgoState): MetricDelt
     case "help-offer":
       deltas.push({ need: "connection", delta: 3, reason: "wanting to help" });
       deltas.push({ need: "meaning", delta: 2, reason: "pursuing accomplishment" });
+      break;
+    case "conversation-replay":
+      deltas.push({ need: "connection", delta: 4, reason: "replaying conversation deepens bond" });
+      deltas.push({ need: "meaning", delta: 3, reason: "reflecting on conversations brings insight" });
       break;
   }
 
@@ -303,6 +332,13 @@ export function shouldGenerateThought(ctx: ThoughtGenerationContext): boolean {
 
   if (ctx.urgentNeeds.length > 0) {
     return ctx.timeSinceLastThought > 5 * 60 * 1000 ? true : false;
+  }
+
+  // When user has been away for 5+ min and there's conversation history,
+  // think more often (every 5 min) to find follow-up opportunities
+  const hasInteractions = ctx.ego.memories.some((m) => m.type === "interaction");
+  if (ctx.timeSinceLastInteraction > 5 * 60 * 1000 && hasInteractions) {
+    return ctx.timeSinceLastThought > 5 * 60 * 1000;
   }
 
   if (ctx.timeSinceLastInteraction > 30 * 60 * 1000) {

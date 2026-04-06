@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { createSoulLogger } from "./logger.js";
-import { executeThoughtAction } from "./action-executor.js";
+import { executeThoughtAction, flushPendingShareMessage, isGoodTimeForMessage } from "./action-executor.js";
 import type { ActionExecutorOptions } from "./action-executor.js";
 import { markSuccess, expirePending, pruneEntries, logSuccessRateSummary } from "./behavior-log.js";
 import type { MessageSender } from "./soul-actions.js";
@@ -81,7 +81,7 @@ export class ThoughtService {
 
     // Initialize LLM generator from config
     if (options.llmConfig) {
-      createSoulLLMGenerator(options.llmConfig)
+      createSoulLLMGenerator(options.llmConfig, options.openclawConfig as Parameters<typeof createSoulLLMGenerator>[1])
         .then((gen) => {
           if (gen) {
             this.llmGenerator = gen;
@@ -157,9 +157,62 @@ export class ThoughtService {
     try {
       await this.applyDecay();
       await this.runExpiryIfDue();
+      await this.resolveStalePendingEntries();
+      await this.flushPendingMessage();
       await this.checkAndGenerateThought();
     } catch (err) {
       log.error("Error in thought service tick", String(err));
+    }
+  }
+
+  /**
+   * Auto-resolve stale pending behavior log entries (>10 min old).
+   * This prevents deadlock when the message_received hook doesn't fire
+   * (e.g. gateway restart, hook not registered for a channel).
+   */
+  private async resolveStalePendingEntries(): Promise<void> {
+    const STALE_MS = 10 * 60 * 1000; // 10 minutes
+    const now = Date.now();
+    let resolved = false;
+
+    await updateEgoStore(this.storePath, (ego) => {
+      if (!ego.behaviorLog) return ego;
+      for (const entry of ego.behaviorLog) {
+        if (entry.outcome === "pending" && now - entry.timestamp > STALE_MS) {
+          entry.outcome = "expired";
+          entry.resolvedAt = now;
+          resolved = true;
+        }
+      }
+      return ego;
+    });
+
+    if (resolved) {
+      log.info("Auto-resolved stale pending behavior entries (>10 min old)");
+    }
+  }
+
+  /**
+   * If there's a pending share message queued from quiet hours, send it now
+   * if it's a good time.
+   */
+  private async flushPendingMessage(): Promise<void> {
+    if (!this.sendMessage || !this.proactiveChannel || !this.proactiveTarget) {
+      return;
+    }
+
+    const message = await flushPendingShareMessage();
+    if (!message) return;
+
+    try {
+      await this.sendMessage({
+        to: this.proactiveTarget,
+        content: message,
+        channel: this.proactiveChannel,
+      });
+      log.info(`Flushed pending message: ${message.slice(0, 50)}...`);
+    } catch (err) {
+      log.warn("Failed to flush pending message", String(err));
     }
   }
 
@@ -379,7 +432,7 @@ export class ThoughtService {
     if (this.onThought) {
       try {
         // Abort check before executing the thought
-        if (this.thoughtAbortController?.signal.aborted) {
+        if (signal.aborted) {
           log.info("Thought discarded: aborted before execution");
           return;
         }
@@ -387,7 +440,7 @@ export class ThoughtService {
         await this.applyThoughtResult(result);
 
         // Abort check before executing action
-        if (this.thoughtAbortController?.signal.aborted) {
+        if (signal.aborted) {
           log.info("Thought action cancelled: user interaction in progress");
           return;
         }
@@ -582,17 +635,32 @@ export class ThoughtService {
       // Store the conversation content as an interaction memory
       // Keep only recent interactions to avoid unbounded growth
       if (type === "inbound" && text.length >= 5) {
+        // Extract topic tags from the conversation text
+        const extractedTags = this.extractInteractionTags(text);
+        const tags = ["conversation", type, ...extractedTags];
+
+        // Use LLM to generate a summary if available, otherwise use truncated text
+        const content = text.slice(0, 300);
+
         const interactionMemory: SoulMemory = {
           id: randomBytes(8).toString("hex"),
           type: "interaction",
-          content: text.slice(0, 200),
+          content,
           emotion: sentiment.score * 30,
           valence: sentiment.score > 0.1 ? "positive" : sentiment.score < -0.1 ? "negative" : "neutral",
           importance: Math.min(1, text.length / 100 + Math.abs(sentiment.score) * 0.3),
           timestamp: Date.now(),
-          tags: ["conversation", type],
+          tags,
         };
         ego.memories.push(interactionMemory);
+
+        // Detect user language from message text
+        if (type === "inbound" && text.length >= 5) {
+          const detected = this.detectLanguage(text);
+          if (detected) {
+            ego.userLanguage = detected;
+          }
+        }
 
         // Keep only the most recent 50 interaction memories
         const interactionMemories = ego.memories.filter((m) => m.type === "interaction");
@@ -1048,5 +1116,150 @@ If there are no new preferences, return an empty array: []`;
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Extract topic tags from conversation text using keyword matching.
+   * Falls back to simple word extraction if no keywords are matched.
+   * Tags are used by conversation-replay analyzer to match conversations
+   * with Soul's learned knowledge.
+   */
+  private extractInteractionTags(text: string): string[] {
+    const tags: string[] = [];
+    const lower = text.toLowerCase();
+
+    // Technical keywords
+    const techKeywords: Record<string, string> = {
+      "python": "python",
+      "javascript": "javascript",
+      "typescript": "typescript",
+      "react": "react",
+      "vue": "vue",
+      "node": "nodejs",
+      "docker": "docker",
+      "kubernetes": "kubernetes",
+      "k8s": "kubernetes",
+      "aws": "aws",
+      "gcp": "gcp",
+      "azure": "azure",
+      "linux": "linux",
+      "macos": "macos",
+      "windows": "windows",
+      "database": "database",
+      "redis": "redis",
+      "postgres": "postgres",
+      "mysql": "mysql",
+      "mongodb": "mongodb",
+      "api": "api",
+      "rest": "rest-api",
+      "graphql": "graphql",
+      "ai": "ai",
+      "ml": "machine-learning",
+      "machine learning": "machine-learning",
+      "deep learning": "deep-learning",
+      "llm": "llm",
+      "gpt": "gpt",
+      "claude": "claude",
+      "openai": "openai",
+      "error": "error-handling",
+      "bug": "bug",
+      "debug": "debugging",
+      "test": "testing",
+      "deploy": "deployment",
+      "ci/cd": "ci-cd",
+      "security": "security",
+      "performance": "performance",
+      "architecture": "architecture",
+      "design": "design",
+      "product": "product",
+      "project": "project-management",
+    };
+
+    // Chinese technical keywords
+    const cnKeywords: Record<string, string> = {
+      "人工智能": "ai",
+      "机器学习": "machine-learning",
+      "深度学习": "deep-learning",
+      "编程": "programming",
+      "开发": "development",
+      "算法": "algorithm",
+      "数据库": "database",
+      "服务器": "server",
+      "前端": "frontend",
+      "后端": "backend",
+      "全栈": "fullstack",
+      "运维": "devops",
+      "测试": "testing",
+      "部署": "deployment",
+      "架构": "architecture",
+      "设计": "design",
+      "产品": "product",
+      "项目": "project-management",
+      "错误": "error-handling",
+      "问题": "problem",
+      "优化": "optimization",
+      "安全": "security",
+    };
+
+    for (const [keyword, tag] of Object.entries(techKeywords)) {
+      if (lower.includes(keyword)) {
+        tags.push(tag);
+      }
+    }
+
+    for (const [keyword, tag] of Object.entries(cnKeywords)) {
+      if (text.includes(keyword)) {
+        tags.push(tag);
+      }
+    }
+
+    // Deduplicate and limit
+    return [...new Set(tags)].slice(0, 5);
+  }
+
+  /**
+   * Detect the user's language from message text using CJK character ratio.
+   * Returns a language code ("zh-CN", "en", "ja", "ko") or null if unclear.
+   * Lightweight heuristic — no LLM call needed.
+   */
+  private detectLanguage(text: string): string | null {
+    let cjk = 0;
+    let latin = 0;
+    let hiragana = 0;
+    let hangul = 0;
+
+    for (const ch of text) {
+      const code = ch.codePointAt(0)!;
+      // CJK Unified Ideographs + Extension A-H
+      if (
+        (code >= 0x4e00 && code <= 0x9fff) ||
+        (code >= 0x3400 && code <= 0x4dbf) ||
+        (code >= 0x20000 && code <= 0x2a6df)
+      ) {
+        cjk++;
+      }
+      // Hiragana/Katakana — likely Japanese
+      if ((code >= 0x3040 && code <= 0x309f) || (code >= 0x30a0 && code <= 0x30ff)) {
+        hiragana++;
+      }
+      // Hangul — Korean
+      if ((code >= 0xac00 && code <= 0xd7af) || (code >= 0x1100 && code <= 0x11ff)) {
+        hangul++;
+      }
+      // Latin
+      if ((code >= 0x0041 && code <= 0x007a) || (code >= 0x00c0 && code <= 0x024f)) {
+        latin++;
+      }
+    }
+
+    const total = cjk + latin + hiragana + hangul;
+    if (total === 0) return null;
+
+    if (hangul / total > 0.3) return "ko";
+    if (hiragana / total > 0.15) return "ja";
+    if (cjk / total > 0.2) return "zh-CN";
+    if (latin / total > 0.5) return "en";
+
+    return null;
   }
 }

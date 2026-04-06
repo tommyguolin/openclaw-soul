@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.5.0 (2026-04-07)
+
+### Changes
+
+- **Universal LLM access via gateway local API**: Soul now calls the gateway's `/v1/chat/completions` endpoint by default, which handles all provider auth/routing/OAuth transparently. Works in all environments (daemon mode, foreground, any deployment) without requiring API keys or env vars. Falls back to direct provider API if gateway is unavailable
+- **Language detection and awareness**: Soul detects the user's language from messages (Chinese, English, Japanese, Korean) and stores it in ego state. All LLM prompts include language instructions so proactive messages match the user's language
+- **Improved proactive message quality**: Enhanced LLM value gate with explicit criteria for what counts as valuable (specific insights, useful tips, answers to previous questions) vs. not valuable (just saying hi, generic encouragement, "I was thinking about..."). Both primary and fallback LLM attempts must agree before sending
+- **Sentence-boundary truncation**: Proactive messages are now truncated at sentence boundaries instead of mid-sentence, supporting both English and Chinese punctuation
+- **Meta-analysis stripping**: LLM output is cleaned of common meta-analysis prefixes ("Let me analyze...", "Based on my analysis...") that sometimes appear despite instructions
+- **Time-of-day context in prompts**: Proactive message prompts now include time context (morning/afternoon/evening) so message tone matches the time
+- **Stale pending behavior cleanup**: Behavior log entries stuck in "pending" state for over 10 minutes are automatically resolved to prevent deadlock (e.g. when gateway restarts or message_received hook doesn't fire)
+
+### Fixes
+
+- Fixed gateway returning `400 - Invalid model` error: gateway local API expects `model: "openclaw"` (not actual model name like "MiniMax-M2.5")
+- Fixed proactive message deadlock where pending behavior entries blocked all future sends until manually resolved
+- Fixed gateway port resolution: now checks env var, OpenClaw config, and default (18789) in priority order
+- Fixed LLM `max_tokens` too low (300 → 1024) causing truncated thought generation
+
+## 1.4.0 (2026-04-06)
+
+### Changes
+
+- **Conversation replay overhaul**: Soul now analyzes ALL conversations, a broader scope — not just questions/queriess): Soul replays past conversations, thinking about whether it resolved questions, if there's better approach (share), that) or if no relevant knowledge, learn more). Users's interests and projects, skills, challenges are and proactively search for solutions to share findings)
+  - User profile built from facts + preferences + conversation history — user's interests/projects/skills/challenges drive `learn-topic` or `search-web` to find solutions and then share
+  - Extended conversation replay analysis to 7 days (was just 24 hours) for smarter matching with conversation substance
+  - Faster first proactive message: lowered thought trigger to 15 min, conversation-replay threshold to 15 min, lowered `shouldGenerateThought` threshold to 15 min for active conversation history
+  - Improved interaction memory with extracted topic tags and 300 char content (up from 200)
+  - Better LLM prompt with richer context:user profile, conversation history, knowledge gained, language detection, extended value assessment criteria (better solutions, relevant discoveries, user challenges, skills)
+  - Increased message length limit to 300 chars
+
+- Smart timing gate with quiet hours (23-08:00) and pending message queue for later
+- Reduced generic template fallback threshold ( more generic phrases blocked)- **Conversation-driven thought system**: Soul now replays past conversations instead of generating generic thoughts. It recalls what the user said, checks if it has learned anything relevant since, and decides whether to follow up, search for more information, or share insights
+- New `conversation-replay` thought type with highest priority when recent conversations exist. Detects unresolved questions, matches conversation topics with newly acquired knowledge, and generates follow-up opportunities
+- **Smart timing for proactive messages**: Quiet hours (23:00-08:00) — messages are queued instead of sent. Pending messages are automatically flushed at the next good hour
+- **Better interaction memory**: conversations now store up to 300 chars (was 200) with extracted topic tags (tech keywords in English and Chinese). Tags enable conversation-replay to match conversations with Soul's learned knowledge
+- Improved LLM thought prompt: includes actual conversation content and recent learnings, so thoughts reference specific topics instead of abstract need states
+- Deprioritizes generic need-gap and bond-deepen thoughts when conversation-replay has high-priority opportunities
+
+## 1.3.2 (2026-04-05)
+
+### Fixes
+
+- Fixed proactive messaging never triggering: restored `bond-deepen` → `send-message` routing (was over-removed in v1.3.1). The LLM value gate still filters out generic "I miss you" messages, but now allows messages when Soul has learned something relevant to share
+
 ## 1.3.0 (2026-04-04)
 
 ### Changes

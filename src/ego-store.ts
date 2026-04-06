@@ -161,6 +161,8 @@ export function createDefaultEgoState(): EgoState {
     coreIdentity: "A soulful lobster",
     establishedRoutines: [],
     behaviorLog: [],
+    pendingShareMessage: null,
+    userLanguage: null,
   };
 }
 
@@ -209,6 +211,8 @@ function mergeWithDefaultsV2(loaded: Partial<EgoState>): EgoState {
     "coreIdentity",
     "lastThoughtTime",
     "lastInteractionTime",
+    "pendingShareMessage",
+    "userLanguage",
   ] as (keyof EgoState)[]) {
     if (loaded[key] !== undefined) {
       (result as Record<string, unknown>)[key] = loaded[key];

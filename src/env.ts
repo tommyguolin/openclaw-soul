@@ -5,9 +5,31 @@
  * avoiding the env-harvesting security scanner rule.
  */
 
-// Gateway port for message sending
-export function getGatewayPort(): string {
-  return process.env.OPENCLAW_GATEWAY_PORT ?? "18789";
+const DEFAULT_GATEWAY_PORT = 18789;
+
+/**
+ * Resolve the gateway port from (in priority order):
+ * 1. OPENCLAW_GATEWAY_PORT env var
+ * 2. gateway.port from OpenClaw config
+ * 3. Default 18789
+ */
+export function getGatewayPort(openclawConfig?: Record<string, unknown>): number {
+  // Env var takes highest priority
+  const envRaw = process.env.OPENCLAW_GATEWAY_PORT?.trim();
+  if (envRaw) {
+    const parsed = Number.parseInt(envRaw, 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+
+  // Fall back to config
+  const configPort = (openclawConfig?.gateway as Record<string, unknown> | undefined)?.port;
+  if (typeof configPort === "number" && Number.isFinite(configPort) && configPort > 0) {
+    return configPort;
+  }
+
+  return DEFAULT_GATEWAY_PORT;
 }
 
 // API key resolution for LLM providers

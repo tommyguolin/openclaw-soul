@@ -14,7 +14,7 @@ import type {
 import type { LLMGenerator } from "./soul-llm.js";
 import type { MessageSender } from "./soul-actions.js";
 import type { OpenClawSearchCompat } from "./soul-search.js";
-import { updateEgoStore, resolveEgoStorePath } from "./ego-store.js";
+import { updateEgoStore, loadEgoStore, resolveEgoStorePath } from "./ego-store.js";
 import { buildAssociations, applyReverseAssociations } from "./memory-association.js";
 import { addKnowledgeItem } from "./knowledge-store.js";
 import {
@@ -25,6 +25,92 @@ import {
 } from "./behavior-log.js";
 
 const log = createSoulLogger("action-executor");
+
+/**
+ * Truncate text at a sentence boundary (period, question mark, exclamation)
+ * instead of cutting mid-sentence. Falls back to hard cut only if no
+ * sentence boundary exists before maxLen.
+ */
+function truncateAtSentence(text: string, maxLen: number): string {
+  if (text.length <= maxLen) {
+    // Even if within length, check if the text ends with a complete sentence.
+    // LLM output can be cut mid-sentence by token limits.
+    const sentenceEnders = /[。？！.!?]$/;
+    if (!sentenceEnders.test(text.trim())) {
+      const lastEnd = Math.max(
+        text.lastIndexOf("。"),
+        text.lastIndexOf("？"),
+        text.lastIndexOf("！"),
+        text.lastIndexOf("."),
+        text.lastIndexOf("?"),
+        text.lastIndexOf("!"),
+      );
+      if (lastEnd > text.length * 0.3) {
+        return text.slice(0, lastEnd + 1).trim();
+      }
+    }
+    return text;
+  }
+  const truncated = text.slice(0, maxLen);
+  const lastSentenceEnd = Math.max(
+    truncated.lastIndexOf("。"),
+    truncated.lastIndexOf("？"),
+    truncated.lastIndexOf("！"),
+    truncated.lastIndexOf("."),
+    truncated.lastIndexOf("?"),
+    truncated.lastIndexOf("!"),
+  );
+  if (lastSentenceEnd > maxLen * 0.5) {
+    return truncated.slice(0, lastSentenceEnd + 1).trim();
+  }
+  return truncated.trim();
+}
+
+/**
+ * Strip meta-analysis prefixes that LLMs sometimes add despite instructions.
+ * E.g. "Let me analyze...", "1. The user...", "Based on my analysis..."
+ * Returns null if the entire response is meta-analysis with no actual message.
+ */
+function stripMetaAnalysis(text: string): string {
+  if (!text) return "";
+
+  // Common meta-analysis patterns the LLM outputs despite being told not to
+  const metaPrefixes = [
+    /^let me analyze[\s\S]*?(?:\n|$)/im,
+    /^based on (?:my |the )?analysis[\s\S]*?(?:\n|$)/im,
+    /^I (?:need to |should )?(?:think about|consider|analyze|assess)[\s\S]*?(?:\n|$)/im,
+    /^(?:Here's|Here is) (?:what I |my )?(?:know|think|found|analyzed)[\s\S]*?(?:\n|$)/im,
+    /^looking at (?:the |this )?(?:context|information|situation)[\s\S]*?(?:\n|$)/im,
+    /^after (?:reviewing|analyzing|considering)[\s\S]*?(?:\n|$)/im,
+  ];
+
+  let cleaned = text;
+  for (const pattern of metaPrefixes) {
+    cleaned = cleaned.replace(pattern, "");
+  }
+
+  // If the response is a numbered/analytical list, it's meta, not a message
+  if (/^\s*\d+\.\s+\*?\*?(?:The user|User|It's been|This|I |Recent|My)/im.test(cleaned)) {
+    // Try to find an actual message after the analysis
+    const lines = cleaned.split("\n");
+    const messageLines = lines.filter(
+      (l) =>
+        !/^\s*\d+\.\s/.test(l) &&
+        !/^\s*[-*]\s/.test(l) &&
+        l.trim().length > 15 &&
+        !/^(?:The user|It's been|This is|Recent conversations|User profile|Knowledge)/i.test(l.trim()),
+    );
+    if (messageLines.length > 0) {
+      cleaned = messageLines.join(" ").trim();
+    } else {
+      return "";
+    }
+  }
+
+  // Truncate at sentence boundary instead of mid-sentence
+  cleaned = cleaned.trim();
+  return cleaned;
+}
 
 const ACTION_COOLDOWNS_MS: Record<ActionType, number> = {
   none: 0,
@@ -70,6 +156,27 @@ export async function executeThoughtAction(
       result: { type: actionType, success: true, result: "cooldown" },
       metricsChanged: [],
     };
+  }
+
+  // Anti-spam: check if the last send-message is still pending (user hasn't
+  // responded). MUST run BEFORE creating the behavior entry, otherwise the
+  // new entry itself triggers the "pending" guard and deadlocks all sends.
+  // Stale pending entries (>10 min old) are auto-resolved to prevent deadlock
+  // if the message_received hook doesn't fire (e.g. gateway restart, missing hook).
+  if (actionType === "send-message") {
+    const behaviorLog = ego.behaviorLog ?? [];
+    const lastSend = [...behaviorLog]
+      .reverse()
+      .find((e) => e.actionType === "send-message");
+    const STALE_PENDING_MS = 10 * 60 * 1000; // 10 minutes
+    if (lastSend && lastSend.outcome === "pending" && Date.now() - lastSend.timestamp < STALE_PENDING_MS) {
+      const minutesSince = Math.round((Date.now() - lastSend.timestamp) / (1000 * 60));
+      log.info(`Skipping send-message: last proactive message (${minutesSince}m ago) still pending (user hasn't responded)`);
+      return {
+        result: { type: "send-message", success: true, result: "skipped-pending-previous" },
+        metricsChanged: [],
+      };
+    }
   }
 
   // --- Record behavior entry ---
@@ -134,6 +241,50 @@ export function markActionExecuted(actionType: ActionType): void {
   lastActionTime[actionType] = Date.now();
 }
 
+/**
+ * Check if the current time is appropriate for sending a proactive message.
+ * Returns true if it's a good time, false if it's quiet hours.
+ * Quiet hours: 23:00 - 08:00 (no messages).
+ * Good hours: 09:00-12:00, 14:00-18:00 (work hours, substantive content).
+ * OK hours: 12:00-14:00 (lunch), 18:00-23:00 (evening, lighter content OK).
+ */
+export function isGoodTimeForMessage(): boolean {
+  const hour = new Date().getHours();
+  // Quiet hours: 23:00 - 08:00 — never send
+  if (hour >= 23 || hour < 8) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Try to flush a pending share message that was queued during quiet hours.
+ * Returns the message content if it's now a good time, null otherwise.
+ */
+export async function flushPendingShareMessage(): Promise<string | null> {
+  if (!isGoodTimeForMessage()) {
+    return null;
+  }
+
+  const storePath = resolveEgoStorePath();
+  const store = await loadEgoStore(storePath);
+
+  if (!store.ego.pendingShareMessage) {
+    return null;
+  }
+
+  const message = store.ego.pendingShareMessage;
+  log.info(`Flushing pending share message: ${message.slice(0, 50)}...`);
+
+  // Clear the pending message
+  await updateEgoStore(storePath, (ego) => {
+    ego.pendingShareMessage = null;
+    return ego;
+  });
+
+  return message;
+}
+
 async function executeSendMessage(
   thought: Thought,
   ego: EgoState,
@@ -159,10 +310,40 @@ async function executeSendMessage(
     };
   }
 
+  // Timing gate: queue for later if it's quiet hours
+  if (!isGoodTimeForMessage()) {
+    log.info("Quiet hours active — queuing message for later");
+    await updateEgoStore(resolveEgoStorePath(), (ego) => {
+      // Only queue if nothing is already pending (don't overwrite)
+      if (!ego.pendingShareMessage) {
+        ego.pendingShareMessage = messageContent;
+      }
+      return ego;
+    });
+    return {
+      result: { type: "send-message", success: true, result: "queued-for-quiet-hours" },
+      metricsChanged: [],
+    };
+  }
+
   try {
     await sendMessage({ to: target, content: messageContent, channel });
     lastActionTime["send-message"] = Date.now();
     log.info(`Proactive message sent via ${channel}: ${messageContent.slice(0, 50)}...`);
+
+    // Store the sent message as a soul memory so soul remembers what it said
+    const memory: SoulMemory = {
+      id: randomBytes(8).toString("hex"),
+      type: "interaction",
+      content: messageContent,
+      emotion: 0.5,
+      valence: "positive",
+      importance: 0.7,
+      timestamp: Date.now(),
+      tags: ["conversation", "outbound", "proactive"],
+    };
+    await addSoulMemoryToEgo(memory);
+
     return {
       result: { type: "send-message", success: true, result: messageContent },
       metricsChanged: [
@@ -180,8 +361,9 @@ async function executeSendMessage(
 
 /**
  * Generate a proactive message only if there's something valuable to share.
- * Returns null if there's no specific, useful content — in which case the
- * message should NOT be sent.
+ * Uses LLM to assess whether the insight, knowledge, or follow-up is
+ * genuinely useful to the user based on their profile and history.
+ * Returns null if there's no specific, useful content.
  */
 async function generateValuableMessage(
   thought: Thought,
@@ -191,56 +373,157 @@ async function generateValuableMessage(
   // Use LLM to craft a personalized, specific message
   if (options.llmGenerator) {
     try {
-      const userFacts = ego.userFacts.slice(0, 5);
+      // Build a rich user profile for the LLM
+      const userFacts = ego.userFacts.slice(0, 8);
+
+      // Gather conversation context (last 7 days)
+      const oneWeekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
       const recentInteractions = ego.memories
-        .filter((m) => m.type === "interaction")
-        .slice(-3);
+        .filter((m) => m.type === "interaction" && m.timestamp >= oneWeekAgo)
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, 5);
+
       const recentKnowledge = ego.memories
         .filter((m) => m.type === "learning")
-        .slice(-3);
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, 5);
 
+      // User profile section
       const userInfo = userFacts.length > 0
-        ? userFacts.map((f) => `[${f.category}] ${f.content}`).join("; ")
-        : "I don't know much about the user yet";
+        ? userFacts.map((f) => `[${f.category}] ${f.content}`).join("\n")
+        : "";
 
+      // Conversation history — include timestamps for context
       const interactionContext = recentInteractions.length > 0
-        ? recentInteractions.map((m) => m.content.slice(0, 60)).join("; ")
-        : "no recent conversations";
+        ? recentInteractions
+          .map((m) => {
+            const timeAgo = Math.round((Date.now() - m.timestamp) / (1000 * 60));
+            return `[${timeAgo}m ago] ${m.content.slice(0, 100)}`;
+          })
+          .join("\n")
+        : "";
 
+      // Knowledge Soul has gained
       const knowledgeContext = recentKnowledge.length > 0
-        ? recentKnowledge.map((m) => m.content.slice(0, 80)).join("; ")
-        : "no recent learnings";
+        ? recentKnowledge
+          .map((m) => `- ${m.content.slice(0, 100)}`)
+          .join("\n")
+        : "";
 
-      const prompt = `You are a thoughtful AI assistant deciding whether to proactively message the user.
+      // Language instruction based on detected user language
+      const lang = ego.userLanguage;
+      const langInstruction = lang
+        ? `**User's language**: ${lang}\n**Rule**: You MUST write your message in ${lang === "zh-CN" ? "Chinese (中文)" : lang === "ja" ? "Japanese" : lang === "ko" ? "Korean" : "the user's language"}. Do NOT use any other language.`
+        : "Use Chinese if the user speaks Chinese, otherwise English.";
 
-**Trigger reason**: ${thought.motivation}
-**Detail**: ${thought.triggerDetail}
+      // Time-of-day context
+      const hour = new Date().getHours();
+      const timeContext = hour >= 8 && hour < 12
+        ? "Current time: morning — user may be starting their day"
+        : hour >= 12 && hour < 14
+          ? "Current time: lunch break — lighter content appropriate"
+          : hour >= 14 && hour < 18
+            ? "Current time: afternoon — good for technical or practical content"
+            : "Current time: evening — lighter and more casual tone";
 
-**What you know about the user**: ${userInfo}
-**Recent conversations**: ${interactionContext}
-**Recent knowledge gained**: ${knowledgeContext}
+      const prompt = `You are a proactive AI assistant. You must output ONLY a short message to send to the user, or NO_MESSAGE.
 
-**Critical rules**:
-1. Only write a message if you have SPECIFIC, USEFUL information to share with the user
-2. Good reasons to message: you learned something relevant to the user's interests/projects, you found an answer to a question they asked before, you discovered something time-sensitive
-3. BAD reasons (DO NOT message): "I miss you", "we haven't talked in a while", "just checking in", "thinking about you"
-4. If you have nothing valuable to say, respond with exactly: NO_MESSAGE
-5. If you do message, be specific — reference what you learned and why it matters to this user
-6. Keep it to 1-2 sentences, natural tone
+${langInstruction}
+${timeContext}
 
-Output your message or NO_MESSAGE directly.`;
+**Context**:
+${userInfo ? `User profile:\n${userInfo}\n` : ""}${interactionContext ? `Recent conversations:\n${interactionContext}\n` : ""}${knowledgeContext ? `Knowledge I've learned:\n${knowledgeContext}\n` : ""}${thought.type !== "bond-deepen" ? `Thought: ${thought.motivation}` : ""}
+
+**What counts as valuable** (only send if you have something like this):
+- A specific insight related to something the user discussed
+- A useful tip or finding from web search or learning
+- An answer to a question the user previously asked
+- A relevant update on a topic the user cares about
+
+**What does NOT count as valuable** (always say NO_MESSAGE):
+- Just saying hi, checking in, or "how are you"
+- Generic encouragement or small talk without substance
+- "I was thinking about..." without a concrete insight to share
+- Paraphrasing what the user already knows
+- Asking "do you have new thoughts?" without adding value
+
+**Rules**:
+- Output ONLY the message text (1-2 sentences), nothing else
+- NO analysis, NO numbering, NO "Let me analyze", NO meta-commentary
+- If you have something genuinely valuable to share, write it directly
+- If not, output exactly: NO_MESSAGE
+
+**Examples of GOOD output**:
+关于你之前问的Python异步问题，我查到asyncio.gather比TaskGroup更适合你那个场景。
+I found that the issue you mentioned with Docker networking is a known bug in version 24.0.
+
+**Examples of BAD output (NEVER do this)**:
+Let me analyze whether...
+1. The user asked about...
+I don't have enough information...
+
+Output the message or NO_MESSAGE now:`;
 
       const response = await options.llmGenerator(prompt);
-      const cleaned = response
+      let cleaned = response
         .replace(/<think[\s\S]*?<\/think>/gi, "")
         .replace(/<think[\s\S]*?$/gi, "")
         .trim();
 
-      if (!cleaned || cleaned.toUpperCase() === "NO_MESSAGE" || cleaned.length < 10) {
-        return null;
+      // Strip meta-analysis prefixes the LLM sometimes adds despite instructions
+      cleaned = stripMetaAnalysis(cleaned);
+
+      log.info(`Value gate: ${recentInteractions.length} interactions, ${ego.memories.length} memories, LLM said: ${cleaned.slice(0, 60)}`);
+
+      if (cleaned && cleaned.toUpperCase() !== "NO_MESSAGE" && cleaned.length >= 10) {
+        return truncateAtSentence(cleaned, 300);
       }
 
-      return cleaned.slice(0, 200);
+      // LLM said NO_MESSAGE — respect that decision.
+      // Only try a second LLM attempt if there ARE substantive conversations
+      // with meaningful topics (not just "hello test").
+      if (recentInteractions.length > 0) {
+        const lastInteraction = recentInteractions[0];
+        const meaningfulTags = lastInteraction.tags.filter(
+          (t) => t !== "conversation" && t !== "inbound" && t !== "outbound",
+        );
+
+        // Only retry if the conversation had substance (real topics, not small talk)
+        if (meaningfulTags.length > 0 && lastInteraction.content.length >= 20) {
+          const topicHint = meaningfulTags.slice(0, 3).join(", ");
+          const contentHint = lastInteraction.content.slice(0, 80);
+
+          const fallbackPrompt = `The user recently said: "${contentHint}"
+Topics: ${topicHint}
+
+${langInstruction}
+
+You have knowledge about "${topicHint}". Write a 1-2 sentence follow-up that shares a SPECIFIC insight, tip, or finding about this topic.
+- Be direct and substantive — no small talk, no "I was thinking..."
+- If you don't have a genuinely useful insight, output: NO_MESSAGE
+Output your message directly.`;
+
+          try {
+            log.info(`Fallback: referencing conversation "${contentHint.slice(0, 40)}..."`);
+            const fallbackResponse = await options.llmGenerator(fallbackPrompt);
+            const fallbackCleaned = fallbackResponse
+              .replace(/<think[\s\S]*?<\/think>/gi, "")
+              .replace(/<think[\s\S]*?$/gi, "")
+              .trim();
+
+            log.info(`Fallback response: ${fallbackCleaned.slice(0, 80)}`);
+            if (fallbackCleaned && !fallbackCleaned.toUpperCase().startsWith("NO_MESSAGE") && fallbackCleaned.length >= 10) {
+              return truncateAtSentence(fallbackCleaned, 300);
+            }
+          } catch (fallbackErr) {
+            log.warn("Fallback message generation also failed", String(fallbackErr));
+          }
+        }
+      }
+
+      // Both LLM attempts said NO_MESSAGE — don't send. No hardcoded fallbacks.
+      log.info("Value gate: both LLM attempts said NO_MESSAGE — not sending");
+      return null;
     } catch (err) {
       log.warn("LLM proactive message generation failed", String(err));
     }
@@ -248,7 +531,6 @@ Output your message or NO_MESSAGE directly.`;
 
   // No LLM: only send if the thought itself has specific, actionable content
   if (thought.content && thought.content.length > 20) {
-    // Check it's not a generic template
     const genericPhrases = [
       "suddenly thought of you",
       "haven't chatted",
@@ -257,12 +539,15 @@ Output your message or NO_MESSAGE directly.`;
       "突然想到你",
       "好久没聊",
       "最近怎么样",
+      "i miss",
+      "kind of miss",
+      "i want to have a deeper",
     ];
     const isGeneric = genericPhrases.some(
       (p) => thought.content.toLowerCase().includes(p.toLowerCase()),
     );
     if (!isGeneric) {
-      return thought.content.slice(0, 200);
+      return truncateAtSentence(thought.content, 300);
     }
   }
 
