@@ -105,7 +105,7 @@ plugins:
 # Required for proactive messaging (Soul sending messages to you)
 hooks:
   enabled: true
-  token: "your-secret-token-here"
+  token: "your-secret-token-here"  # Any random string (e.g. openssl rand -hex 32)
 ```
 
 That's it — Soul auto-detects everything else:
@@ -134,7 +134,7 @@ plugins:
 # Required for proactive messaging (Soul sending messages to you)
 hooks:
   enabled: true
-  token: "your-secret-token-here"   # Used by Soul to send messages via gateway
+  token: "your-secret-token-here"   # Any random string (e.g. openssl rand -hex 32)
 ```
 
 ### Environment Variables
