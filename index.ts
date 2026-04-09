@@ -83,6 +83,7 @@ function buildSendMessage(opts: {
 }
 
 let thoughtService: ThoughtService | null = null;
+let serviceCreated = false;
 
 /**
  * Extract a typed config value from pluginConfig.
@@ -208,7 +209,7 @@ const plugin = {
     // The gateway may call register() multiple times (e.g. for different agent
     // session registries). We must always register hooks (api.on) for each
     // registry, but the ThoughtService instance is shared.
-    if (!thoughtService?.isRunning()) {
+    if (!serviceCreated) {
       // --- 1. Auto-resolve LLM config from OpenClaw's primary model ---
       const llmConfig = resolveLLMConfigFromOpenClaw(
         openclawConfig as Parameters<typeof resolveLLMConfigFromOpenClaw>[0],
@@ -251,6 +252,7 @@ const plugin = {
           : undefined;
 
       // --- 4. Create and register the thought service ---
+      serviceCreated = true;
       thoughtService = new ThoughtService({
         checkIntervalMs: config.checkIntervalMs ?? 60_000,
         llmConfig,

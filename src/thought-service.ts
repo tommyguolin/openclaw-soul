@@ -87,12 +87,12 @@ export class ThoughtService {
             this.llmGenerator = gen;
             log.info("Soul LLM generator initialized");
           } else {
-            log.info("No LLM generator — will use rule-based thought generation");
+            log.debug("No LLM generator — will use rule-based thought generation");
           }
         })
         .catch((err) => {
           log.warn(`Failed to initialize soul LLM generator: ${String(err)}`);
-          log.info("No LLM generator — will use rule-based thought generation");
+          log.debug("No LLM generator — will use rule-based thought generation");
         });
     }
   }
