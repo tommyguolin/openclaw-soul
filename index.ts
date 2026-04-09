@@ -275,7 +275,7 @@ const plugin = {
         },
       });
     } else {
-      log.info("Soul ThoughtService already running — re-registering hooks only");
+      log.debug("Soul ThoughtService already running — re-registering hooks only");
     }
 
     // --- 5. Inject soul system prompt via before_prompt_build hook ---
@@ -350,7 +350,7 @@ const plugin = {
       }
     });
 
-    log.info("Soul plugin registered (hooks: before_prompt_build, message_received, message_sent)");
+    log.debug("Soul plugin registered (hooks: before_prompt_build, message_received, message_sent)");
   },
 };
 
