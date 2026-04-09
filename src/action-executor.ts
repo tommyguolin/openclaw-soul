@@ -484,49 +484,10 @@ Output the message or NO_MESSAGE now:`;
       }
 
       // LLM said NO_MESSAGE — respect that decision.
-      // Only try a second LLM attempt if there ARE substantive conversations
-      // with meaningful topics (not just "hello test").
-      if (recentInteractions.length > 0) {
-        const lastInteraction = recentInteractions[0];
-        const meaningfulTags = lastInteraction.tags.filter(
-          (t) => t !== "conversation" && t !== "inbound" && t !== "outbound",
-        );
-
-        // Only retry if the conversation had substance (real topics, not small talk)
-        if (meaningfulTags.length > 0 && lastInteraction.content.length >= 20) {
-          const topicHint = meaningfulTags.slice(0, 3).join(", ");
-          const contentHint = lastInteraction.content.slice(0, 80);
-
-          const fallbackPrompt = `The user recently said: "${contentHint}"
-Topics: ${topicHint}
-
-${langInstruction}
-
-You have knowledge about "${topicHint}". Write a 1-2 sentence follow-up that shares a SPECIFIC insight, tip, or finding about this topic.
-- Be direct and substantive — no small talk, no "I was thinking..."
-- If you don't have a genuinely useful insight, output: NO_MESSAGE
-Output your message directly.`;
-
-          try {
-            log.info(`Fallback: referencing conversation "${contentHint.slice(0, 40)}..."`);
-            const fallbackResponse = await options.llmGenerator(fallbackPrompt);
-            const fallbackCleaned = fallbackResponse
-              .replace(/<think[\s\S]*?<\/think>/gi, "")
-              .replace(/<think[\s\S]*?$/gi, "")
-              .trim();
-
-            log.info(`Fallback response: ${fallbackCleaned.slice(0, 80)}`);
-            if (fallbackCleaned && !fallbackCleaned.toUpperCase().startsWith("NO_MESSAGE") && fallbackCleaned.length >= 10) {
-              return truncateAtSentence(fallbackCleaned, 300);
-            }
-          } catch (fallbackErr) {
-            log.warn("Fallback message generation also failed", String(fallbackErr));
-          }
-        }
-      }
-
-      // Both LLM attempts said NO_MESSAGE — don't send. No hardcoded fallbacks.
-      log.info("Value gate: both LLM attempts said NO_MESSAGE — not sending");
+      // The primary LLM already had full context (conversations, knowledge,
+      // user profile). A second attempt with a hint would just produce
+      // low-quality filler that bypasses the value gate.
+      log.info("Value gate: LLM said NO_MESSAGE — not sending");
       return null;
     } catch (err) {
       log.warn("LLM proactive message generation failed", String(err));
