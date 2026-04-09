@@ -913,12 +913,12 @@ function determineActionForOpportunity(
     return { actionType: "send-message" };
   }
 
-  // bond-deepen: route to send-message, but the LLM value gate in
-  // generateValuableMessage decides if the content is worth sending.
-  // Generic "I miss you" messages will be filtered out; messages that
-  // reference learned knowledge or user facts will pass through.
+  // bond-deepen: do NOT route to send-message. This thought type fires
+  // after 10 min of silence and generates bonding content that almost
+  // never has genuine proactive value. It gets internally recorded as
+  // a soul memory (connection need delta) but should not spam the user.
   if (type === "bond-deepen") {
-    return { actionType: "send-message" };
+    return { actionType: "none" };
   }
 
   // opportunity-detected with connection need: only message if there's

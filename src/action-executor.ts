@@ -450,6 +450,10 @@ ${userInfo ? `User profile:\n${userInfo}\n` : ""}${interactionContext ? `Recent 
 - "I was thinking about..." without a concrete insight to share
 - Paraphrasing what the user already knows
 - Asking "do you have new thoughts?" without adding value
+- Offering to help, debug, read logs, or do tasks for the user (you are a proactive messenger, NOT an assistant responding to requests)
+- Saying "I'm ready to help" or "let me check X for you" — this is assistant behavior, not proactive insight
+- Messages about yourself (the AI/bot/plugin), your capabilities, or your internal state
+- Restating the user's own words back to them as if it were new information
 
 **Rules**:
 - Output ONLY the message text (1-2 sentences), nothing else
@@ -465,6 +469,9 @@ I found that the issue you mentioned with Docker networking is a known bug in ve
 Let me analyze whether...
 1. The user asked about...
 I don't have enough information...
+收到了，我准备好帮你查看日志了。
+我可以帮你检查一下这个问题。
+I'm ready to help you with that.
 
 Output the message or NO_MESSAGE now:`;
 
