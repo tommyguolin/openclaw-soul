@@ -57,30 +57,26 @@ Soul remembers your conversations, your preferences, and what it has learned:
 
 ## How It Works
 
-```
-┌─────────────────────────────────────────────────┐
-│                  OpenClaw Core                   │
-│                                                  │
-│  message_received ──→ Soul records interaction   │
-│  message_sent ──────→ Soul tracks engagement     │
-│  before_prompt_build → Soul injects context      │
-└──────────┬──────────────────────┬───────────────┘
-           │                      │
-           ▼                      ▼
-┌─────────────────────┐  ┌───────────────────────┐
-│   Thought Service    │  │   System Prompt       │
-│   (adaptive tick)    │  │   Injection           │
-│                      │  │                       │
-│  1. Compute          │  │  • Current needs      │
-│     engagement score │  │  • Goals & desires    │
-│  2. Generate thought │  │  • User facts         │
-│  3. Execute action   │  │  • Relevant memories  │
-│     - learn-topic    │  │  • Learned knowledge  │
-│     - search-web     │  │  • Recent activity    │
-│     - send-message   │  │  • Personality        │
-│     - self-reflect   │  │                       │
-└─────────────────────┘  └───────────────────────┘
-```
+### Hooks into OpenClaw
+
+| Hook | What Soul Does |
+|------|---------------|
+| `message_received` | Records interaction, detects language, extracts user facts |
+| `message_sent` | Tracks engagement, updates behavior log |
+| `before_prompt_build` | Injects soul context (needs, memories, knowledge, personality) |
+
+### Two Parallel Systems
+
+**Thought Service** (background, adaptive tick):
+1. Compute engagement score (interaction recency, frequency, substance)
+2. Generate thought based on conversation context and emotional state
+3. Execute action: `learn-topic`, `search-web`, `send-message`, `self-reflect`
+
+**System Prompt Injection** (every response):
+- Current emotional needs and goals
+- User facts and preferences
+- Relevant memories and learned knowledge
+- Personality traits and recent activity
 
 ### Thought Flow
 
@@ -222,36 +218,25 @@ Soul uses the LLM configured in OpenClaw's `agents.defaults.model`. Any OpenAI-c
 
 ## Architecture
 
-```
-openclaw-soul/
-├── index.ts                 # Plugin entry point & hooks
-├── openclaw.plugin.json     # Plugin manifest
-├── package.json
-├── tsconfig.json
-└── src/
-    ├── types.ts             # TypeScript type definitions
-    ├── thought-service.ts   # Core thought generation & scheduling
-    ├── thought.ts           # Thought weights & adaptive frequency
-    ├── intelligent-thought.ts  # Context-aware thought & opportunity detection
-    ├── action-executor.ts   # Executes thought actions (learn, search, etc.)
-    ├── behavior-log.ts      # Tracks action outcomes & adjusts probabilities
-    ├── prompts.ts           # System prompt builder
-    ├── ego-store.ts         # Ego state persistence (JSON file)
-    ├── knowledge-store.ts   # Knowledge persistence & search
-    ├── memory-retrieval.ts  # Contextual memory recall
-    ├── memory-association.ts # Memory association graph
-    ├── memory-consolidation.ts # Short→long-term memory promotion
-    ├── sentiment-analysis.ts # Chinese text sentiment analysis
-    ├── soul-llm.ts          # LLM provider abstraction
-    ├── soul-search.ts       # Multi-provider web search
-    ├── expiry.ts            # Memory/knowledge/facts cleanup
-    ├── awakening.ts         # Awakening sequence (legacy, skipped by default)
-    ├── growth-decay.ts      # Need decay & growth calculations
-    ├── obsession-formation.ts # Obsession formation logic
-    ├── self-maintenance.ts  # Self-maintenance routines
-    ├── logger.ts            # Lightweight logger
-    └── paths.ts             # File path resolution
-```
+| Module | Description |
+|--------|-------------|
+| `index.ts` | Plugin entry point & hooks |
+| `thought-service.ts` | Core thought generation & adaptive scheduling |
+| `thought.ts` | Thought weights & adaptive frequency logic |
+| `intelligent-thought.ts` | Context-aware thought & opportunity detection |
+| `action-executor.ts` | Executes thought actions (learn, search, message, reflect) |
+| `behavior-log.ts` | Tracks action outcomes & adjusts probabilities |
+| `prompts.ts` | System prompt builder for context injection |
+| `ego-store.ts` | Ego state persistence (JSON file) |
+| `knowledge-store.ts` | Knowledge persistence & search |
+| `memory-retrieval.ts` | Contextual memory recall |
+| `memory-association.ts` | Memory association graph |
+| `memory-consolidation.ts` | Short → long-term memory promotion |
+| `sentiment-analysis.ts` | Chinese text sentiment analysis |
+| `soul-llm.ts` | LLM provider abstraction (gateway + direct fallback) |
+| `soul-search.ts` | Multi-provider web search |
+| `expiry.ts` | Memory / knowledge / facts cleanup |
+| `growth-decay.ts` | Need decay & growth calculations |
 
 ## Development
 
