@@ -329,13 +329,20 @@ const plugin = {
 
         // Run all processing in the background so we don't block the agent
         // turn. The hook must return quickly (<1s) to avoid feishu streaming
-        // card timeouts (30s). LLM calls for sentiment/facts/preferences can
-        // take 30-60s total, so they MUST be fire-and-forget.
-        if (text.length >= 5) {
+        // card timeouts (30s). LLM calls for facts/preferences can take
+        // 30-60s total, so they MUST be fire-and-forget.
+        //
+        // Token cost: extractUserFacts ~300 tokens, extractUserPreferences
+        // ~300 tokens. Only run these for substantive messages (>=15 chars)
+        // to avoid wasting tokens on short replies like "ok", "收到", "好的".
+        if (text.length >= 15) {
           thoughtService.recordInteractionWithText({ type: "inbound", text })
             .then(() => thoughtService.extractUserFacts(text))
             .then(() => thoughtService.extractUserPreferences(text))
             .catch((err) => log.warn(`Background message processing failed: ${String(err)}`));
+        } else if (text.length >= 5) {
+          thoughtService.recordInteractionWithText({ type: "inbound", text })
+            .catch((err) => log.warn(`Record interaction failed: ${String(err)}`));
         } else {
           thoughtService.recordInteraction({ type: "inbound" }).catch((err) =>
             log.warn(`Record interaction failed: ${String(err)}`),
