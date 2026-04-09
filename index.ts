@@ -327,14 +327,19 @@ const plugin = {
         // Abort any in-progress thought — user interaction takes priority
         thoughtService.abortCurrentThought();
 
+        // Run all processing in the background so we don't block the agent
+        // turn. The hook must return quickly (<1s) to avoid feishu streaming
+        // card timeouts (30s). LLM calls for sentiment/facts/preferences can
+        // take 30-60s total, so they MUST be fire-and-forget.
         if (text.length >= 5) {
-          await thoughtService.recordInteractionWithText({ type: "inbound", text });
-          await thoughtService.extractUserFacts(text);
-          await thoughtService.extractUserPreferences(text).catch((err) =>
-            log.warn(`User preference extraction failed: ${String(err)}`),
-          );
+          thoughtService.recordInteractionWithText({ type: "inbound", text })
+            .then(() => thoughtService.extractUserFacts(text))
+            .then(() => thoughtService.extractUserPreferences(text))
+            .catch((err) => log.warn(`Background message processing failed: ${String(err)}`));
         } else {
-          await thoughtService.recordInteraction({ type: "inbound" });
+          thoughtService.recordInteraction({ type: "inbound" }).catch((err) =>
+            log.warn(`Record interaction failed: ${String(err)}`),
+          );
         }
       } catch (err) {
         log.warn(`message_received hook failed: ${String(err)}`);
