@@ -103,6 +103,11 @@ export class ThoughtService {
       return;
     }
 
+    // Wait for gateway to fully initialize before starting thought cycles
+    // The gateway HTTP endpoints (/v1/chat/completions, /hooks/agent) may not
+    // be ready immediately on startup. A short delay avoids transient fetch errors.
+    await new Promise((r) => setTimeout(r, 5000));
+
     const store = await loadEgoStore(this.storePath);
     const ego = store.ego;
 
