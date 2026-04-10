@@ -13,50 +13,44 @@ const THOUGHT_EXPIRY_MS = 30 * 60 * 1000;
 const thoughtWeights: Record<ThoughtType, (ctx: ThoughtGenerationContext) => number> = {
   "opportunity-detected": (ctx) => {
     const opportunityNeeds = ctx.urgentNeeds;
-    if (opportunityNeeds.length > 0) return 70;
-    return 30;
+    if (opportunityNeeds.length > 0) return 60;
+    return 20;
   },
   "threat-warning": (ctx) => {
     const survivalNeed = ctx.ego.needs.survival;
-    if (survivalNeed.current < survivalNeed.ideal * 0.5) return 90;
-    if (survivalNeed.current < survivalNeed.ideal * 0.7) return 60;
-    return 20;
+    if (survivalNeed.current < survivalNeed.ideal * 0.5) return 50;
+    return 10;
   },
   "skill-gap": (ctx) => {
     const growthNeed = ctx.ego.needs.growth;
-    if (growthNeed.current < growthNeed.ideal * 0.5) return 50;
-    return 20;
+    if (growthNeed.current < growthNeed.ideal * 0.5) return 40;
+    return 15;
   },
   "memory-resurface": (ctx) => {
-    if (ctx.recentMemories.length > 3) return 40;
-    return 10;
+    if (ctx.recentMemories.length > 3) return 30;
+    return 5;
   },
-  "bond-deepen": (ctx) => {
-    const connectionNeed = ctx.ego.needs.connection;
-    if (connectionNeed.current < connectionNeed.ideal * 0.5) return 80;
-    if (connectionNeed.current < connectionNeed.ideal * 0.7) return 50;
-    return 20;
+  "bond-deepen": (_ctx) => {
+    // Ego-driven: very low priority, action is already "none"
+    return 5;
   },
-  "meaning-quest": (ctx) => {
-    const meaningNeed = ctx.ego.needs.meaning;
-    if (meaningNeed.current < meaningNeed.ideal * 0.5) return 60;
-    return 30;
+  "meaning-quest": (_ctx) => {
+    // Ego-driven: very low priority
+    return 5;
   },
-  "existential-reflection": (ctx) => {
-    const hour = ctx.currentHour;
-    if (hour >= 20 || hour <= 6) return 30;
-    if (ctx.ego.totalThoughts % 20 === 0) return 20;
-    return 10;
+  "existential-reflection": (_ctx) => {
+    // Ego-driven: very low priority
+    return 5;
   },
   "help-offer": (ctx) => {
     const connectionNeed = ctx.ego.needs.connection;
-    if (connectionNeed.current > connectionNeed.ideal * 0.7) return 70;
-    return 40;
+    if (connectionNeed.current > connectionNeed.ideal * 0.7) return 50;
+    return 25;
   },
   "learn-topic": (ctx) => {
     const growthNeed = ctx.ego.needs.growth;
-    if (growthNeed.current < growthNeed.ideal * 0.6) return 70;
-    return 40;
+    if (growthNeed.current < growthNeed.ideal * 0.6) return 50;
+    return 25;
   },
   "search-web": (ctx) => {
     const growthNeed = ctx.ego.needs.growth;
@@ -68,14 +62,15 @@ const thoughtWeights: Record<ThoughtType, (ctx: ThoughtGenerationContext) => num
     return 15;
   },
   "conversation-replay": (ctx) => {
-    // High weight when there are recent conversations to replay
+    // Dominant thought type: user's actual conversations are the primary
+    // driver of meaningful thoughts, not ego needs.
     const interactionMemories = ctx.ego.memories.filter(
       (m) => m.type === "interaction" && Date.now() - m.timestamp < 24 * 60 * 60 * 1000,
     );
     if (interactionMemories.length === 0) return 0;
-    if (interactionMemories.length >= 3) return 80;
-    if (interactionMemories.length >= 1) return 60;
-    return 30;
+    if (interactionMemories.length >= 3) return 90;
+    if (interactionMemories.length >= 1) return 75;
+    return 40;
   },
 };
 

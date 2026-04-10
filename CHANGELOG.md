@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.9.0 (2026-04-10)
+
+### Changes
+
+- **Problem-driven thoughts**: Soul's thoughts now focus on the user's actual conversations and problems instead of ego-driven self-reflection. `conversation-replay` is now the dominant thought type (weight 90 vs ego types at 5)
+- **Search from user's actual words**: Search queries are now extracted directly from the user's original messages instead of being LLM-summarized into generic keywords. This preserves specificity (e.g. "WSL操作Win11桌面程序" instead of "code")
+- **No fake learning**: Removed the LLM reflection fallback that fabricated knowledge when web search returned no results. Soul now only records knowledge from real web search results
+- **Demoted ego-driven thought types**: `bond-deepen`, `meaning-quest`, `existential-reflection` all reduced to weight 5 (were 20-80). They no longer dominate the thought cycle
+
 ## 1.8.1 (2026-04-10)
 
 ### Changes

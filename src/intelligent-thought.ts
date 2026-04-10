@@ -15,6 +15,7 @@ import type {
   ActionType,
 } from "./types.js";
 import { adjustProbability } from "./behavior-log.js";
+import { MEANINGLESS_QUERIES } from "./action-executor.js";
 
 const log = createSoulLogger("intelligent-thought");
 
@@ -958,42 +959,37 @@ function determineActionForOpportunity(
 }
 
 function extractLearningTopics(text: string): string[] {
-  const topics: string[] = [];
-  const keywords = [
-    "AI",
-    "machine learning",
-    "deep learning",
-    "programming",
-    "code",
-    "development",
-    "technology",
-    "software",
-    "algorithm",
-    "data",
-    "Python",
-    "JavaScript",
-    "LLM",
-    "large language model",
-    "GPT",
-    "Claude",
-    "OpenAI",
-    "research",
-    "product",
-    "design",
-    "architecture",
-    "system",
-    "security",
-    "network",
-  ];
+  // Extract specific phrases from user's actual words instead of
+  // matching against a generic keyword list. The user's original
+  // question/statement contains the most search-worthy content.
+  const results: string[] = [];
 
-  const textLower = text.toLowerCase();
-  for (const keyword of keywords) {
-    if (textLower.includes(keyword.toLowerCase())) {
-      topics.push(keyword);
+  // 1. Extract quoted strings (user explicitly mentioned these)
+  const quoted = text.match(/[""「」『』]([^""「」『』]{3,50})[""「」『』]/g);
+  if (quoted) {
+    for (const q of quoted.slice(0, 2)) {
+      const clean = q.replace(/[""「」『』]/g, "").trim();
+      if (clean.length >= 3 && !MEANINGLESS_QUERIES.has(clean.toLowerCase())) {
+        results.push(clean);
+      }
     }
   }
 
-  return topics.slice(0, 3);
+  // 2. Extract substantive phrases (4+ consecutive meaningful words)
+  // Split on punctuation and filler words
+  const phrases = text.split(/[，。！？、；：,!?;:\n\r]+/)
+    .map((p) => p.trim())
+    .filter((p) => {
+      const words = p.split(/\s+/).filter((w) => w.length > 0);
+      return words.length >= 2 && p.length >= 4 && p.length <= 50;
+    });
+  for (const phrase of phrases.slice(0, 2)) {
+    if (!results.includes(phrase)) {
+      results.push(phrase);
+    }
+  }
+
+  return results.slice(0, 3);
 }
 
 function extractExistentialTopics(motivation: string): string[] {

@@ -129,7 +129,7 @@ const recentSearchQueries: Map<string, number> = new Map();
 const SEARCH_DEDUP_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 /** Generic words that are not meaningful search queries */
-const MEANINGLESS_QUERIES = new Set([
+export const MEANINGLESS_QUERIES = new Set([
   "code", "ai", "the", "app", "web", "api", "ios", "sdk", "url",
   "http", "test", "hello", "help", "data", "info", "user", "bot",
   "chat", "msg", "text", "msg", "new", "old", "yes", "no", "ok",
@@ -633,27 +633,10 @@ Output knowledge points directly, do not add prefixes or numbering.`;
       } catch (err) {
         log.warn(`Learn topic "${topic}" extraction failed`, String(err));
       }
-    } else if (options.llmGenerator) {
-      try {
-        const prompt = `As a soulful AI, you decide to learn about "${topic}".
-Based on your existing knowledge, describe in 2 sentences the importance of this topic. Output directly, do not add prefixes.`;
-
-        const llmResponse = await options.llmGenerator(prompt);
-        const learned = llmResponse.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
-        if (learned) {
-          allLearnings.push(learned);
-          await addKnowledgeItem(undefined, {
-            topic,
-            content: learned,
-            source: "reflection",
-            tags: [topic.toLowerCase()],
-            confidence: 0.5,
-          });
-          log.info(`Learned "${topic}" via LLM reflection (no web results)`);
-        }
-      } catch (err) {
-        log.warn(`LLM fallback for "${topic}" failed`, String(err));
-      }
+    } else {
+      // No web results — don't fabricate knowledge via LLM reflection.
+      // Real learning only comes from actual web search results.
+      log.info(`No web results for "${topic}" — skipping (no fake learning)`);
     }
   }
 
