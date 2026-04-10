@@ -128,6 +128,32 @@ const lastActionTime: Record<string, number> = {};
 const recentSearchQueries: Map<string, number> = new Map();
 const SEARCH_DEDUP_MS = 6 * 60 * 60 * 1000; // 6 hours
 
+/** Generic words that are not meaningful search queries */
+const MEANINGLESS_QUERIES = new Set([
+  "code", "ai", "the", "app", "web", "api", "ios", "sdk", "url",
+  "http", "test", "hello", "help", "data", "info", "user", "bot",
+  "chat", "msg", "text", "msg", "new", "old", "yes", "no", "ok",
+]);
+
+/**
+ * Check if a search query is meaningful enough to warrant a web search.
+ * Rejects single generic words, very short queries, and queries that
+ * are too broad to return useful results.
+ */
+function isWorthSearching(query: string): boolean {
+  const trimmed = query.trim();
+  if (trimmed.length < 4) return false;
+
+  const words = trimmed.split(/\s+/).filter((w) => w.length > 0);
+  // Single-word queries must be > 3 chars and not in the meaningless set
+  if (words.length === 1) {
+    return words[0].length > 3 && !MEANINGLESS_QUERIES.has(words[0].toLowerCase());
+  }
+
+  // Multi-word queries are generally fine
+  return true;
+}
+
 export interface ActionExecutorOptions {
   channel?: string;
   target?: string;
@@ -546,6 +572,11 @@ async function executeLearnTopic(
   const allLearnings: string[] = [];
 
   for (const topic of topics) {
+    // Skip generic/meaningless topics that won't produce useful search results
+    if (!isWorthSearching(topic)) {
+      log.info(`Skipping meaningless learn-topic query: "${topic}"`);
+      continue;
+    }
     const searchResults = await soulWebSearch(topic, options.openclawConfig);
 
     if (searchResults && searchResults.length > 0 && options.llmGenerator) {
@@ -653,6 +684,15 @@ async function executeSearchWeb(
   if (!query) {
     return {
       result: { type: "search-web", success: false, error: "No search query" },
+      metricsChanged: [],
+    };
+  }
+
+  // Skip generic queries that waste API calls
+  if (!isWorthSearching(query)) {
+    log.info(`Skipping meaningless search query: "${query}"`);
+    return {
+      result: { type: "search-web", success: true, result: "skipped-meaningless-query" },
       metricsChanged: [],
     };
   }

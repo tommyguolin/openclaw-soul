@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.8.1 (2026-04-10)
+
+### Changes
+
+- **Topic-level thought deduplication**: Soul now tracks the topics of recent thoughts (not just types) and skips thoughts that overlap >40% with a recent one. Prevents infinite loops where Soul keeps ruminating on the same subject (e.g. Win11 exploration)
+- **Search query quality filter**: Generic single-word queries like "code", "ai", "app" are now rejected before wasting API calls. Only multi-word or specific single-word queries (>3 chars) trigger web search
+- **LLM rate limiting**: Soul enforces a minimum 10-second gap between LLM calls to avoid overloading the provider (fixes MiniMax 529 overloaded errors)
+
 ## 1.8.0 (2026-04-10)
 
 ### Changes

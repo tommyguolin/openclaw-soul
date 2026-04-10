@@ -66,6 +66,9 @@ export class ThoughtService {
   private proactiveTarget?: string;
   private openclawConfig?: OpenClawSearchCompat;
   private recentThoughtTypes: string[] = [];
+  private recentThoughtTopics: string[] = [];
+  private lastLLMCallTime = 0;
+  private static readonly MIN_LLM_INTERVAL_MS = 10_000; // 10s between Soul LLM calls
   private thoughtAbortController: AbortController | null = null;
   private thoughtInProgress = false;
 
@@ -383,6 +386,7 @@ export class ThoughtService {
       if (this.llmGenerator) {
         try {
           if (signal.aborted) { return; }
+          await this.waitForLLMRateLimit(signal);
           const opportunities = detectThoughtOpportunities(ctx);
           const nonRepeatingOpportunities = this.recentThoughtTypes.length > 0
             ? opportunities.filter((o) => !this.recentThoughtTypes.includes(o.type))
@@ -396,6 +400,12 @@ export class ThoughtService {
           log.info(
             `Thought: [${thought.type}] ${thought.trigger} - ${thought.content.slice(0, 80)}...`,
           );
+
+          // Skip if this thought overlaps significantly with a recent one
+          if (this.isRepeatTopic(thought.content)) {
+            log.info(`Skipping thought — topic too similar to recent thoughts`);
+            thought = null;
+          }
         } catch (err) {
           if ((err as { name?: string })?.name === "AbortError") {
             log.info("Thought generation aborted");
@@ -410,12 +420,16 @@ export class ThoughtService {
         const nonRepeatingOpportunities = this.recentThoughtTypes.length > 0
           ? opportunities.filter((o) => !this.recentThoughtTypes.includes(o.type))
           : opportunities;
-        if (nonRepeatingOpportunities.length > 0) {
+        // Also filter out opportunities whose topic overlaps recent thoughts
+        const novelOpportunities = nonRepeatingOpportunities.filter(
+          (o) => !this.isRepeatTopic(o.motivation || o.triggerDetail),
+        );
+        if (novelOpportunities.length > 0) {
+          const { buildThoughtFromOpportunity } = await import("./intelligent-thought.js");
+          thought = buildThoughtFromOpportunity(novelOpportunities[0], ego);
+        } else if (nonRepeatingOpportunities.length > 0) {
           const { buildThoughtFromOpportunity } = await import("./intelligent-thought.js");
           thought = buildThoughtFromOpportunity(nonRepeatingOpportunities[0], ego);
-        } else if (opportunities.length > 0) {
-          const { buildThoughtFromOpportunity } = await import("./intelligent-thought.js");
-          thought = buildThoughtFromOpportunity(opportunities[0], ego);
         } else {
           thought = generateThought(ctx) as Thought | null;
         }
@@ -439,6 +453,21 @@ export class ThoughtService {
       this.recentThoughtTypes.push(thought.type);
       if (this.recentThoughtTypes.length > 3) {
         this.recentThoughtTypes.shift();
+      }
+
+      // Track recent thought topics to prevent revisiting the same subject.
+      // Extract key words from content for topic-level dedup.
+      const topicWords = thought.content
+        .split(/[\s,，。.！!？?；;：:、]+/)
+        .filter((w) => w.length >= 3)
+        .map((w) => w.toLowerCase())
+        .slice(0, 5)
+        .join(" ");
+      if (topicWords) {
+        this.recentThoughtTopics.push(topicWords);
+        if (this.recentThoughtTopics.length > 10) {
+          this.recentThoughtTopics.shift();
+        }
       }
     }
 
@@ -497,6 +526,44 @@ export class ThoughtService {
     } else if (actionResult.result.error) {
       log.warn(`Thought action failed: ${thought.actionType}`, actionResult.result.error);
     }
+  }
+
+  /**
+   * Check if a thought's content overlaps significantly with recent thoughts.
+   * Returns true if >40% of meaningful words appear in a recent thought topic.
+   */
+  private isRepeatTopic(content: string): boolean {
+    if (this.recentThoughtTopics.length === 0 || !content) return false;
+
+    const words = content
+      .split(/[\s,，。.！!？?；;：:、]+/)
+      .filter((w) => w.length >= 3)
+      .map((w) => w.toLowerCase());
+    if (words.length === 0) return false;
+
+    for (const recentTopic of this.recentThoughtTopics) {
+      const recentWords = recentTopic.split(" ");
+      const overlap = words.filter((w) => recentWords.includes(w)).length;
+      // If >40% of words overlap with a recent topic, it's a repeat
+      if (overlap / words.length > 0.4) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Rate-limit LLM calls to avoid overloading the provider.
+   * Waits if the last LLM call was too recent.
+   */
+  private async waitForLLMRateLimit(signal: AbortSignal): Promise<void> {
+    const elapsed = Date.now() - this.lastLLMCallTime;
+    const waitMs = ThoughtService.MIN_LLM_INTERVAL_MS - elapsed;
+    if (waitMs > 0) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, waitMs);
+        signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+      });
+    }
+    this.lastLLMCallTime = Date.now();
   }
 
   private async applyThoughtResult(result: SoulActionResult): Promise<void> {
