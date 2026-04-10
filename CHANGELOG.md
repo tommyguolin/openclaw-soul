@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.8.0 (2026-04-10)
+
+### Changes
+
+- **Non-blocking message processing**: The `message_received` hook now runs LLM calls (fact/preference extraction) in the background instead of blocking the agent turn. This prevents feishu streaming card timeouts caused by serial LLM calls taking 60+ seconds
+- **Token cost optimization**: Short messages (<15 chars, e.g. "收到", "好的") skip LLM extraction entirely — only rule-based sentiment analysis runs. Saves ~600 tokens per short message
+
+### Fixes
+
+- **Strengthened proactive message value gate**: Added explicit rejection rules for meta-messages about the bot itself (offering to help, debug, read logs, "I'm ready to..."). These are assistant behaviors, not proactive insights
+- **Disabled bond-deepen → send-message routing**: `bond-deepen` thoughts no longer trigger proactive messages. This type fires after 10 min of silence and almost never produces genuinely valuable content to share
+
 ## 1.7.0 (2026-04-09)
 
 ### Changes
