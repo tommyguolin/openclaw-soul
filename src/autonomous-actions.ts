@@ -360,12 +360,25 @@ export async function executeReportFindings(
   ).join("\n\n");
 
   const lang = ego.userLanguage === "zh-CN" ? "Chinese" : "English";
-  const prompt = `You are a proactive AI assistant. You completed some autonomous analysis tasks. Summarize the findings for the user in ${lang}.
+  const prompt = `You are a proactive AI. You autonomously investigated something and want to share findings with the user. Write the message in ${lang}.
 
-**Task results**:
+**What you investigated**:
 ${taskSummaries}
 
-Write a concise message (2-4 sentences) summarizing the key findings and any actionable recommendations. Be specific — mention actual error messages, file paths, or code locations if they appeared in the analysis. Do NOT be vague.
+Write 2-4 sentences sharing your findings directly with the user. Rules:
+- Start with the FINDING or INSIGHT, never with "收到"/"Got it"/"好的" or acknowledgment phrases
+- This is proactive outreach, NOT a response to a request — do NOT sound like a receptionist
+- Be specific — mention actual error messages, file paths, or root causes
+- Sound natural, like a knowledgeable friend sharing something useful they discovered
+
+**BAD examples** (NEVER do this):
+收到，问题已定位：...
+好的，根据日志分析...
+Got it. I found that...
+
+**GOOD examples**:
+你之前问的超时问题我查到了——根因是 OpenViking 的 embedding API 有 512 token 限制，不是 Soul 本身的问题。
+日志里那个 413 错误是 OpenViking memory search 输入超长导致的，跟 Soul 插件没关系。
 
 Output ONLY the message, nothing else.`;
 

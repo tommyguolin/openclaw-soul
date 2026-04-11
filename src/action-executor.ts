@@ -627,6 +627,10 @@ Output the message or NO_MESSAGE now:`;
         return null;
       }
 
+      // Strip "收到/Got it/好的" prefixes — these make proactive messages sound
+      // like an assistant responding to a command rather than proactively sharing.
+      cleaned = cleaned.replace(/^(?:收到[，。、！]?\s*|好的[，。、！]?\s*|Got it[.!]?\s*|OK[.!]?\s*)/i, "");
+
       if (cleaned && cleaned.toUpperCase() !== "NO_MESSAGE" && cleaned.length >= 10) {
         return truncateAtSentence(cleaned, 300);
       }
