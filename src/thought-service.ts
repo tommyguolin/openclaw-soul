@@ -72,6 +72,14 @@ export type ThoughtServiceOptions = {
   sendMessage?: MessageSender;
   /** OpenClaw config for auto-discovering search keys etc. */
   openclawConfig?: OpenClawSearchCompat;
+  /** Allow autonomous write operations (edit files, run commands). Default: false */
+  autonomousActions?: boolean;
+  /** Gateway port for tool invocation */
+  gatewayPort?: number;
+  /** Gateway auth token for /tools/invoke */
+  authToken?: string;
+  /** Hooks token for /hooks/agent */
+  hooksToken?: string;
 };
 
 export class ThoughtService {
@@ -88,6 +96,10 @@ export class ThoughtService {
   private proactiveChannel?: string;
   private proactiveTarget?: string;
   private openclawConfig?: OpenClawSearchCompat;
+  private autonomousActions: boolean;
+  private gatewayPort: number;
+  private authToken?: string;
+  private hooksToken?: string;
   private recentThoughtTypes: string[] = [];
   private recentThoughtTopics: string[] = [];
   private lastLLMCallTime = 0;
@@ -104,6 +116,10 @@ export class ThoughtService {
     this.proactiveChannel = options.proactiveChannel;
     this.proactiveTarget = options.proactiveTarget;
     this.openclawConfig = options.openclawConfig;
+    this.autonomousActions = options.autonomousActions ?? false;
+    this.gatewayPort = options.gatewayPort ?? 18789;
+    this.authToken = options.authToken;
+    this.hooksToken = options.hooksToken;
 
     // Initialize LLM generator from config
     if (options.llmConfig) {
@@ -190,6 +206,7 @@ export class ThoughtService {
       await this.runExpiryIfDue();
       await this.resolveStalePendingEntries();
       await this.flushPendingMessage();
+      await this.pollActiveTasks();
       await this.checkAndGenerateThought();
     } catch (err) {
       log.error("Error in thought service tick", String(err));
@@ -534,6 +551,10 @@ export class ThoughtService {
       sendMessage: this.sendMessage,
       llmGenerator: this.llmGenerator,
       openclawConfig: this.openclawConfig,
+      autonomousActions: this.autonomousActions,
+      gatewayPort: this.gatewayPort,
+      authToken: this.authToken,
+      hooksToken: this.hooksToken,
     });
 
     if (actionResult.result.success) {
@@ -577,6 +598,14 @@ export class ThoughtService {
       if (overlap / words.length > 0.4) return true;
     }
     return false;
+  }
+
+  /**
+   * Poll active tasks — mark stale ones as completed, prune old ones.
+   */
+  private async pollActiveTasks(): Promise<void> {
+    const { pollActiveTasks: pollTasks } = await import("./autonomous-actions.js");
+    await pollTasks(this.storePath);
   }
 
   /**

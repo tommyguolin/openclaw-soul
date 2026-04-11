@@ -137,6 +137,10 @@ export function getAllSuccessRates(entries: BehaviorEntry[]): ActionSuccessRate[
     "self-reflect",
     "recall-memory",
     "create-goal",
+    "invoke-tool",
+    "analyze-problem",
+    "run-agent-task",
+    "report-findings",
   ];
 
   return actionTypes.map((at) => getActionSuccessRate(at, entries));

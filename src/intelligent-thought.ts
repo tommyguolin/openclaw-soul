@@ -926,6 +926,32 @@ function determineActionForOpportunity(
     return { actionType: "none" };
   }
 
+  // Check for completed autonomous tasks that need to be reported to the user.
+  // This takes priority over generating new thoughts.
+  const completedUndeliveredTasks = (ego.activeTasks ?? []).filter(
+    (t) => t.status === "completed" && !t.resultDelivered && t.result,
+  );
+  if (completedUndeliveredTasks.length > 0) {
+    return { actionType: "report-findings" };
+  }
+
+  // conversation-replay: if the user discussed a problem/error, try to analyze it
+  if (type === "conversation-replay") {
+    const problemKeywords = /error|bug|issue|problem|stuck|failed|broken|crash|timeout|optimize|improve|enhance|refactor|fix|debug|analyze|报错|错误|失败|崩溃|超时|挂了|异常|不能|无法|不行|优化|改进|改善|提升|修复|调试|分析|排查/i;
+    if (problemKeywords.test(opportunity.triggerDetail) || problemKeywords.test(opportunity.motivation)) {
+      // Extract log/source paths from conversation context
+      const logPaths = extractFilePaths(opportunity.triggerDetail + " " + opportunity.motivation, ".log");
+      return {
+        actionType: "analyze-problem",
+        actionParams: {
+          reason: opportunity.motivation,
+          logPaths,
+          sourcePaths: [],
+        },
+      };
+    }
+  }
+
   // opportunity-detected with connection need: only message if there's
   // specific context to share (e.g. learned something relevant)
   if (type === "opportunity-detected" && relatedNeeds.includes("connection")) {
@@ -1029,6 +1055,17 @@ function extractExistentialTopics(motivation: string): string[] {
   }
 
   return matched.slice(0, 2);
+}
+
+/**
+ * Extract file paths from text that end with a given extension.
+ * Used to find log/source paths from user conversation context.
+ */
+function extractFilePaths(text: string, extension: string): string[] {
+  // Match absolute or relative paths ending with the extension
+  const pattern = new RegExp(`(?:/[^\\s:]+|[\\w./-]+)\\${extension}\\b`, "gi");
+  const matches = text.match(pattern);
+  return matches ? [...new Set(matches)].slice(0, 3) : [];
 }
 
 export async function generateIntelligentThought(

@@ -163,6 +163,10 @@ const ACTION_COOLDOWNS_MS: Record<ActionType, number> = {
   "self-reflect": 5 * 60 * 1000,
   "recall-memory": 10 * 60 * 1000,
   "create-goal": 60 * 60 * 1000,
+  "invoke-tool": 5 * 60 * 1000,
+  "analyze-problem": 20 * 60 * 1000,
+  "run-agent-task": 15 * 60 * 1000,
+  "report-findings": 30 * 60 * 1000,
 };
 
 const lastActionTime: Record<string, number> = {};
@@ -204,6 +208,14 @@ export interface ActionExecutorOptions {
   llmGenerator?: LLMGenerator;
   /** OpenClaw config for auto-discovering search API keys etc. */
   openclawConfig?: OpenClawSearchCompat;
+  /** Allow autonomous write operations (edit files, run commands). Default: false */
+  autonomousActions?: boolean;
+  /** Gateway port for tool invocation */
+  gatewayPort?: number;
+  /** Gateway auth token for /tools/invoke */
+  authToken?: string;
+  /** Hooks token for /hooks/agent */
+  hooksToken?: string;
 }
 
 export async function executeThoughtAction(
@@ -288,6 +300,23 @@ export async function executeThoughtAction(
       case "create-goal":
         actionResult = await executeCreateGoal(thought, ego, options);
         break;
+      case "invoke-tool":
+      case "analyze-problem":
+      case "run-agent-task":
+      case "report-findings": {
+        const { executeAutonomousAction } = await import("./autonomous-actions.js");
+        actionResult = await executeAutonomousAction(actionType, thought, ego, {
+          autonomousActions: options.autonomousActions ?? false,
+          gatewayPort: options.gatewayPort ?? 18789,
+          authToken: options.authToken,
+          hooksToken: options.hooksToken,
+          llmGenerator: options.llmGenerator,
+          sendMessage: options.sendMessage,
+          channel: options.channel,
+          target: options.target,
+        });
+        break;
+      }
       default:
         actionResult = {
           result: {

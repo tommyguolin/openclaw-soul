@@ -2,7 +2,7 @@
   "id": "soul",
   "name": "Soul",
   "description": "Autonomous thinking, emotional awareness, and memory system for OpenClaw",
-  "version": "1.10.0",
+  "version": "2.0.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -26,6 +26,10 @@
       "proactiveTarget": {
         "type": "string",
         "description": "Target for proactive messages (auto-learned from first inbound message if omitted)"
+      },
+      "autonomousActions": {
+        "type": "boolean",
+        "description": "Enable autonomous write operations (editing files, running shell commands). Read operations (reading logs, analyzing code) are always allowed. Default: false"
       },
       "llm": {
         "type": "object",

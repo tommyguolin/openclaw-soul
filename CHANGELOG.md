@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.0.0 (2026-04-11)
+
+### Changes
+
+- **Autonomous actions**: Soul can now take real actions beyond thinking — read logs, analyze code, and investigate problems via OpenClaw's gateway tool API. When Soul detects a user discussing a bug, error, optimization, or improvement, it can autonomously read relevant files and analyze the issue
+- **Task tracking**: New `AutonomousTask` system tracks multi-step work across tick cycles. Tasks are persisted in ego state and survive gateway restarts
+- **Permission model**: New `autonomousActions` config option (default: `false`). Read operations (reading files/logs, running diagnostic commands like `cat`, `grep`, `tail`) are always allowed. Write operations (editing files, running destructive commands) require `autonomousActions: true`
+- **Problem detection**: Soul now detects when users discuss errors, bugs, optimizations, and improvements in conversation, and can autonomously investigate
+- **Result reporting**: When autonomous analysis completes, Soul proactively sends findings to the user via the existing proactive messaging channel
+
+### New config option
+
+```yaml
+# In openclaw.yaml under plugins.entries.soul:
+autonomousActions: false  # Set true to allow Soul to edit files and run commands
+```
+
 ## 1.10.0 (2026-04-11)
 
 ### Changes

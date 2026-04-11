@@ -82,6 +82,28 @@ function buildSendMessage(opts: {
   };
 }
 
+/**
+ * Resolve the gateway auth token for tool invocation.
+ * Uses gateway.auth.token first, falls back to hooks.token.
+ */
+function resolveGatewayAuthToken(openclawConfig: Record<string, unknown>): string | undefined {
+  const gateway = openclawConfig.gateway as Record<string, unknown> | undefined;
+  const auth = gateway?.auth as Record<string, unknown> | undefined;
+  if (auth?.token && typeof auth.token === "string") return auth.token;
+
+  // Fallback: hooks.token also works for gateway auth
+  const hooks = openclawConfig.hooks as Record<string, unknown> | undefined;
+  if (hooks?.token && typeof hooks.token === "string") return hooks.token;
+
+  return undefined;
+}
+
+function resolveHooksToken(openclawConfig: Record<string, unknown>): string | undefined {
+  const hooks = openclawConfig.hooks as Record<string, unknown> | undefined;
+  if (hooks?.token && typeof hooks.token === "string") return hooks.token;
+  return undefined;
+}
+
 let thoughtService: ThoughtService | null = null;
 let serviceCreated = false;
 
@@ -99,6 +121,7 @@ type PluginConfig = {
   proactiveChannel?: string;
   proactiveTarget?: string;
   llm?: SoulLLMConfig;
+  autonomousActions?: boolean;
 };
 // Note: `enabled` in PluginConfig is the inner service toggle (default: true).
 // The outer `plugins.entries.soul.enabled` (in openclaw.json) controls plugin loading.
@@ -176,6 +199,7 @@ const plugin = {
       proactiveMessaging: { type: "boolean", description: "Allow soul to send proactive messages. Default: true" },
       proactiveChannel: { type: "string", description: "Override: channel for proactive messages (auto-detected if omitted)" },
       proactiveTarget: { type: "string", description: "Override: target for proactive messages (auto-detected if omitted)" },
+      autonomousActions: { type: "boolean", description: "Enable autonomous write operations (editing files, running commands). Read operations always allowed. Default: false" },
       llm: {
         type: "object",
         description: "Override: LLM config (auto-detected from OpenClaw if omitted)",
@@ -260,6 +284,10 @@ const plugin = {
         proactiveTarget,
         sendMessage,
         openclawConfig,
+        autonomousActions: config.autonomousActions ?? false,
+        gatewayPort: getGatewayPort(openclawConfig),
+        authToken: resolveGatewayAuthToken(openclawConfig),
+        hooksToken: resolveHooksToken(openclawConfig),
         onThought: createSoulActionHandler(),
       });
 

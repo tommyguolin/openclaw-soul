@@ -20,7 +20,7 @@ The thought frequency is **adaptive**, not mechanical:
 - **User away for over an hour** → thoughts every 20-45 minutes
 - **Never during active conversation** — thoughts are paused while you're chatting
 
-Thought types include: `learn-topic`, `search-web`, `send-message`, `self-reflect`, `bond-deepen`, `help-offer`, `meaning-quest`, `existential-reflection`, and more. Soul picks the most relevant type based on context, not random selection.
+Thought types include: `learn-topic`, `search-web`, `send-message`, `self-reflect`, `analyze-problem`, `invoke-tool`, `run-agent-task`, `report-findings`, and more. Soul picks the most relevant type based on context, not random selection.
 
 ### Proactive Messaging
 
@@ -46,6 +46,19 @@ Soul understands the difference between meaningful and trivial content:
 - **Search deduplication** — Won't repeat the same search query within 6 hours
 - **Language awareness** — Detects your language (Chinese, English, Japanese, Korean) and matches it in all responses
 
+### Autonomous Actions
+
+Soul can take **real actions** beyond just thinking — reading logs, analyzing code, investigating problems, and reporting results to you:
+
+- **Problem detection** — When you discuss bugs, errors, optimizations, or improvements, Soul autonomously reads relevant files and logs to investigate
+- **Multi-step analysis** — Gathers information via gateway tools, analyzes with LLM, and stores structured findings
+- **Result reporting** — Proactively sends you a summary of findings when analysis completes
+- **Task tracking** — Tasks persist across gateway restarts and are tracked with step-by-step progress
+
+**Permission model:**
+- **Read operations** (reading files, running diagnostic commands like `cat`, `grep`, `tail`) — always allowed
+- **Write operations** (editing files, running commands that modify state) — require `autonomousActions: true` in config
+
 ### Long-term Memory
 
 Soul remembers your conversations, your preferences, and what it has learned:
@@ -70,7 +83,7 @@ Soul remembers your conversations, your preferences, and what it has learned:
 **Thought Service** (background, adaptive tick):
 1. Compute engagement score (interaction recency, frequency, substance)
 2. Generate thought based on conversation context and emotional state
-3. Execute action: `learn-topic`, `search-web`, `send-message`, `self-reflect`
+3. Execute action: `learn-topic`, `search-web`, `send-message`, `self-reflect`, `analyze-problem`, `invoke-tool`, `report-findings`
 
 **System Prompt Injection** (every response):
 - Current emotional needs and goals
@@ -153,6 +166,7 @@ That's it — Soul auto-detects everything else:
       "enabled": true,                  // Enable/disable (default: true)
       "checkIntervalMs": 60000,         // Thought check interval in ms (default: 60000)
       "proactiveMessaging": true,       // Allow proactive messages (default: true)
+      "autonomousActions": false,       // Allow Soul to edit files and run commands (default: false)
       // "proactiveChannel": "telegram",  // Override: channel for proactive messages
       // "proactiveTarget": "123456",     // Override: target for proactive messages
       // "llm": {                         // Override: LLM config (auto-detected if omitted)
@@ -225,6 +239,8 @@ Soul uses the LLM configured in OpenClaw's `agents.defaults.model`. Any OpenAI-c
 | `thought.ts` | Thought weights & adaptive frequency logic |
 | `intelligent-thought.ts` | Context-aware thought & opportunity detection |
 | `action-executor.ts` | Executes thought actions (learn, search, message, reflect) |
+| `autonomous-actions.ts` | Autonomous action executors (analyze-problem, invoke-tool, report-findings, run-agent-task) |
+| `gateway-client.ts` | OpenClaw gateway tool invocation client (`/tools/invoke`, `/hooks/agent`) |
 | `behavior-log.ts` | Tracks action outcomes & adjusts probabilities |
 | `prompts.ts` | System prompt builder for context injection |
 | `ego-store.ts` | Ego state persistence (JSON file) |

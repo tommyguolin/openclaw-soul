@@ -23,7 +23,11 @@ export type ActionType =
   | "search-web"
   | "recall-memory"
   | "create-goal"
-  | "self-reflect";
+  | "self-reflect"
+  | "invoke-tool"
+  | "analyze-problem"
+  | "run-agent-task"
+  | "report-findings";
 
 export type ThoughtTrigger =
   | "opportunity"
@@ -210,6 +214,35 @@ export type ObsessionType =
   | "meaning"
   | "connection";
 
+// --- Autonomous Task Tracking ---
+
+export type TaskStatus = "pending" | "in-progress" | "completed" | "failed";
+
+export interface TaskStep {
+  id: string;
+  timestamp: number;
+  action: string;
+  input: string;
+  output?: string;
+  success: boolean;
+  duration?: number;
+}
+
+export interface AutonomousTask {
+  id: string;
+  title: string;
+  description: string;
+  status: TaskStatus;
+  createdAt: number;
+  updatedAt: number;
+  completedAt?: number;
+  sourceThoughtId?: string;
+  steps: TaskStep[];
+  result?: string;
+  requiresWritePermission: boolean;
+  resultDelivered: boolean;
+}
+
 export interface EgoState {
   needs: EgoNeeds;
   fears: Fear[];
@@ -239,6 +272,7 @@ export interface EgoState {
   behaviorLog: BehaviorEntry[];
   pendingShareMessage: string | null;
   userLanguage: string | null;
+  activeTasks: AutonomousTask[];
 }
 
 export interface ThoughtGenerationContext {
