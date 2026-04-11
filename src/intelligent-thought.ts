@@ -906,12 +906,12 @@ function determineActionForOpportunity(
     const problemKeywords = /error|bug|issue|problem|stuck|failed|broken|crash|timeout|optimize|improve|enhance|refactor|fix|debug|analyze|观察|检查|排查|报错|错误|失败|崩溃|超时|挂了|异常|不能|无法|不行|优化|改进|改善|提升|修复|调试|分析/i;
     const combinedText = opportunity.triggerDetail + " " + opportunity.motivation;
     if (problemKeywords.test(combinedText)) {
-      const logPaths = extractFilePaths(combinedText, ".log");
+      const filePaths = extractFilePaths(combinedText);
       return {
         actionType: "analyze-problem",
         actionParams: {
           reason: opportunity.motivation,
-          logPaths,
+          logPaths: filePaths,
           sourcePaths: [],
         },
       };
@@ -1061,11 +1061,25 @@ function extractExistentialTopics(motivation: string): string[] {
  * Extract file paths from text that end with a given extension.
  * Used to find log/source paths from user conversation context.
  */
-function extractFilePaths(text: string, extension: string): string[] {
-  // Match absolute or relative paths ending with the extension
-  const pattern = new RegExp(`(?:/[^\\s:]+|[\\w./-]+)\\${extension}\\b`, "gi");
-  const matches = text.match(pattern);
-  return matches ? [...new Set(matches)].slice(0, 3) : [];
+/** File extensions worth reading for problem analysis. */
+const READABLE_EXTENSIONS = [".log", ".ts", ".js", ".py", ".json", ".yaml", ".yml", ".conf", ".toml", ".md", ".txt", ".sh", ".env", ".sql"];
+
+/**
+ * Extract file paths from text for any readable extension.
+ * Returns deduplicated paths, up to 5 total.
+ */
+function extractFilePaths(text: string): string[] {
+  const results: string[] = [];
+  for (const ext of READABLE_EXTENSIONS) {
+    const pattern = new RegExp(`(?:/[^\\s:]+|[\\w./-]+)\\${ext}\\b`, "gi");
+    const matches = text.match(pattern);
+    if (matches) {
+      for (const m of matches) {
+        if (!results.includes(m)) results.push(m);
+      }
+    }
+  }
+  return results.slice(0, 5);
 }
 
 export async function generateIntelligentThought(
@@ -1128,7 +1142,7 @@ export async function generateIntelligentThought(
         thought.actionType = "analyze-problem";
         thought.actionParams = {
           reason: refinedContent.slice(0, 200),
-          logPaths: extractFilePaths(refinedContent, ".log"),
+          logPaths: extractFilePaths(refinedContent + " " + selectedOpportunity.triggerDetail),
           sourcePaths: [],
         };
       } else if (

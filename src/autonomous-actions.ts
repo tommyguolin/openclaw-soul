@@ -151,35 +151,38 @@ export async function executeAnalyzeProblem(
   const gatheredInfo: string[] = [];
 
   // Phase 1: Gather information
-  const logPaths = (thought.actionParams?.logPaths as string[]) ?? [];
+  const filePaths = (thought.actionParams?.logPaths as string[]) ?? [];
   const sourcePaths = (thought.actionParams?.sourcePaths as string[]) ?? [];
 
-  // Read log files directly via Node.js fs (gateway /tools/invoke does not
-  // expose "read" or "exec" tools to HTTP callers due to policy filtering).
-  for (const logPath of logPaths.slice(0, 3)) {
-    const step = await readLocalFile("read-log", logPath);
+  // Read any files mentioned in conversation (logs, source, config, etc.)
+  for (const filePath of filePaths.slice(0, 5)) {
+    const step = await readLocalFile("read-file", filePath);
     steps.push(step);
-    if (step.success && step.output) gatheredInfo.push(`=== Log: ${logPath} ===\n${step.output}`);
+    if (step.success && step.output) gatheredInfo.push(`=== File: ${filePath} ===\n${step.output}`);
   }
 
-  // Read source files
+  // Read additional source files
   for (const srcPath of sourcePaths.slice(0, 3)) {
     const step = await readLocalFile("read-source", srcPath);
     steps.push(step);
     if (step.success && step.output) gatheredInfo.push(`=== Source: ${srcPath} ===\n${step.output}`);
   }
 
-  // If no specific paths provided, try reading recent gateway logs as a default.
-  const defaultLogPaths = [
-    `/tmp/openclaw/openclaw-${new Date().toISOString().slice(0, 10)}.log`,
-    "/tmp/openclaw-gateway.log",
-  ];
+  // If no files were found from conversation, try reading recent logs from
+  // common locations — not limited to OpenClaw itself.
   if (gatheredInfo.length === 0) {
-    for (const logPath of defaultLogPaths) {
-      const step = await readLocalFile("read-default-log", logPath);
+    const today = new Date().toISOString().slice(0, 10);
+    const defaultPaths = [
+      `/tmp/openclaw/openclaw-${today}.log`,
+      "/tmp/openclaw-gateway.log",
+      `/var/log/syslog`,
+      `/var/log/nginx/error.log`,
+    ];
+    for (const p of defaultPaths) {
+      const step = await readLocalFile("read-default-log", p);
       steps.push(step);
       if (step.success && step.output) {
-        gatheredInfo.push(`=== Gateway log: ${logPath} ===\n${step.output}`);
+        gatheredInfo.push(`=== Log: ${p} ===\n${step.output}`);
         break;
       }
     }
@@ -191,16 +194,16 @@ export async function executeAnalyzeProblem(
     const totalContext = gatheredInfo.join("\n\n").slice(0, 12_000);
     const lang = ego.userLanguage === "zh-CN" ? "Chinese" : "English";
 
-    const prompt = `You are analyzing a technical problem for a user. Based on the information below, provide a concise analysis.
+    const prompt = `You are an AI assistant that has autonomously read some files to investigate a problem or question. Based on the information below, provide a concise analysis.
 
-**Problem context**: ${thought.content.slice(0, 300)}
+**Context**: ${thought.content.slice(0, 300)}
 
 **Gathered information**:
 ${totalContext}
 
 Please analyze and respond in ${lang}:
-1. What is the root cause (if identifiable)?
-2. What is the recommended fix or next step?
+1. What is the root cause or key finding (if identifiable)?
+2. What is the recommended fix, next step, or useful insight?
 3. Any relevant code or config changes needed?
 
 Keep your response under 300 words. Be specific and actionable.`;
