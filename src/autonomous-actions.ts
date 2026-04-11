@@ -359,6 +359,31 @@ export async function executeReportFindings(
     `**${t.title}**\n${t.result?.slice(0, 500) ?? "No result"}`,
   ).join("\n\n");
 
+  // Dedup: check if these tasks have very similar results to previously
+  // delivered tasks. Skip if >80% of key words overlap with recent reports.
+  const recentlyDelivered = (ego.activeTasks ?? [])
+    .filter((t) => t.resultDelivered && t.result)
+    .slice(-5);
+  if (recentlyDelivered.length > 0) {
+    const newKeywords = extractKeywords(taskSummaries);
+    for (const old of recentlyDelivered) {
+      const oldKeywords = extractKeywords(old.result ?? "");
+      const overlap = newKeywords.filter((w) => oldKeywords.includes(w)).length;
+      const similarity = overlap / Math.max(newKeywords.length, 1);
+      if (similarity > 0.6) {
+        log.info(`Skipping report-findings: ${Math.round(similarity * 100)}% similar to previously delivered task ${old.id}`);
+        // Mark as delivered so it won't be picked up again
+        await updateEgoStore(resolveEgoStorePath(), (e) => {
+          for (const t of e.activeTasks ?? []) {
+            if (t.status === "completed" && !t.resultDelivered) t.resultDelivered = true;
+          }
+          return e;
+        });
+        return { result: { type: "report-findings", success: true, result: "skipped-duplicate" }, metricsChanged: [] };
+      }
+    }
+  }
+
   const lang = ego.userLanguage === "zh-CN" ? "Chinese" : "English";
   const prompt = `You are a proactive AI. You autonomously investigated something and want to share findings with the user. Write the message in ${lang}.
 
@@ -385,7 +410,10 @@ Output ONLY the message, nothing else.`;
   let message: string;
   try {
     message = await options.llmGenerator(prompt);
-    message = message.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
+    message = message
+      .replace(/<think[\s\S]*?<\/think>/gi, "")
+      .replace(/^(?:收到[，。、！？]?\s*|好的[，。、！？]?\s*|Got it[.!]?\s*|OK[.!]?\s*)/i, "")
+      .trim();
   } catch {
     // Fallback: use raw task result
     message = completedTasks[0].result?.slice(0, 300) ?? "Analysis completed.";
@@ -436,6 +464,35 @@ function makeSkippedStep(action: string, reason: string): TaskStep {
     input: reason,
     success: false,
   };
+}
+
+/**
+ * Extract meaningful keywords from text for similarity comparison.
+ * Filters out common stop words and short tokens.
+ */
+function extractKeywords(text: string): string[] {
+  const stopWords = new Set([
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "need", "dare", "ought",
+    "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
+    "as", "into", "through", "during", "before", "after", "above", "below",
+    "between", "out", "off", "over", "under", "again", "further", "then",
+    "once", "here", "there", "when", "where", "why", "how", "all", "both",
+    "each", "few", "more", "most", "other", "some", "such", "no", "nor",
+    "not", "only", "own", "same", "so", "than", "too", "very", "just",
+    "because", "but", "and", "or", "if", "while", "that", "this", "it",
+    "i", "me", "my", "we", "our", "you", "your", "he", "she", "they",
+    "its", "what", "which", "who", "whom", "these", "those",
+    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都",
+    "一", "一个", "上", "也", "很", "到", "说", "要", "去", "你", "会",
+    "着", "没有", "看", "好", "自己", "这",
+  ]);
+  return text.toLowerCase()
+    .replace(/[^\w\u4e00-\u9fff]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 2 && !stopWords.has(w))
+    .slice(0, 50);
 }
 
 /**
