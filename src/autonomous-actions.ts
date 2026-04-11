@@ -180,17 +180,22 @@ export async function executeAnalyzeProblem(
     if (step.success && step.output) gatheredInfo.push(`=== Exec: ${cmd} ===\n${step.output}`);
   }
 
-  // If no specific paths provided, try reading recent gateway logs as a default
+  // If no specific paths provided, try reading recent gateway logs as a default.
+  // Use "read" tool instead of "exec" — exec via /tools/invoke can trigger
+  // OpenClaw agent event system errors ("Agent listener invoked outside active run").
+  const defaultLogPaths = [
+    "/tmp/openclaw/openclaw-2026-04-11.log",
+    `/tmp/openclaw/openclaw-${new Date().toISOString().slice(0, 10)}.log`,
+    "/tmp/openclaw-gateway.log",
+  ];
   if (gatheredInfo.length === 0) {
-    const defaultLogStep = await runToolStep(
-      "read-default-log",
-      "exec",
-      { command: "ls -t /tmp/openclaw/*.log 2>/dev/null | head -1 | xargs tail -n 200" },
-      options,
-    );
-    steps.push(defaultLogStep);
-    if (defaultLogStep.success && defaultLogStep.output) {
-      gatheredInfo.push(`=== Default gateway log (last 200 lines) ===\n${defaultLogStep.output}`);
+    for (const logPath of defaultLogPaths) {
+      const step = await runToolStep("read-default-log", "read", { path: logPath, offset: -200 }, options);
+      steps.push(step);
+      if (step.success && step.output) {
+        gatheredInfo.push(`=== Gateway log: ${logPath} ===\n${step.output}`);
+        break;
+      }
     }
   }
 

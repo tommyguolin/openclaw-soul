@@ -969,9 +969,10 @@ function determineActionForOpportunity(
   }
 
   if (type === "meaning-quest" || type === "existential-reflection") {
-    // Adjusted by behavior history
-    const searchProb = adjustProbability(0.3, "search-web", ego.behaviorLog ?? []);
-    const reflectProb = adjustProbability(0.15, "self-reflect", ego.behaviorLog ?? []);
+    // These are philosophical/internal topics — almost never need web search.
+    // Prefer self-reflection; only search if truly time-sensitive.
+    const searchProb = adjustProbability(0.05, "search-web", ego.behaviorLog ?? []);
+    const reflectProb = adjustProbability(0.3, "self-reflect", ego.behaviorLog ?? []);
     const roll = Math.random();
     if (roll < reflectProb) {
       return { actionType: "self-reflect" };

@@ -70,6 +70,37 @@ function isEgoStateQuery(text: string): boolean {
 }
 
 /**
+ * Time-sensitive topics that genuinely need web search for current information.
+ * Most other topics the LLM can answer from its training data.
+ */
+const TIME_SENSITIVE_PATTERNS = [
+  // Weather & environment
+  /天气|气温|温度|weather|forecast/i,
+  // Finance & markets
+  /股票|股价|基金|行情|大盘|汇率|比特币|bitcoin|stock|price|market|index|crypto/i,
+  // News & current events
+  /新闻|最新|今日|昨天|本周|最近发生|news|latest|today|yesterday|this week|breaking/i,
+  // Sports scores & live events
+  /比分|赛果|比分|score|match result|比分/i,
+  // Version updates & releases
+  /最新版本|新版本|new release|latest version|changelog|更新日志/i,
+  // Real-time availability
+  /营业|开门|还有没有|available|in stock|sold out|库存/i,
+  // Specific dates with current reference
+  /\d{4}年.*(发生|出台|发布|上线)/,
+];
+
+/**
+ * Check if a topic is time-sensitive and genuinely needs web search.
+ * Most topics (programming, philosophy, science, etc.) the LLM already knows
+ * from its training data. Only real-time information needs a web search.
+ */
+function isTimeSensitiveTopic(text: string): boolean {
+  if (!text) return false;
+  return TIME_SENSITIVE_PATTERNS.some((p) => p.test(text));
+}
+
+/**
  * Truncate text at a sentence boundary (period, question mark, exclamation)
  * instead of cutting mid-sentence. Falls back to hard cut only if no
  * sentence boundary exists before maxLen.
@@ -666,6 +697,11 @@ async function executeLearnTopic(
       log.info(`Skipping ego-state query: "${topic}"`);
       continue;
     }
+    // Skip non-time-sensitive topics — the LLM already knows these from training data
+    if (!isTimeSensitiveTopic(topic)) {
+      log.info(`Skipping non-time-sensitive learn-topic: "${topic}" (LLM can answer)`);
+      continue;
+    }
     const searchResults = await soulWebSearch(topic, options.openclawConfig);
 
     if (searchResults && searchResults.length > 0 && options.llmGenerator) {
@@ -774,6 +810,15 @@ async function executeSearchWeb(
     log.info(`Skipping ego-state search query: "${query}"`);
     return {
       result: { type: "search-web", success: true, result: "skipped-ego-state" },
+      metricsChanged: [],
+    };
+  }
+
+  // Skip non-time-sensitive topics — LLM can answer from training data
+  if (!isTimeSensitiveTopic(query)) {
+    log.info(`Skipping non-time-sensitive search: "${query}" (LLM can answer)`);
+    return {
+      result: { type: "search-web", success: true, result: "skipped-not-time-sensitive" },
       metricsChanged: [],
     };
   }
