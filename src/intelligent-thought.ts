@@ -174,7 +174,8 @@ function analyzeRecentInteraction(timeSinceLastInteraction: number): DetectedTho
       type: "bond-deepen",
       trigger: "bonding",
       triggerDetail: `Long time no interaction: ${Math.floor(minutesSince / 60)}h${Math.floor(minutesSince % 60)}m`,
-      priority: 70 + minutesSince * 0.1,
+      // Cap at 85 so observe-and-improve (P=90/95) still wins for self-modification
+      priority: Math.min(85, 70 + minutesSince * 0.1),
       source: "environmental-change",
       relatedNeeds: ["connection"],
       motivation: `It's been a long time since I interacted with the user, I want to reach out`,
@@ -913,7 +914,15 @@ function determineActionForOpportunity(
     return { actionType: "self-reflect" };
   }
 
+  // bond-deepen: do NOT route to send-message or any action.
+  // Must be checked BEFORE global task routing to prevent bond-deepen
+  // from being hijacked by completedUndeliveredTasks/completableFixTasks.
+  if (type === "bond-deepen") {
+    return { actionType: "none" };
+  }
+
   // --- Autonomous action routing (high priority, before learn-topic) ---
+  // NOTE: These run AFTER type-specific routing so bond-deepen → none is honored.
 
   // Report completed tasks to user FIRST — this delivers value and marks tasks
   // as delivered, clearing the way for new actions (run-agent-task, etc.)
@@ -979,11 +988,6 @@ function determineActionForOpportunity(
   // help-offer: proactively reach out to offer help (value-driven)
   if (type === "help-offer") {
     return { actionType: "send-message" };
-  }
-
-  // bond-deepen: do NOT route to send-message.
-  if (type === "bond-deepen") {
-    return { actionType: "none" };
   }
 
   // opportunity-detected with connection need: only message if there's

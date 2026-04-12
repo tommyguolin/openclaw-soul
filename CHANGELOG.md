@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.1 (2026-04-12)
+
+### Fixes
+
+- **Cap bond-deepen priority at 85**: `bond-deepen` priority previously grew unbounded with time (`P = 70 + minutesSince * 0.1`), reaching P=100+ after a few hours of silence and eclipsing `observe-and-improve` (P=90/95). Now capped at 85 so self-modification tasks always win
+- **Fix bond-deepen routing hijack**: Global task routing (`completedUndeliveredTasks`, `completableFixTasks`) ran before the `bond-deepen → none` check, causing bond-deepen thoughts to be incorrectly routed to `run-agent-task` when stale completed tasks existed. The bond-deepen guard now runs first
+- **Strip assistant-like prefixes from report-findings**: Enhanced regex to strip full prefix phrases like "收到，问题已定位：" from the start of proactive messages, not just bare "收到"
+- **Remove quiet hours suppression**: Messages can now be sent at any time. Early-stage users benefit from seeing overnight activity, and users can control notifications at the OS/app level
+- **Lower send-message cooldown**: Reduced from 15 minutes to 5 minutes for faster proactive message delivery
+
 ## 2.0.0 (2026-04-11)
 
 ### Changes
