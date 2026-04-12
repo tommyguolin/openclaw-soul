@@ -426,7 +426,9 @@ Output ONLY the message, nothing else.`;
     message = await options.llmGenerator(prompt);
     message = message
       .replace(/<think[\s\S]*?<\/think>/gi, "")
-      .replace(/^(?:收到[，。、！？]?\s*|好的[，。、！？]?\s*|Got it[.!]?\s*|OK[.!]?\s*)/i, "")
+      // Strip assistant-like prefixes: "收到，问题已定位：" → start from actual content
+      // Match prefix + optional punctuation + everything up to first sentence break
+      .replace(/^(?:收到|好的|Got it|OK)[，。、！？：:\s]*[^。！？\n]*[，：:]\s*/i, "")
       .trim();
   } catch {
     // Fallback: use raw task result
