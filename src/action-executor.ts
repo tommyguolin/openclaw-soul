@@ -195,9 +195,9 @@ const ACTION_COOLDOWNS_MS: Record<ActionType, number> = {
   "recall-memory": 10 * 60 * 1000,
   "create-goal": 60 * 60 * 1000,
   "invoke-tool": 5 * 60 * 1000,
-  "analyze-problem": 20 * 60 * 1000,
+  "analyze-problem": 60 * 60 * 1000,
   "run-agent-task": 15 * 60 * 1000,
-  "report-findings": 30 * 60 * 1000,
+  "report-findings": 2 * 60 * 60 * 1000,
 };
 
 const lastActionTime: Record<string, number> = {};

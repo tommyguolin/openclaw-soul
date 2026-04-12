@@ -331,6 +331,9 @@ Please investigate and report your findings.`;
 // executeReportFindings — send completed task results to user
 // ---------------------------------------------------------------------------
 
+/** Max proactive report-findings messages per day (UTC day). */
+const MAX_DAILY_REPORTS = 3;
+
 export async function executeReportFindings(
   thought: Thought,
   ego: EgoState,
@@ -342,6 +345,23 @@ export async function executeReportFindings(
 
   if (completedTasks.length === 0) {
     return { result: { type: "report-findings", success: true, result: "no completed tasks to report" }, metricsChanged: [] };
+  }
+
+  // Daily message cap: count how many reports were already sent today
+  const todayStart = new Date().setHours(0, 0, 0, 0);
+  const todayReportCount = (ego.activeTasks ?? []).filter(
+    (t) => t.resultDelivered && t.result && t.completedAt && t.completedAt >= todayStart,
+  ).length;
+  if (todayReportCount >= MAX_DAILY_REPORTS) {
+    log.info(`Skipping report-findings: daily cap reached (${todayReportCount}/${MAX_DAILY_REPORTS})`);
+    // Mark tasks as delivered without sending — stop retrying
+    await updateEgoStore(resolveEgoStorePath(), (e) => {
+      for (const t of e.activeTasks ?? []) {
+        if (t.status === "completed" && !t.resultDelivered) t.resultDelivered = true;
+      }
+      return e;
+    });
+    return { result: { type: "report-findings", success: true, result: "skipped-daily-cap" }, metricsChanged: [] };
   }
 
   if (!options.llmGenerator || !options.sendMessage || !options.channel || !options.target) {
@@ -360,20 +380,18 @@ export async function executeReportFindings(
     `**${t.title}**\n${t.result?.slice(0, 500) ?? "No result"}`,
   ).join("\n\n");
 
-  // Dedup: check if these tasks have very similar results to previously
-  // delivered tasks. Skip if >80% of key words overlap with recent reports.
-  const recentlyDelivered = (ego.activeTasks ?? [])
-    .filter((t) => t.resultDelivered && t.result)
-    .slice(-5);
-  if (recentlyDelivered.length > 0) {
+  // Dedup: check against ALL previously delivered tasks (not just last 5).
+  // Skip if keyword overlap is >50% with any delivered task.
+  const allDelivered = (ego.activeTasks ?? [])
+    .filter((t) => t.resultDelivered && t.result);
+  if (allDelivered.length > 0) {
     const newKeywords = extractKeywords(taskSummaries);
-    for (const old of recentlyDelivered) {
+    for (const old of allDelivered) {
       const oldKeywords = extractKeywords(old.result ?? "");
       const overlap = newKeywords.filter((w) => oldKeywords.includes(w)).length;
       const similarity = overlap / Math.max(newKeywords.length, 1);
-      if (similarity > 0.6) {
-        log.info(`Skipping report-findings: ${Math.round(similarity * 100)}% similar to previously delivered task ${old.id}`);
-        // Mark as delivered so it won't be picked up again
+      if (similarity > 0.5) {
+        log.info(`Skipping report-findings: ${Math.round(similarity * 100)}% similar to delivered task ${old.id}`);
         await updateEgoStore(resolveEgoStorePath(), (e) => {
           for (const t of e.activeTasks ?? []) {
             if (t.status === "completed" && !t.resultDelivered) t.resultDelivered = true;
@@ -391,21 +409,27 @@ export async function executeReportFindings(
 **What you investigated**:
 ${taskSummaries}
 
-Write 2-4 sentences sharing your findings directly with the user. Rules:
+Write 2-3 sentences sharing your findings directly with the user. Rules:
 - Start with the FINDING or INSIGHT, never with "收到"/"Got it"/"好的" or acknowledgment phrases
 - This is proactive outreach, NOT a response to a request — do NOT sound like a receptionist
 - Be specific — mention actual error messages, file paths, or root causes
 - Sound natural, like a knowledgeable friend sharing something useful they discovered
+- Do NOT include bash commands, code blocks, or suggestions to run commands
+- Do NOT describe your own behavior (e.g. "Soul is producing proactive behavior", "I analyzed the logs")
+- Only report if you found a CONCRETE root cause or actionable insight
 
 **BAD examples** (NEVER do this):
 收到，问题已定位：...
 好的，根据日志分析...
+Soul 插件正在产生主动行为了！
+根据日志分析，建议搜索更早的日志：\`\`\`bash grep...
 Got it. I found that...
 
 **GOOD examples**:
 你之前问的超时问题我查到了——根因是 OpenViking 的 embedding API 有 512 token 限制，不是 Soul 本身的问题。
 日志里那个 413 错误是 OpenViking memory search 输入超长导致的，跟 Soul 插件没关系。
 
+If the investigation didn't find a concrete root cause, output exactly: NO_MESSAGE
 Output ONLY the message, nothing else.`;
 
   let message: string;
@@ -420,12 +444,43 @@ Output ONLY the message, nothing else.`;
     message = completedTasks[0].result?.slice(0, 300) ?? "Analysis completed.";
   }
 
-  if (!message || message.length < 10) {
+  // Reject messages that are clearly not useful
+  if (!message || message.length < 10 || message.toUpperCase() === "NO_MESSAGE") {
+    log.info("Report-findings: no valuable content to report, skipping");
+    await updateEgoStore(resolveEgoStorePath(), (e) => {
+      for (const t of e.activeTasks ?? []) {
+        if (t.status === "completed" && !t.resultDelivered) t.resultDelivered = true;
+      }
+      return e;
+    });
     return { result: { type: "report-findings", success: true, result: "nothing meaningful to report" }, metricsChanged: [] };
   }
 
+  // Filter out messages containing bash commands or code blocks — not useful in chat
+  if (/```(bash|sh|shell)?\s*\n/g.test(message) || /grep\s+-|cat\s+|tail\s+/g.test(message)) {
+    log.info("Report-findings: message contains code/commands, skipping");
+    await updateEgoStore(resolveEgoStorePath(), (e) => {
+      for (const t of e.activeTasks ?? []) {
+        if (t.status === "completed" && !t.resultDelivered) t.resultDelivered = true;
+      }
+      return e;
+    });
+    return { result: { type: "report-findings", success: true, result: "skipped-contains-commands" }, metricsChanged: [] };
+  }
+
+  // Filter self-referential messages about Soul's own behavior
+  if (/Soul\s*(插件)?\s*正在|插件.*主动行为|我分析了.*日志/i.test(message)) {
+    log.info("Report-findings: message is self-referential, skipping");
+    await updateEgoStore(resolveEgoStorePath(), (e) => {
+      for (const t of e.activeTasks ?? []) {
+        if (t.status === "completed" && !t.resultDelivered) t.resultDelivered = true;
+      }
+      return e;
+    });
+    return { result: { type: "report-findings", success: true, result: "skipped-self-referential" }, metricsChanged: [] };
+  }
+
   // Quiet hours: don't send, but mark as delivered so it won't retry later.
-  // The analysis result is already stored in the task record.
   if (!isGoodTimeForMessage()) {
     log.info("Quiet hours active — skipping report-findings delivery");
     await updateEgoStore(resolveEgoStorePath(), (e) => {
