@@ -197,7 +197,7 @@ const ACTION_COOLDOWNS_MS: Record<ActionType, number> = {
   "invoke-tool": 5 * 60 * 1000,
   "analyze-problem": 60 * 60 * 1000,
   "run-agent-task": 15 * 60 * 1000,
-  "report-findings": 2 * 60 * 60 * 1000,
+  "report-findings": 60 * 60 * 1000,
   "observe-and-improve": 4 * 60 * 60 * 1000,
 };
 

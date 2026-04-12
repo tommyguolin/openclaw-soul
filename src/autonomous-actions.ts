@@ -341,9 +341,6 @@ Please investigate and report your findings. If a concrete fix is identified and
 // executeReportFindings — send completed task results to user
 // ---------------------------------------------------------------------------
 
-/** Max proactive report-findings messages per day (UTC day). */
-const MAX_DAILY_REPORTS = 3;
-
 export async function executeReportFindings(
   thought: Thought,
   ego: EgoState,
@@ -355,23 +352,6 @@ export async function executeReportFindings(
 
   if (completedTasks.length === 0) {
     return { result: { type: "report-findings", success: true, result: "no completed tasks to report" }, metricsChanged: [] };
-  }
-
-  // Daily message cap: count how many reports were already sent today
-  const todayStart = new Date().setHours(0, 0, 0, 0);
-  const todayReportCount = (ego.activeTasks ?? []).filter(
-    (t) => t.resultDelivered && t.result && t.completedAt && t.completedAt >= todayStart,
-  ).length;
-  if (todayReportCount >= MAX_DAILY_REPORTS) {
-    log.info(`Skipping report-findings: daily cap reached (${todayReportCount}/${MAX_DAILY_REPORTS})`);
-    // Mark tasks as delivered without sending — stop retrying
-    await updateEgoStore(resolveEgoStorePath(), (e) => {
-      for (const t of e.activeTasks ?? []) {
-        if (t.status === "completed" && !t.resultDelivered) t.resultDelivered = true;
-      }
-      return e;
-    });
-    return { result: { type: "report-findings", success: true, result: "skipped-daily-cap" }, metricsChanged: [] };
   }
 
   if (!options.llmGenerator || !options.sendMessage || !options.channel || !options.target) {
