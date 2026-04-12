@@ -404,7 +404,6 @@ Write 2-3 sentences sharing your findings directly with the user. Rules:
 - This is proactive outreach, NOT a response to a request — do NOT sound like a receptionist
 - Be specific — mention actual error messages, file paths, or root causes
 - Sound natural, like a knowledgeable friend sharing something useful they discovered
-- Do NOT include bash commands, code blocks, or suggestions to run commands
 - Do NOT describe your own behavior (e.g. "Soul is producing proactive behavior", "I analyzed the logs")
 - Only report if you found a CONCRETE root cause or actionable insight
 
@@ -444,18 +443,6 @@ Output ONLY the message, nothing else.`;
       return e;
     });
     return { result: { type: "report-findings", success: true, result: "nothing meaningful to report" }, metricsChanged: [] };
-  }
-
-  // Filter out messages containing bash commands or code blocks — not useful in chat
-  if (/```(bash|sh|shell)?\s*\n/g.test(message) || /grep\s+-|cat\s+|tail\s+/g.test(message)) {
-    log.info("Report-findings: message contains code/commands, skipping");
-    await updateEgoStore(resolveEgoStorePath(), (e) => {
-      for (const t of e.activeTasks ?? []) {
-        if (t.status === "completed" && !t.resultDelivered) t.resultDelivered = true;
-      }
-      return e;
-    });
-    return { result: { type: "report-findings", success: true, result: "skipped-contains-commands" }, metricsChanged: [] };
   }
 
   // Filter self-referential messages about Soul's own behavior
