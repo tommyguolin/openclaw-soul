@@ -702,7 +702,7 @@ function analyzeContextualTriggers(ctx: ThoughtGenerationContext): DetectedThoug
     // Must be high enough priority to win over conversation-replay (P=70) and
     // bond-deepen (P≤80). The 4-hour cooldown in action-executor prevents
     // runaway self-modification.
-    const basePriority = hasConversationReplay ? 75 : 85;
+    const basePriority = hasConversationReplay ? 90 : 95;
     opportunities.push({
       type: "opportunity-detected",
       trigger: "opportunity",
