@@ -188,7 +188,7 @@ function stripMetaAnalysis(text: string): string {
 
 const ACTION_COOLDOWNS_MS: Record<ActionType, number> = {
   none: 0,
-  "send-message": 15 * 60 * 1000,
+  "send-message": 5 * 60 * 1000,
   "learn-topic": 15 * 60 * 1000,
   "search-web": 10 * 60 * 1000,
   "self-reflect": 5 * 60 * 1000,
@@ -384,11 +384,9 @@ export function markActionExecuted(actionType: ActionType): void {
  * OK hours: 12:00-14:00 (lunch), 18:00-23:00 (evening, lighter content OK).
  */
 export function isGoodTimeForMessage(): boolean {
-  const hour = new Date().getHours();
-  // Quiet hours: 23:00 - 08:00 — never send
-  if (hour >= 23 || hour < 8) {
-    return false;
-  }
+  // Always allow — early stage: user needs to see Soul is active and working.
+  // Users can mute notifications at night; seeing morning messages from overnight
+  // work builds confidence in the plugin.
   return true;
 }
 
@@ -441,22 +439,6 @@ async function executeSendMessage(
     log.info("Proactive message skipped: no valuable content to share");
     return {
       result: { type: "send-message", success: true, result: "skipped-no-value" },
-      metricsChanged: [],
-    };
-  }
-
-  // Timing gate: queue for later if it's quiet hours
-  if (!isGoodTimeForMessage()) {
-    log.info("Quiet hours active — queuing message for later");
-    await updateEgoStore(resolveEgoStorePath(), (ego) => {
-      // Only queue if nothing is already pending (don't overwrite)
-      if (!ego.pendingShareMessage) {
-        ego.pendingShareMessage = messageContent;
-      }
-      return ego;
-    });
-    return {
-      result: { type: "send-message", success: true, result: "queued-for-quiet-hours" },
       metricsChanged: [],
     };
   }

@@ -915,22 +915,23 @@ function determineActionForOpportunity(
 
   // --- Autonomous action routing (high priority, before learn-topic) ---
 
-  // Route completed analysis with fix suggestions to agent execution.
-  // The agent has write access and can implement the fix.
+  // Report completed tasks to user FIRST — this delivers value and marks tasks
+  // as delivered, clearing the way for new actions (run-agent-task, etc.)
+  const completedUndeliveredTasks = (ego.activeTasks ?? []).filter(
+    (t) => t.status === "completed" && !t.resultDelivered && t.result,
+  );
+  if (completedUndeliveredTasks.length > 0) {
+    return { actionType: "report-findings" };
+  }
+
+  // After results are delivered, route completed analysis with fix suggestions
+  // to agent execution. The agent has write access and can implement the fix.
   const completableFixTasks = (ego.activeTasks ?? []).filter(
     (t) => t.status === "completed" && !t.resultDelivered && t.result &&
       /fix|修复|解决|suggest|recommend|change|修改|优化|improve/i.test(t.result),
   );
   if (completableFixTasks.length > 0) {
     return { actionType: "run-agent-task" };
-  }
-
-  // Check for completed autonomous tasks that need to be reported to the user.
-  const completedUndeliveredTasks = (ego.activeTasks ?? []).filter(
-    (t) => t.status === "completed" && !t.resultDelivered && t.result,
-  );
-  if (completedUndeliveredTasks.length > 0) {
-    return { actionType: "report-findings" };
   }
 
   // conversation-replay AND opportunity-detected: if the user discussed a

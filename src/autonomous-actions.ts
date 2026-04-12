@@ -457,18 +457,6 @@ Output ONLY the message, nothing else.`;
     return { result: { type: "report-findings", success: true, result: "skipped-self-referential" }, metricsChanged: [] };
   }
 
-  // Quiet hours: don't send, but mark as delivered so it won't retry later.
-  if (!isGoodTimeForMessage()) {
-    log.info("Quiet hours active — skipping report-findings delivery");
-    await updateEgoStore(resolveEgoStorePath(), (e) => {
-      for (const t of e.activeTasks ?? []) {
-        if (t.status === "completed" && !t.resultDelivered) t.resultDelivered = true;
-      }
-      return e;
-    });
-    return { result: { type: "report-findings", success: true, result: "skipped-quiet-hours" }, metricsChanged: [] };
-  }
-
   try {
     await options.sendMessage({
       to: options.target,
