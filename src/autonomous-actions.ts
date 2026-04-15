@@ -399,10 +399,9 @@ export async function executeReportFindings(
 **What you investigated**:
 ${taskSummaries}
 
-Write 2-3 sentences sharing your findings directly with the user. Rules:
-- Start with the FINDING or INSIGHT, never with "收到"/"Got it"/"好的" or acknowledgment phrases
-- This is proactive outreach, NOT a response to a request — do NOT sound like a receptionist
-- Be specific — mention actual error messages, file paths, or root causes
+Write 2-3 sentences: start with a brief natural opening, then share your findings. Rules:
+- Start with a short natural opening that gives context (e.g. "我后来查了一下...", "我研究了一下那个问题——", "Just looked into that issue...")
+- Then deliver the specific finding — mention actual error messages, file paths, or root causes
 - Sound natural, like a knowledgeable friend sharing something useful they discovered
 - Do NOT describe your own behavior (e.g. "Soul is producing proactive behavior", "I analyzed the logs")
 - Only report if you found a CONCRETE root cause or actionable insight
@@ -413,10 +412,12 @@ Write 2-3 sentences sharing your findings directly with the user. Rules:
 Soul 插件正在产生主动行为了！
 根据日志分析，建议搜索更早的日志：\`\`\`bash grep...
 Got it. I found that...
+你之前问的超时问题我查到了——根因是... ← no opening, feels abrupt
 
 **GOOD examples**:
-你之前问的超时问题我查到了——根因是 OpenViking 的 embedding API 有 512 token 限制，不是 Soul 本身的问题。
-日志里那个 413 错误是 OpenViking memory search 输入超长导致的，跟 Soul 插件没关系。
+我后来查了一下你之前问的超时问题——根因是 OpenViking 的 embedding API 有 512 token 限制，不是 Soul 本身的问题。
+我研究了一下日志里那个 413 错误，是 OpenViking memory search 输入超长导致的，跟 Soul 插件没关系。
+Just looked into that 413 error — it's caused by oversized memory search input, not the plugin itself.
 
 If the investigation didn't find a concrete root cause, output exactly: NO_MESSAGE
 Output ONLY the message, nothing else.`;

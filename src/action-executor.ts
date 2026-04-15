@@ -574,17 +574,28 @@ ${isUserTopicFollowUp
 - Restating the user's own words back to them as if it were new information
 
 **Rules**:
-- Output ONLY the message text (1-2 sentences), nothing else
+- Start with a brief natural opening (half sentence) that gives context for why you're reaching out
+- Then deliver the specific finding/insight in 1-2 more sentences
 - NO analysis, NO numbering, NO "Let me analyze", NO meta-commentary
 - If you have something genuinely valuable to share, write it directly
 - If not, output exactly: NO_MESSAGE
 
+**Opening phrase examples** (pick one that fits, or use similar):
+- "我后来想了想..." / "I thought about it and..."
+- "我突然想到..." / "I just realized..."
+- "我从网上查到一个有意思的东西——" / "I came across something interesting —"
+- "对了，关于你之前问的..." / "By the way, about what you asked earlier..."
+- "刚刚我在研究的时候发现..." / "While looking into something, I found..."
+- "我后来又查了一下..." / "I did some more research and..."
+
 **Examples of GOOD output**:
-关于你之前问的Python异步问题，我查到asyncio.gather比TaskGroup更适合你那个场景。
-I found that the issue you mentioned with Docker networking is a known bug in version 24.0.
-关于你之前问的怎么让AI更主动，我查到李飞飞提出的"以人为本的AI"理念——强调AI应该主动理解人的需求而非被动响应。
+我后来想了想你之前问的Python异步问题，查到asyncio.gather比TaskGroup更适合你那个场景。
+我突然想到一个跟之前话题相关的——你提到的Docker网络问题其实是24.0版本的已知bug。
+我从网上查到一个有意思的东西——李飞飞提出的"以人为本的AI"理念，强调AI应该主动理解人的需求而非被动响应。
+I thought about it and found that the Docker networking issue you mentioned is a known bug in version 24.0.
 
 **Examples of BAD output (NEVER do this)**:
+关于你之前问的Python异步问题，我查到asyncio.gather比TaskGroup更适合你那个场景。 ← no opening, feels abrupt
 Let me analyze whether...
 1. The user asked about...
 I don't have enough information...
