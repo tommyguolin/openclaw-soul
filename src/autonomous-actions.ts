@@ -542,6 +542,7 @@ ${userContext || "Limited user info."}
 4. Verify the fix doesn't break anything (check for syntax errors, import issues)
 
 **Safety rules**:
+- **Always read a file before editing it** — use the read tool first, then use the exact text from the file content as oldText in the edit tool. Never guess or fabricate file content
 - Only modify files in ${soulDir}/
 - Make small, focused changes (one improvement per run)
 - Never delete existing functionality — only add or improve
