@@ -102,8 +102,10 @@ Edit `~/.openclaw/openclaw.json`:
 ```jsonc
 {
   "plugins": {
-    "soul": {
-      "enabled": true
+    "entries": {
+      "soul": {
+        "enabled": true
+      }
     }
   },
   // Required: enable gateway chat completions endpoint
@@ -176,19 +178,23 @@ Three settings: enable plugin, enable chat completions, enable hooks.
 ```jsonc
 {
   "plugins": {
-    "soul": {
-      "enabled": true,
-      "checkIntervalMs": 60000,         // Thought check interval (default: 60000)
-      "proactiveMessaging": true,        // Allow proactive messages (default: true)
-      "autonomousActions": false,        // Allow editing files and running commands (default: false)
-      // "proactiveChannel": "telegram", // Override: channel for proactive messages
-      // "proactiveTarget": "123456",    // Override: target for proactive messages
-      // "llm": {                        // Override LLM config (auto-detected if omitted)
-      //   "provider": "openai",
-      //   "model": "gpt-4o",
-      //   "apiKeyEnv": "OPENAI_API_KEY",
-      //   "baseUrl": "https://api.openai.com/v1"
-      // }
+    "entries": {
+      "soul": {
+        "enabled": true,
+        "config": {
+          "checkIntervalMs": 60000,         // Thought check interval (default: 60000)
+          "proactiveMessaging": true,        // Allow proactive messages (default: true)
+          "autonomousActions": false         // Allow editing files and running commands (default: false)
+          // "proactiveChannel": "telegram",  // Override: channel for proactive messages
+          // "proactiveTarget": "123456",     // Override: target for proactive messages
+          // "llm": {                         // Override LLM config (auto-detected if omitted)
+          //   "provider": "openai",
+          //   "model": "gpt-4o",
+          //   "apiKeyEnv": "OPENAI_API_KEY",
+          //   "baseUrl": "https://api.openai.com/v1"
+          // }
+        }
+      }
     }
   },
   "gateway": {
