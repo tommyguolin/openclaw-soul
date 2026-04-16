@@ -914,11 +914,11 @@ function determineActionForOpportunity(
     return { actionType: "self-reflect" };
   }
 
-  // bond-deepen: do NOT route to send-message or any action.
+  // bond-deepen: reach out to the user to deepen the relationship.
   // Must be checked BEFORE global task routing to prevent bond-deepen
   // from being hijacked by completedUndeliveredTasks/completableFixTasks.
   if (type === "bond-deepen") {
-    return { actionType: "none" };
+    return { actionType: "send-message" };
   }
 
   // --- Autonomous action routing (high priority, before learn-topic) ---

@@ -167,6 +167,10 @@ export class ThoughtService {
     }
 
     this.running = true;
+
+    // Send startup greeting to let the user know Soul is alive
+    await this.sendStartupGreeting(ego);
+
     this.intervalId = setInterval(() => {
       void this.tick();
     }, this.checkIntervalMs);
@@ -185,6 +189,37 @@ export class ThoughtService {
 
   isRunning(): boolean {
     return this.running;
+  }
+
+  /**
+   * Send a brief greeting on startup so the user immediately sees Soul is active.
+   * Only sends if proactive messaging is configured.
+   */
+  private async sendStartupGreeting(ego: EgoState): Promise<void> {
+    if (!this.sendMessage || !this.proactiveChannel || !this.proactiveTarget) {
+      return;
+    }
+
+    const lang = ego.userLanguage === "zh-CN" ? "zh" : "en";
+    const hours = Math.floor((Date.now() - ego.lastInteractionTime) / (1000 * 60 * 60));
+    const timeContext = hours > 0
+      ? (lang === "zh" ? `距离上次聊天已经${hours}小时了` : `it's been ${hours} hour${hours > 1 ? "s" : ""} since we last chatted`)
+      : "";
+
+    const greeting = lang === "zh"
+      ? `嗨，Soul刚刚醒来了，准备开始思考。${timeContext}，有什么想法随时找我聊！`
+      : `Hey, Soul just woke up and is ready to think. ${timeContext ? timeContext + "." : ""} Feel free to chat anytime!`;
+
+    try {
+      await this.sendMessage({
+        to: this.proactiveTarget,
+        content: greeting,
+        channel: this.proactiveChannel,
+      });
+      log.info(`Startup greeting sent via ${this.proactiveChannel}`);
+    } catch (err) {
+      log.warn(`Failed to send startup greeting: ${String(err)}`);
+    }
   }
 
   /**
