@@ -22,6 +22,7 @@ export type AutonomousActionOptions = {
   sendMessage?: MessageSender;
   channel?: string;
   target?: string;
+  workspaceContext?: string;
 };
 
 /**
@@ -195,7 +196,16 @@ export async function executeAnalyzeProblem(
   let analysisResult = "";
   if (options.llmGenerator && gatheredInfo.length > 0) {
     const totalContext = gatheredInfo.join("\n\n").slice(0, 12_000);
-    const lang = ego.userLanguage === "zh-CN" ? "Chinese" : "English";
+    const lang = ego.userLanguage === "zh-CN" ? "Chinese"
+      : ego.userLanguage === "ja" ? "Japanese"
+        : ego.userLanguage === "ko" ? "Korean"
+        : undefined;
+    const userSamples = ego.recentUserMessages ?? [];
+    const langInstruction = lang
+      ? `Please analyze and respond in ${lang}.`
+      : userSamples.length > 0
+        ? `The user writes in this language:\n${userSamples.slice(0, 3).join("\n")}\nRespond in the same language.`
+        : "Respond in English.";
 
     const prompt = `You are an AI assistant that has autonomously read some files to investigate a problem or question. Based on the information below, provide a concise analysis.
 
@@ -204,7 +214,7 @@ export async function executeAnalyzeProblem(
 **Gathered information**:
 ${totalContext}
 
-Please analyze and respond in ${lang}:
+${langInstruction}
 1. What is the root cause or key finding (if identifiable)?
 2. What is the recommended fix, next step, or useful insight?
 3. Any relevant code or config changes needed?
@@ -287,7 +297,7 @@ ${thought.content}
 
 Context:
 - User profile: ${userContext || "limited"}
-- Trigger: ${thought.triggerDetail}${readOnlyInstruction}${analysisContext}
+- Trigger: ${thought.triggerDetail}${readOnlyInstruction}${analysisContext}${options.workspaceContext ? `\n- Workspace rules:\n${options.workspaceContext}` : ""}
 
 Please investigate and report your findings. If a concrete fix is identified and you have write access, implement it.`;
 
@@ -393,8 +403,17 @@ export async function executeReportFindings(
     }
   }
 
-  const lang = ego.userLanguage === "zh-CN" ? "Chinese" : "English";
-  const prompt = `You are a proactive AI. You autonomously investigated something and want to share findings with the user. Write the message in ${lang}.
+  const cjkLang = ego.userLanguage === "zh-CN" ? "Chinese (中文)"
+    : ego.userLanguage === "ja" ? "Japanese"
+      : ego.userLanguage === "ko" ? "Korean"
+      : undefined;
+  const userSamples = ego.recentUserMessages ?? [];
+  const reportLangInstruction = cjkLang
+    ? `Write the message in ${cjkLang}.`
+    : userSamples.length > 0
+      ? `The user writes in this language:\n${userSamples.slice(0, 3).join("\n")}\nWrite the message in the SAME language.`
+      : "Write the message in English.";
+  const prompt = `You are a proactive AI. You autonomously investigated something and want to share findings with the user. ${reportLangInstruction}
 
 **What you investigated**:
 ${taskSummaries}

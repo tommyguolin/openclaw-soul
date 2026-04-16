@@ -163,6 +163,7 @@ export function createDefaultEgoState(): EgoState {
     behaviorLog: [],
     pendingShareMessage: null,
     userLanguage: null,
+    recentUserMessages: [],
     activeTasks: [],
   };
 }
@@ -191,6 +192,7 @@ function mergeWithDefaultsV2(loaded: Partial<EgoState>): EgoState {
     "awakeningThoughts",
     "establishedRoutines",
     "activeTasks",
+    "recentUserMessages",
   ] as (keyof EgoState)[]) {
     if (loaded[key] !== undefined) {
       (result as Record<string, unknown>)[key] = loaded[key];

@@ -17,12 +17,13 @@ export async function buildSoulSystemPrompt(
   ego: EgoState,
   context?: string,
   relevantMemories?: SoulMemory[],
+  workspaceContext?: string,
 ): Promise<string> {
   // Extract recent proactive messages (sent by soul, not in reply to user)
   const recentProactiveMessages = ego.memories
     .filter((m) => m.type === "interaction" && m.tags.includes("proactive"))
     .sort((a, b) => b.timestamp - a.timestamp)
-    .slice(0, 3);
+    .slice(0, 5);
   const proactiveMsgDesc = buildProactiveMessagesDescription(recentProactiveMessages);
   const awakeningPrompt = buildAwakeningPrompt(ego);
 
@@ -96,7 +97,8 @@ ${userPrefsDesc}
 
 ${buildMemoriesDescription(relevantMemories)}
 ${knowledgeDesc ? `\n## Learned Knowledge\n\n${knowledgeDesc}` : ""}
-${proactiveMsgDesc ? `\n## Your Recent Proactive Messages\n\n${proactiveMsgDesc}` : ""}
+${workspaceContext ? `\n## Workspace Context\n\n${workspaceContext}` : ""}
+${proactiveMsgDesc ? `\n## Your Recent Proactive Messages (you sent these — the user may reply to them)\n\n${proactiveMsgDesc}` : ""}
 
 ## State
 
@@ -393,7 +395,7 @@ function buildProactiveMessagesDescription(messages: SoulMemory[]): string {
   const lines: string[] = [];
   for (const msg of messages) {
     const timeAgo = getTimeAgo(msg.timestamp);
-    lines.push(`- (${timeAgo}) ${msg.content}`);
+    lines.push(`- (${timeAgo}) "${msg.content.slice(0, 200)}"`);
   }
 
   return lines.join("\n");

@@ -248,6 +248,8 @@ export interface ActionExecutorOptions {
   authToken?: string;
   /** Hooks token for /hooks/agent */
   hooksToken?: string;
+  /** Workspace context from SOUL.md, AGENTS.md, etc. */
+  workspaceContext?: string;
 }
 
 export async function executeThoughtAction(
@@ -347,6 +349,7 @@ export async function executeThoughtAction(
           sendMessage: options.sendMessage,
           channel: options.channel,
           target: options.target,
+          workspaceContext: options.workspaceContext,
         });
         break;
       }
@@ -527,11 +530,19 @@ async function generateValuableMessage(
           .join("\n")
         : "";
 
-      // Language instruction based on detected user language
+      // Language instruction based on detected user language or message samples
       const lang = ego.userLanguage;
-      const langInstruction = lang
-        ? `**User's language**: ${lang}\n**Rule**: You MUST write your message in ${lang === "zh-CN" ? "Chinese (中文)" : lang === "ja" ? "Japanese" : lang === "ko" ? "Korean" : "the user's language"}. Do NOT use any other language.`
-        : "Use Chinese if the user speaks Chinese, otherwise English.";
+      const userSamples = ego.recentUserMessages ?? [];
+      let langInstruction: string;
+      if (lang === "zh-CN" || lang === "ja" || lang === "ko") {
+        // CJK languages detected reliably via character ranges
+        langInstruction = `**User's language**: ${lang}\n**Rule**: You MUST write your message in ${lang === "zh-CN" ? "Chinese (中文)" : lang === "ja" ? "Japanese" : "Korean"}. Do NOT use any other language.`;
+      } else if (userSamples.length > 0) {
+        // Latin-script languages: pass samples so LLM matches the language
+        langInstruction = `**User's recent messages**:\n${userSamples.map((s, i) => `${i + 1}. ${s}`).join("\n")}\n**Rule**: You MUST write your message in the SAME language the user uses. Match their language exactly. Do NOT use any other language.`;
+      } else {
+        langInstruction = "Use Chinese if the user speaks Chinese, otherwise English.";
+      }
 
       // Time-of-day context
       const hour = new Date().getHours();
@@ -552,7 +563,7 @@ ${langInstruction}
 ${timeContext}
 
 **Context**:
-${userInfo ? `User profile:\n${userInfo}\n` : ""}${interactionContext ? `Recent conversations:\n${interactionContext}\n` : ""}${knowledgeContext ? `Knowledge I've learned:\n${knowledgeContext}\n` : ""}${thought.type !== "bond-deepen" ? `Thought: ${thought.motivation}` : ""}
+${userInfo ? `User profile:\n${userInfo}\n` : ""}${interactionContext ? `Recent conversations:\n${interactionContext}\n` : ""}${knowledgeContext ? `Knowledge I've learned:\n${knowledgeContext}\n` : ""}${options.workspaceContext ? `Workspace rules:\n${options.workspaceContext}\n` : ""}${thought.type !== "bond-deepen" ? `Thought: ${thought.motivation}` : ""}
 
 ${isUserTopicFollowUp
   ? `**IMPORTANT**: You just searched for or learned about a topic the user previously discussed. You SHOULD share your finding in 1-2 sentences. Reference the specific topic and what you found. Only say NO_MESSAGE if the knowledge is completely unrelated to what the user cares about.`

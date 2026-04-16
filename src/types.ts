@@ -273,6 +273,7 @@ export interface EgoState {
   behaviorLog: BehaviorEntry[];
   pendingShareMessage: string | null;
   userLanguage: string | null;
+  recentUserMessages: string[];
   activeTasks: AutonomousTask[];
 }
 

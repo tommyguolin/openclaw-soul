@@ -80,6 +80,10 @@ export type ThoughtServiceOptions = {
   authToken?: string;
   /** Hooks token for /hooks/agent */
   hooksToken?: string;
+  /** Workspace context loaded from files (SOUL.md, AGENTS.md, etc.) */
+  workspaceContext?: string;
+  /** File names to load from state directory */
+  workspaceFiles?: string[];
 };
 
 export class ThoughtService {
@@ -100,6 +104,9 @@ export class ThoughtService {
   private gatewayPort: number;
   private authToken?: string;
   private hooksToken?: string;
+  private workspaceContext: string;
+  private workspaceFiles: string[];
+  private lastWorkspaceRefresh = 0;
   private recentThoughtTypes: string[] = [];
   private recentThoughtTopics: string[] = [];
   private lastLLMCallTime = 0;
@@ -120,6 +127,8 @@ export class ThoughtService {
     this.gatewayPort = options.gatewayPort ?? 18789;
     this.authToken = options.authToken;
     this.hooksToken = options.hooksToken;
+    this.workspaceContext = options.workspaceContext ?? "";
+    this.workspaceFiles = options.workspaceFiles ?? ["SOUL.md", "AGENTS.md", "MEMORY.md", "USER.md"];
 
     // Initialize LLM generator from config
     if (options.llmConfig) {
@@ -240,11 +249,49 @@ export class ThoughtService {
       await this.applyDecay();
       await this.runExpiryIfDue();
       await this.resolveStalePendingEntries();
+      await this.maybeRefreshWorkspaceContext();
       await this.flushPendingMessage();
       await this.pollActiveTasks();
       await this.checkAndGenerateThought();
     } catch (err) {
       log.error("Error in thought service tick", String(err));
+    }
+  }
+
+  /**
+   * Refresh workspace context every 5 minutes.
+   */
+  private async maybeRefreshWorkspaceContext(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastWorkspaceRefresh < 5 * 60 * 1000) return;
+    this.lastWorkspaceRefresh = now;
+
+    try {
+      const { loadWorkspaceContext } = await import("./paths.js");
+      const result = await loadWorkspaceContext(this.workspaceFiles);
+      if (result.content && result.content !== this.workspaceContext) {
+        this.workspaceContext = result.content;
+        log.debug(`Workspace context refreshed: ${result.content.length} chars from ${result.fileCount} files`);
+      }
+    } catch {
+      // Non-critical — workspace context is best-effort
+    }
+  }
+
+  /**
+   * Update the workspace context from files on disk.
+   */
+  async refreshWorkspaceContext(): Promise<void> {
+    try {
+      const { loadWorkspaceContext } = await import("./paths.js");
+      const result = await loadWorkspaceContext(this.workspaceFiles);
+      this.workspaceContext = result.content;
+      this.lastWorkspaceRefresh = Date.now();
+      if (result.content) {
+        log.info(`Workspace context loaded: ${result.content.length} chars from ${result.fileCount} files`);
+      }
+    } catch {
+      // Non-critical
     }
   }
 
@@ -590,6 +637,7 @@ export class ThoughtService {
       gatewayPort: this.gatewayPort,
       authToken: this.authToken,
       hooksToken: this.hooksToken,
+      workspaceContext: this.workspaceContext || undefined,
     });
 
     if (actionResult.result.success) {
@@ -833,6 +881,10 @@ export class ThoughtService {
           if (detected) {
             ego.userLanguage = detected;
           }
+
+          // Store message sample for language matching (non-CJK languages)
+          const sample = text.slice(0, 100);
+          ego.recentUserMessages = [...(ego.recentUserMessages || []), sample].slice(-5);
         }
 
         // Keep only the most recent 50 interaction memories
@@ -907,7 +959,7 @@ export class ThoughtService {
     const { buildSoulSystemPrompt } = await import("./prompts.js");
     const store = await loadEgoStore(this.storePath);
     const relevantMemories = context ? await this.recallRelevantMemories(context) : undefined;
-    return buildSoulSystemPrompt(store.ego, context, relevantMemories);
+    return buildSoulSystemPrompt(store.ego, context, relevantMemories, this.workspaceContext || undefined);
   }
 
   async forceThought(): Promise<Thought | null> {
@@ -1391,9 +1443,11 @@ If there are no new preferences, return an empty array: []`;
   }
 
   /**
-   * Detect the user's language from message text using CJK character ratio.
-   * Returns a language code ("zh-CN", "en", "ja", "ko") or null if unclear.
-   * Lightweight heuristic — no LLM call needed.
+   * Detect the user's language from message text using character ratio.
+   * Returns a language code ("zh-CN", "ja", "ko") or null.
+   * CJK/Japanese/Korean are detected reliably via character ranges.
+   * Latin-script languages (Danish, German, French, etc.) return null —
+   * the caller uses stored message samples for LLM-based language matching.
    */
   private detectLanguage(text: string): string | null {
     let cjk = 0;
@@ -1431,8 +1485,8 @@ If there are no new preferences, return an empty array: []`;
     if (hangul / total > 0.3) return "ko";
     if (hiragana / total > 0.15) return "ja";
     if (cjk / total > 0.2) return "zh-CN";
-    if (latin / total > 0.5) return "en";
-
+    // Latin-script languages can't be reliably distinguished by character ranges.
+    // Return null — the caller will use recentUserMessages for language matching.
     return null;
   }
 }

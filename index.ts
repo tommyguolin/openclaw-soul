@@ -13,6 +13,7 @@ import { createSoulActionHandler, type MessageSender } from "./src/soul-actions.
 import { createSoulLogger } from "./src/logger.js";
 import { resolveLLMConfigFromOpenClaw, type SoulLLMConfig } from "./src/soul-llm.js";
 import { getGatewayPort } from "./src/env.js";
+import { loadWorkspaceContext } from "./src/paths.js";
 
 const log = createSoulLogger("plugin");
 
@@ -74,6 +75,8 @@ function buildSendMessage(opts: {
     // Normalize target format per channel:
     // Discord requires "user:<id>" for DMs — auto-prefix bare numeric IDs
     const target = normalizeTarget(channel, rawTarget);
+
+    log.debug(`Sending proactive message to ${channel}/${target}: ${params.content.slice(0, 300)}`);
 
     // Primary: use /tools/invoke with message tool for direct delivery
     try {
@@ -185,6 +188,7 @@ type PluginConfig = {
   proactiveTarget?: string;
   llm?: SoulLLMConfig;
   autonomousActions?: boolean;
+  workspaceFiles?: string[];
 };
 // Note: `enabled` in PluginConfig is the inner service toggle (default: true).
 // The outer `plugins.entries.soul.enabled` (in openclaw.json) controls plugin loading.
@@ -263,6 +267,7 @@ const plugin = {
       proactiveChannel: { type: "string", description: "Override: channel for proactive messages (auto-detected if omitted)" },
       proactiveTarget: { type: "string", description: "Override: target for proactive messages (auto-detected if omitted)" },
       autonomousActions: { type: "boolean", description: "Enable autonomous write operations (editing files, running commands). Read operations always allowed. Default: false" },
+      workspaceFiles: { type: "array", description: "File names to load from state dir as workspace context. Default: [\"SOUL.md\",\"AGENTS.md\",\"MEMORY.md\",\"USER.md\"]" },
       llm: {
         type: "object",
         description: "Override: LLM config (auto-detected from OpenClaw if omitted)",
@@ -342,6 +347,7 @@ const plugin = {
           : undefined;
 
       // --- 4. Create and register the thought service ---
+      const workspaceFiles = config.workspaceFiles ?? ["SOUL.md", "AGENTS.md", "MEMORY.md", "USER.md"];
       serviceCreated = true;
       thoughtService = new ThoughtService({
         checkIntervalMs: config.checkIntervalMs ?? 60_000,
@@ -355,11 +361,13 @@ const plugin = {
         authToken: resolveGatewayAuthToken(openclawConfig),
         hooksToken: resolveHooksToken(openclawConfig),
         onThought: createSoulActionHandler(),
+        workspaceFiles,
       });
 
       api.registerService({
         id: "soul-thought-service",
         start: async () => {
+          await thoughtService!.refreshWorkspaceContext();
           await thoughtService!.start();
           log.info("Soul thought service started");
         },
