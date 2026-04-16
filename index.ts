@@ -17,6 +17,17 @@ import { getGatewayPort } from "./src/env.js";
 const log = createSoulLogger("plugin");
 
 /**
+ * Normalize the target format for a given channel.
+ * Discord requires "user:<id>" for DMs — auto-prefix bare numeric IDs.
+ */
+function normalizeTarget(channel: string, target: string): string {
+  if (channel === "discord" && /^\d{10,}$/.test(target)) {
+    return `user:${target}`;
+  }
+  return target;
+}
+
+/**
  * Build a sendMessage function that delivers a proactive message directly
  * to a channel via the gateway's /tools/invoke HTTP endpoint.
  *
@@ -55,10 +66,14 @@ function buildSendMessage(opts: {
     }
 
     const channel = params.channel || opts.getChannel();
-    const target = params.to || opts.getTarget();
-    if (!channel || !target) {
+    const rawTarget = params.to || opts.getTarget();
+    if (!channel || !rawTarget) {
       throw new Error("sendMessage: no channel/target resolved yet");
     }
+
+    // Normalize target format per channel:
+    // Discord requires "user:<id>" for DMs — auto-prefix bare numeric IDs
+    const target = normalizeTarget(channel, rawTarget);
 
     // Primary: use /tools/invoke with message tool for direct delivery
     try {

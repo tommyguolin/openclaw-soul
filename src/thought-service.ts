@@ -207,7 +207,7 @@ export class ThoughtService {
       : "";
 
     const greeting = lang === "zh"
-      ? `嗨，Soul刚刚醒来了，准备开始思考。${timeContext}，有什么想法随时找我聊！`
+      ? `嗨，Soul刚刚醒来了，准备开始思考。${timeContext ? timeContext + "，" : ""}有什么想法随时找我聊！`
       : `Hey, Soul just woke up and is ready to think. ${timeContext ? timeContext + "." : ""} Feel free to chat anytime!`;
 
     try {

@@ -399,25 +399,26 @@ export async function executeReportFindings(
 **What you investigated**:
 ${taskSummaries}
 
-Write 2-3 sentences: start with a brief natural opening, then share your findings. Rules:
-- Start with a short natural opening that gives context (e.g. "我后来查了一下...", "我研究了一下那个问题——", "Just looked into that issue...")
-- Then deliver the specific finding — mention actual error messages, file paths, or root causes
+Write 2-3 sentences in flowing prose (NOT a numbered list). Rules:
+- Start by mentioning WHAT you investigated and WHY (e.g. "我后来查了一下飞书消息发送超时的问题——", "我研究了一下那个 413 错误——", "I looked into the Discord delivery issue —")
+- Then share the CONCRETE finding: actual error messages, root causes, or actionable insights
+- If you investigated multiple things, pick the ONE most interesting finding — do NOT list them all
 - Sound natural, like a knowledgeable friend sharing something useful they discovered
 - Do NOT describe your own behavior (e.g. "Soul is producing proactive behavior", "I analyzed the logs")
+- Do NOT use numbered lists or bullet points — they get truncated and look bad in chat
 - Only report if you found a CONCRETE root cause or actionable insight
 
 **BAD examples** (NEVER do this):
-收到，问题已定位：...
-好的，根据日志分析...
-Soul 插件正在产生主动行为了！
-根据日志分析，建议搜索更早的日志：\`\`\`bash grep...
-Got it. I found that...
-你之前问的超时问题我查到了——根因是... ← no opening, feels abrupt
+收到，问题已定位：...                          ← assistant-like prefix
+我查了日志，发现两个问题：1.xxx 2.xxx       ← numbered list, gets truncated
+我研究了一下那个问题——根因是...             ← WHAT problem? Too vague
+Soul 插件正在产生主动行为了！                ← describing Soul's own behavior
+好的，根据日志分析...                        ← assistant-like prefix
 
 **GOOD examples**:
-我后来查了一下你之前问的超时问题——根因是 OpenViking 的 embedding API 有 512 token 限制，不是 Soul 本身的问题。
-我研究了一下日志里那个 413 错误，是 OpenViking memory search 输入超长导致的，跟 Soul 插件没关系。
-Just looked into that 413 error — it's caused by oversized memory search input, not the plugin itself.
+我后来查了一下飞书消息发送超时的问题——根因是 OpenViking 的 embedding API 有 512 token 限制，不是 Soul 本身的问题。
+我研究了一下日志里那个 413 错误，是 memory search 输入超长导致的，跟 Soul 插件没关系。
+I looked into the Discord message delivery failure — it turns out Discord requires the "user:" prefix before user IDs in the target field.
 
 If the investigation didn't find a concrete root cause, output exactly: NO_MESSAGE
 Output ONLY the message, nothing else.`;

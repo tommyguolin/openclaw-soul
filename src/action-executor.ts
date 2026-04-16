@@ -577,6 +577,7 @@ ${isUserTopicFollowUp
 - Start with a brief natural opening (half sentence) that gives context for why you're reaching out
 - Then deliver the specific finding/insight in 1-2 more sentences
 - NO analysis, NO numbering, NO "Let me analyze", NO meta-commentary
+- Do NOT use numbered lists (1. 2. 3.) or bullet points — write flowing prose only
 - If you have something genuinely valuable to share, write it directly
 - If not, output exactly: NO_MESSAGE
 
