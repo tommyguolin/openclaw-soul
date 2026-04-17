@@ -1,5 +1,10 @@
 # Soul — Give Your AI Assistant Its Own Inner Life
 
+[![ClawHub](https://img.shields.io/badge/ClawHub-soul-blue?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiI+PHJlY3Qgd2lkdGg9IjE2IiBoZWlnaHQ9IjE2IiByeD0iMyIgZmlsbD0iIzQwOWNmZiIvPjwvc3ZnPg==)](https://clawhub.ai/plugins/openclaw-soul-plugin)
+[![Version](https://img.shields.io/github/v/tag/tommyguolin/openclaw-soul?label=version)](https://github.com/tommyguolin/openclaw-soul/tags)
+[![License](https://img.shields.io/github/license/tommyguolin/openclaw-soul)](https://github.com/tommyguolin/openclaw-soul/blob/main/LICENSE)
+[![Stars](https://img.shields.io/github/stars/tommyguolin/openclaw-soul?style=social)](https://github.com/tommyguolin/openclaw-soul/stargazers)
+
 > An autonomous thinking, memory, and self-improvement plugin for [OpenClaw](https://github.com/openclaw/openclaw)
 
 **Soul doesn't just respond to you — it thinks on its own, remembers your conversations, learns from the web, and proactively shares useful insights.**
@@ -188,7 +193,13 @@ Three settings: enable plugin, enable chat completions, enable hooks.
         "config": {
           "checkIntervalMs": 60000,         // Thought check interval (default: 60000)
           "proactiveMessaging": true,        // Allow proactive messages (default: true)
-          "autonomousActions": false         // Allow editing files and running commands (default: false)
+          "autonomousActions": false,        // Allow editing files and running commands (default: false)
+          "thoughtFrequency": 1.0            // Thought frequency multiplier (default: 1.0)
+          // Lower = more frequent thinking & messaging. Examples:
+          //   0.2 — testing: thoughts every ~1 min, messages every ~1 min
+          //   0.5 — chatty: 2x more frequent than default
+          //   1.0 — default: balanced (8-12 min active, 20-45 min away)
+          //   2.0 — quiet: 2x less frequent
           // "proactiveChannel": "telegram",  // Override: channel for proactive messages
           // "proactiveTarget": "123456",     // Override: target for proactive messages
           // "llm": {                         // Override LLM config (auto-detected if omitted)
