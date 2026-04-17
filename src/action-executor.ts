@@ -1102,8 +1102,8 @@ Rules:
       usedWebSearch = true;
       const topResults = searchResult.results.slice(0, 5);
       const resultText = topResults
-        .map((r: { title?: string; content?: string; url?: string }) =>
-          `- ${r.title || ""}: ${(r.content || "").slice(0, 150)}`)
+        .map((r: { title?: string; snippet?: string; content?: string; url?: string }) =>
+          `- ${r.title || ""}: ${((r.snippet || r.content) || "").slice(0, 150)}`)
         .join("\n");
 
       // Dedup check
@@ -1301,8 +1301,8 @@ Rules:
       const topResults = searchResult.results.slice(0, 5);
       articleUrl = topResults[0]?.url;
       const resultText = topResults
-        .map((r: { title?: string; content?: string }) =>
-          `- ${r.title || ""}: ${(r.content || "").slice(0, 150)}`)
+        .map((r: { title?: string; snippet?: string; content?: string }) =>
+          `- ${r.title || ""}: ${((r.snippet || r.content) || "").slice(0, 150)}`)
         .join("\n");
 
       const extractPrompt = `From these search results about "${topic}", extract the most interesting finding for the user.
