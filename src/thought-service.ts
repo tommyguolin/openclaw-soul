@@ -114,6 +114,7 @@ export class ThoughtService {
   private recentThoughtTopics: string[] = [];
   private recentActionHistory: string[] = [];
   private consecutiveSkipCount = 0;
+  private backoffTimeoutId: ReturnType<typeof setTimeout> | null = null;
   private lastLLMCallTime = 0;
   private static readonly MIN_LLM_INTERVAL_MS = 10_000; // 10s between Soul LLM calls
   private thoughtAbortController: AbortController | null = null;
@@ -200,6 +201,10 @@ export class ThoughtService {
     if (this.intervalId) {
       clearInterval(this.intervalId);
       this.intervalId = null;
+    }
+    if (this.backoffTimeoutId) {
+      clearTimeout(this.backoffTimeoutId);
+      this.backoffTimeoutId = null;
     }
     this.running = false;
     log.info("Soul service stopped");
@@ -555,21 +560,8 @@ export class ThoughtService {
 
           // Skip if this thought overlaps significantly with a recent one
           if (this.isRepeatTopic(thought.content)) {
-            this.consecutiveSkipCount++;
-            const backoffMinutes = Math.min(this.consecutiveSkipCount * 2, 30);
-            log.info(`Skipping thought — topic too similar (skip #${this.consecutiveSkipCount}, backing off ${backoffMinutes}m)`);
             thought = null;
-            // Reschedule next tick with backoff
-            if (this.intervalId) {
-              clearInterval(this.intervalId);
-              const backoffMs = backoffMinutes * 60 * 1000;
-              setTimeout(() => {
-                this.intervalId = setInterval(() => {
-                  void this.tick();
-                }, this.checkIntervalMs);
-                void this.tick();
-              }, backoffMs);
-            }
+            this.applySkipBackoff("topic too similar");
             return;
           }
 
@@ -581,7 +573,9 @@ export class ThoughtService {
             return;
           }
           log.warn(`LLM thought generation failed, using fallback: ${String(err)}`);
-          thought = generateThought(ctx) as Thought | null;
+          this.consecutiveSkipCount++;
+          this.applySkipBackoff(`LLM failure: ${String(err).slice(0, 60)}`);
+          return;
         }
       } else {
         if (signal.aborted) { return; }
@@ -600,7 +594,10 @@ export class ThoughtService {
           const { buildThoughtFromOpportunity } = await import("./intelligent-thought.js");
           thought = buildThoughtFromOpportunity(nonRepeatingOpportunities[0], ego);
         } else {
-          thought = generateThought(ctx) as Thought | null;
+          // All opportunities exhausted — back off instead of generating random thoughts
+          this.consecutiveSkipCount++;
+          this.applySkipBackoff("no novel opportunities");
+          return;
         }
       }
     } finally {
@@ -615,6 +612,8 @@ export class ThoughtService {
     // Reject thought content that is actually an LLM error message
     if (isLLMErrorContent(thought.content)) {
       log.warn(`Rejecting thought — content is LLM error message: ${thought.content.slice(0, 80)}`);
+      this.consecutiveSkipCount++;
+      this.applySkipBackoff("LLM error content");
       return;
     }
 
@@ -713,6 +712,40 @@ export class ThoughtService {
     } else if (actionResult.result.error) {
       log.warn(`Thought action failed: ${thought.actionType}`, actionResult.result.error);
     }
+  }
+
+  /**
+   * Apply exponential backoff when thoughts are repeatedly skipped or fail.
+   * Clears the current interval, waits with backoff, then resumes.
+   * Safe against concurrent calls — cancels any pending backoff first.
+   */
+  private applySkipBackoff(reason: string): void {
+    const backoffMinutes = Math.min(this.consecutiveSkipCount * 2, 30);
+    log.info(`Skipping thought — ${reason} (skip #${this.consecutiveSkipCount}, backing off ${backoffMinutes}m)`);
+
+    // Cancel any pending backoff to prevent parallel intervals
+    if (this.backoffTimeoutId) {
+      clearTimeout(this.backoffTimeoutId);
+      this.backoffTimeoutId = null;
+    }
+
+    // Pause the regular interval
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+    }
+
+    if (!this.running) return;
+
+    const backoffMs = backoffMinutes * 60 * 1000;
+    this.backoffTimeoutId = setTimeout(() => {
+      this.backoffTimeoutId = null;
+      if (!this.running) return;
+      this.intervalId = setInterval(() => {
+        void this.tick();
+      }, this.checkIntervalMs);
+      void this.tick();
+    }, backoffMs);
   }
 
   /**
