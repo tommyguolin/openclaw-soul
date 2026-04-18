@@ -2,60 +2,19 @@
   "id": "soul",
   "name": "Soul",
   "description": "Autonomous thinking, emotional awareness, and memory system for OpenClaw",
-  "version": "2.1.0",
+  "version": "2.2.0",
+  "enabledByDefault": true,
   "configSchema": {
     "type": "object",
-    "additionalProperties": false,
+    "additionalProperties": true,
     "properties": {
       "enabled": {
         "type": "boolean",
         "description": "Enable soul service (background thoughts, ego state). Default: true"
       },
-      "checkIntervalMs": {
-        "type": "number",
-        "description": "Interval for thought generation checks (ms). Default: 60000"
-      },
-      "proactiveMessaging": {
-        "type": "boolean",
-        "description": "Enable proactive messaging when soul has thoughts. Default: true"
-      },
-      "proactiveChannel": {
-        "type": "string",
-        "description": "Channel for proactive messages (auto-detected if omitted)"
-      },
-      "proactiveTarget": {
-        "type": "string",
-        "description": "Target for proactive messages (auto-learned from first inbound message if omitted)"
-      },
       "autonomousActions": {
         "type": "boolean",
         "description": "Enable autonomous write operations (editing files, running shell commands). Read operations (reading logs, analyzing code) are always allowed. Default: false"
-      },
-      "llm": {
-        "type": "object",
-        "description": "LLM configuration for soul thought generation",
-        "properties": {
-          "provider": {
-            "type": "string",
-            "description": "LLM provider (anthropic, openai, deepseek, etc.)"
-          },
-          "model": {
-            "type": "string",
-            "description": "Model ID"
-          },
-          "apiKeyEnv": {
-            "type": "string",
-            "description": "Environment variable name for API key (e.g. OPENAI_API_KEY)"
-          },
-          "baseUrl": {
-            "type": "string",
-            "description": "Custom API base URL (optional)"
-          }
-        }
-      },
-      "workspaceFiles": {
-        "type": "array",
-        "description": "File names to load from workspace dir as context. Default: [\"SOUL.md\",\"AGENTS.md\",\"MEMORY.md\",\"USER.md\"]"
       },
       "thoughtFrequency": {
         "type": "number",

@@ -259,29 +259,15 @@ const plugin = {
   id: "soul",
   name: "Soul",
   description: "Autonomous thinking, emotional awareness, and memory system",
-  version: "1.0.0",
+  version: "2.2.0",
+  enabledByDefault: true,
   configSchema: {
     type: "object",
-    additionalProperties: false,
+    additionalProperties: true,
     properties: {
       enabled: { type: "boolean", description: "Enable/disable soul service. Default: true" },
-      checkIntervalMs: { type: "number", description: "Thought check interval in ms. Default: 60000" },
-      proactiveMessaging: { type: "boolean", description: "Allow soul to send proactive messages. Default: true" },
-      proactiveChannel: { type: "string", description: "Override: channel for proactive messages (auto-detected if omitted)" },
-      proactiveTarget: { type: "string", description: "Override: target for proactive messages (auto-detected if omitted)" },
       autonomousActions: { type: "boolean", description: "Enable autonomous write operations (editing files, running commands). Read operations always allowed. Default: false" },
-      workspaceFiles: { type: "array", description: "File names to load from state dir as workspace context. Default: [\"SOUL.md\",\"AGENTS.md\",\"MEMORY.md\",\"USER.md\"]" },
       thoughtFrequency: { type: "number", description: "Thought frequency multiplier. Default: 1.0. Lower = more frequent (e.g. 0.2 for testing), higher = less frequent" },
-      llm: {
-        type: "object",
-        description: "Override: LLM config (auto-detected from OpenClaw if omitted)",
-        properties: {
-          provider: { type: "string" },
-          model: { type: "string" },
-          apiKeyEnv: { type: "string" },
-          baseUrl: { type: "string" },
-        },
-      },
     },
   },
 
