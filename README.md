@@ -100,22 +100,25 @@ git clone https://github.com/tommyguolin/openclaw-soul.git
 openclaw plugins install ./openclaw-soul
 ```
 
-### 2. That's it
+### 2. Enable proactive messaging
 
-Soul activates automatically after install — no configuration needed. It auto-detects:
+Soul needs permission to send you messages. Run these commands:
+
+```bash
+openclaw config set hooks.enabled true
+openclaw config set hooks.token "$(openssl rand -hex 32)"
+openclaw config set tools.alsoAllow message
+```
+
+### 3. That's it
+
+Restart your gateway. Soul auto-detects:
 - **LLM** — Uses your `agents.defaults.model` config
 - **Search** — Uses your `tools.web.search` provider
 - **Channel** — Auto-detects your first messaging channel
 - **Target** — Auto-learns from your first incoming message
 
 Just start chatting. Soul begins thinking and building a profile immediately.
-
-> **Note**: For proactive messaging (Soul sending you messages first), you need hooks enabled:
-> ```bash
-> openclaw config set hooks.enabled true
-> openclaw config set hooks.token "$(openssl rand -hex 32)"
-> openclaw config set tools.alsoAllow message
-> ```
 
 ## How It Works
 
