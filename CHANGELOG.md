@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.2.1 (2026-04-19)
+
+### Changes
+
+- **Simplified install config**: Reduced configSchema from 9 fields to 3 user-facing options (`enabled`, `autonomousActions`, `thoughtFrequency`). Advanced options (checkIntervalMs, proactiveChannel, proactiveTarget, workspaceFiles, llm) still work via raw config but are hidden from the install UI
+- **enabledByDefault**: Soul activates immediately after install with zero configuration. LLM, messaging channel, and target are all auto-detected from OpenClaw config
+- **Deduplicate pluginConfig log**: Gateway may call register() multiple times for different agent registries — now only logs when config actually changes
+
 ## 2.2.0 (2026-04-18)
 
 ### Changes
