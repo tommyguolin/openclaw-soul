@@ -302,23 +302,26 @@ export async function executeThoughtAction(
   }
 
   // Anti-spam: check if the last send-message is still pending (user hasn't
-  // responded). MUST run BEFORE creating the behavior entry, otherwise the
-  // new entry itself triggers the "pending" guard and deadlocks all sends.
-  // Stale pending entries (>10 min old) are auto-resolved to prevent deadlock
-  // if the message_received hook doesn't fire (e.g. gateway restart, missing hook).
+  // responded). Only block if the new message would be a duplicate of the
+  // pending one. Stale pending entries are auto-resolved to prevent deadlock.
   if (actionType === "send-message") {
     const behaviorLog = ego.behaviorLog ?? [];
     const lastSend = [...behaviorLog]
       .reverse()
       .find((e) => e.actionType === "send-message");
-    const STALE_PENDING_MS = 10 * 60 * 1000; // 10 minutes
+    const freq = options.thoughtFrequency ?? 1.0;
+    const STALE_PENDING_MS = 10 * 60 * 1000 * freq;
     if (lastSend && lastSend.outcome === "pending" && Date.now() - lastSend.timestamp < STALE_PENDING_MS) {
-      const minutesSince = Math.round((Date.now() - lastSend.timestamp) / (1000 * 60));
-      log.info(`Skipping send-message: last proactive message (${minutesSince}m ago) still pending (user hasn't responded)`);
-      return {
-        result: { type: "send-message", success: true, result: "skipped-pending-previous" },
-        metricsChanged: [],
-      };
+      // Only skip if the new thought overlaps with the pending one (duplicate)
+      if (isDuplicateMessage(thought.content || thought.motivation || "")) {
+        const minutesSince = Math.round((Date.now() - lastSend.timestamp) / (1000 * 60));
+        log.info(`Skipping send-message: duplicate of pending message (${minutesSince}m ago)`);
+        return {
+          result: { type: "send-message", success: true, result: "skipped-duplicate-pending" },
+          metricsChanged: [],
+        };
+      }
+      // Different content — allow sending even if previous is still pending
     }
   }
 
