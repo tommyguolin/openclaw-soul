@@ -1375,17 +1375,17 @@ export async function generateIntelligentThought(
       const thought = buildThoughtFromOpportunity(selectedOpportunity, ctx.ego);
       thought.content = refinedContent;
 
-      // LLM content often contains more specific intent than the opportunity's
-      // triggerDetail/motivation. Check if the LLM wants to investigate,
-      // read files/logs, or analyze something — these should route to
-      // analyze-problem, not learn-topic.
+      // LLM content may indicate a specific intent to investigate or fix a problem.
+      // Only override to analyze-problem when the LLM explicitly describes a concrete
+      // problem to investigate — not just because common words like "观察" or "检查"
+      // appear in the text.
       // EXCEPTION: don't override explicit suggestedActions that are deliberate
       // proactive actions (observe-and-improve, proactive-research, proactive-content-push).
-      const diagnosticKeywords = /读取|读一下|查看|检查|观察|排查|分析|分析一下|日志|log|investigate|inspect|check|analyze|read.*(file|log)|diagnos/i;
+      const strongProblemIndicators = /排查.*问题|分析.*错误|修复.*bug|debug|fix.*issue|diagnos|investigate.*error|read.*log.*file|检查.*日志|读取.*文件.*错误/i;
       const protectedActions = new Set(["observe-and-improve", "proactive-research", "proactive-content-push"]);
       const isProtectedAction = protectedActions.has(selectedOpportunity.suggestedAction ?? "");
       if (!isProtectedAction &&
-          diagnosticKeywords.test(refinedContent) &&
+          strongProblemIndicators.test(refinedContent) &&
           (selectedOpportunity.type === "opportunity-detected" ||
            selectedOpportunity.type === "conversation-replay" ||
            selectedOpportunity.type === "skill-gap")) {
@@ -1395,7 +1395,7 @@ export async function generateIntelligentThought(
           logPaths: extractFilePaths(refinedContent + " " + selectedOpportunity.triggerDetail),
           sourcePaths: [],
         };
-      } else if (!isSelfImprovementAction && (
+      } else if (!isProtectedAction && (
         selectedOpportunity.type === "skill-gap" ||
         selectedOpportunity.type === "opportunity-detected"
       )) {
@@ -1410,7 +1410,7 @@ export async function generateIntelligentThought(
 
       return thought;
     } catch (err) {
-      log.warn("LLM thought refinement failed, using structured thought", { error: String(err) });
+      log.warn(`LLM thought refinement failed, using structured thought: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
