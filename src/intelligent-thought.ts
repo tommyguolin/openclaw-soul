@@ -652,7 +652,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
       (m) =>
         m.type === "learning" &&
         m.tags.includes("proactive-research") &&
-        m.timestamp > now - 24 * 60 * 60 * 1000,
+        m.timestamp > now - 6 * 60 * 60 * 1000,  // 6 hours (scaled by thoughtFrequency below)
     );
 
     if (!hasRecentResearch) {
@@ -696,7 +696,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
       (m) =>
         m.type === "learning" &&
         m.tags.includes("proactive-content-push") &&
-        m.timestamp > now - 12 * 60 * 60 * 1000,
+        m.timestamp > now - 4 * 60 * 60 * 1000,  // 4 hours
     );
 
     if (!hasRecentPush) {
