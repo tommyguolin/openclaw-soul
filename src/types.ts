@@ -242,6 +242,7 @@ export interface AutonomousTask {
   sourceThoughtId?: string;
   steps: TaskStep[];
   result?: string;
+  resultFilePath?: string;
   requiresWritePermission: boolean;
   resultDelivered: boolean;
 }

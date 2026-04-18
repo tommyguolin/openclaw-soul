@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { readFileSync, unlinkSync, mkdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createSoulLogger } from "./logger.js";
 import { invokeGatewayTool, fireAgentTask, isWriteTool } from "./gateway-client.js";
@@ -295,6 +296,11 @@ export async function executeRunAgentTask(
     ? `\n\n**Previous analysis result** (use this to implement the fix):\n${latestAnalysis.result?.slice(0, 1000)}`
     : "";
 
+  // Create task first to get ID for result file path
+  const taskId = randomBytes(4).toString("hex");
+  mkdirSync("/tmp/soul-results", { recursive: true });
+  const resultFilePath = `/tmp/soul-results/${taskId}.md`;
+
   const agentMessage = `[Soul Autonomous Task]
 ${thought.content}
 
@@ -304,7 +310,11 @@ Context:
 - User profile: ${userContext || "limited"}
 - Trigger: ${thought.triggerDetail}${readOnlyInstruction}${analysisContext}${options.workspaceContext ? `\n- Workspace rules:\n${options.workspaceContext}` : ""}
 
-Please investigate and report your findings. If a concrete fix is identified and you have write access, implement it.`;
+Please investigate and report your findings. If a concrete fix is identified and you have write access, implement it.
+
+**CRITICAL**: After completing your work, write a summary to:
+${resultFilePath}
+Keep it to 1-2 sentences: what you found and what you did (if anything).`;
 
   const fireResult = await fireAgentTask({
     message: agentMessage,
@@ -322,7 +332,7 @@ Please investigate and report your findings. If a concrete fix is identified and
 
   // Create task record
   const task: AutonomousTask = {
-    id: randomBytes(4).toString("hex"),
+    id: taskId,
     title: thought.motivation.slice(0, 100),
     description: thought.content.slice(0, 200),
     status: "in-progress",
@@ -330,6 +340,7 @@ Please investigate and report your findings. If a concrete fix is identified and
     updatedAt: Date.now(),
     sourceThoughtId: thought.id,
     steps: [{ id: randomBytes(4).toString("hex"), timestamp: Date.now(), action: "fire-agent", input: agentMessage.slice(0, 200), success: true }],
+    resultFilePath,
     requiresWritePermission: options.autonomousActions,
     resultDelivered: false,
   };
@@ -565,6 +576,23 @@ export async function executeObserveAndImprove(
   const soulDir = "/root/.openclaw/extensions/soul";
   const userContext = ego.userFacts.slice(0, 5).map((f) => `[${f.category}] ${f.content}`).join("\n");
 
+  // Create task first to get ID for result file path
+  const task: AutonomousTask = {
+    id: randomBytes(4).toString("hex"),
+    title: "Self-improvement: observe and fix",
+    description: "Autonomous code improvement task",
+    status: "in-progress",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    sourceThoughtId: thought.id,
+    steps: [],
+    requiresWritePermission: true,
+    resultDelivered: false,
+  };
+
+  mkdirSync("/tmp/soul-results", { recursive: true });
+  const resultFilePath = `/tmp/soul-results/${task.id}.md`;
+
   const prompt = `[Soul Self-Improvement Task]
 
 You are a TypeScript developer tasked with improving the Soul plugin at ${soulDir}.
@@ -594,7 +622,9 @@ ${userContext || "Limited user info."}
 - Do NOT modify package.json, openclaw.plugin.json, or index.ts entry point
 - After changes, verify TypeScript compiles: run \`npx tsc --noEmit\` in ${soulDir}/
 
-Report what you changed and why.`;
+**CRITICAL**: After completing your work, write a summary of your findings and changes to:
+${resultFilePath}
+Format: 1-2 sentences describing what you found/changed and why.`;
 
   const fireResult = await fireAgentTask({
     message: prompt,
@@ -607,18 +637,7 @@ Report what you changed and why.`;
     return { result: { type: "observe-and-improve", success: false, error: fireResult.error }, metricsChanged: [] };
   }
 
-  const task: AutonomousTask = {
-    id: randomBytes(4).toString("hex"),
-    title: "Self-improvement: observe and fix",
-    description: "Autonomous code improvement task",
-    status: "in-progress",
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    sourceThoughtId: thought.id,
-    steps: [],
-    requiresWritePermission: true,
-    resultDelivered: false,
-  };
+  task.resultFilePath = resultFilePath;
   await persistTask(task);
 
   log.info(`Fired self-improvement agent task ${task.id}, runId=${fireResult.runId}`);
@@ -750,25 +769,43 @@ async function persistTask(task: AutonomousTask): Promise<void> {
 }
 
 /**
- * Poll active tasks and mark stale ones as completed.
- * Called from the tick cycle to clean up tasks that may have been
- * abandoned (e.g. gateway restart while task was running).
+ * Poll active tasks: check result files, mark stale ones as completed.
+ * Returns list of newly completed tasks (with results from file capture).
  */
-export async function pollActiveTasks(storePath: string): Promise<void> {
+export async function pollActiveTasks(storePath: string): Promise<AutonomousTask[]> {
   const STALE_MS = 10 * 60 * 1000; // 10 minutes
   const MAX_TASKS = 20;
+  const newlyCompleted: AutonomousTask[] = [];
 
   await updateEgoStore(storePath, (e) => {
     if (!e.activeTasks) { e.activeTasks = []; return e; }
 
-    let changed = false;
     for (const task of e.activeTasks) {
-      if (task.status === "in-progress" && Date.now() - task.updatedAt > STALE_MS) {
+      if (task.status !== "in-progress") continue;
+
+      // Check result file first
+      if (task.resultFilePath && !task.result) {
+        try {
+          const content = readFileSync(task.resultFilePath, "utf-8").trim();
+          if (content) {
+            task.result = content;
+            task.status = "completed";
+            task.completedAt = Date.now();
+            task.updatedAt = Date.now();
+            newlyCompleted.push({ ...task });
+            try { unlinkSync(task.resultFilePath); } catch { /* ignore cleanup failure */ }
+            continue;
+          }
+        } catch { /* file not ready yet */ }
+      }
+
+      // Fallback: stale timeout
+      if (Date.now() - task.updatedAt > STALE_MS) {
         task.status = "completed";
         task.result = task.result ?? "Task timed out (stale >10 min)";
         task.completedAt = Date.now();
         task.updatedAt = Date.now();
-        changed = true;
+        newlyCompleted.push({ ...task });
       }
     }
 
@@ -777,10 +814,13 @@ export async function pollActiveTasks(storePath: string): Promise<void> {
       e.activeTasks = e.activeTasks
         .sort((a, b) => b.updatedAt - a.updatedAt)
         .slice(0, MAX_TASKS);
-      changed = true;
     }
 
-    if (changed) log.info("Polled active tasks: marked stale/trimmed");
     return e;
   });
+
+  if (newlyCompleted.length > 0) {
+    log.info(`Tasks completed: ${newlyCompleted.map((t) => `${t.id}(${t.result ? "has-result" : "timeout"})`).join(", ")}`);
+  }
+  return newlyCompleted;
 }

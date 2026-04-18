@@ -771,11 +771,14 @@ export class ThoughtService {
   }
 
   /**
-   * Poll active tasks — mark stale ones as completed, prune old ones.
+   * Poll active tasks — check result files, mark stale ones as completed, prune old ones.
    */
   private async pollActiveTasks(): Promise<void> {
     const { pollActiveTasks: pollTasks } = await import("./autonomous-actions.js");
-    await pollTasks(this.storePath);
+    const completed = await pollTasks(this.storePath);
+    if (completed.length > 0) {
+      log.info(`pollActiveTasks: ${completed.length} task(s) newly completed`);
+    }
   }
 
   /**
