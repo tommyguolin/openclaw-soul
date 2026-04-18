@@ -1097,10 +1097,10 @@ Rules:
 
   try {
     const { soulWebSearch } = await import("./soul-search.js");
-    const searchResult = await soulWebSearch(searchQuery, options.openclawConfig);
-    if (searchResult?.results?.length) {
+    const searchResults = await soulWebSearch(searchQuery, options.openclawConfig);
+    if (searchResults?.length) {
       usedWebSearch = true;
-      const topResults = searchResult.results.slice(0, 5);
+      const topResults = searchResults.slice(0, 5);
       const resultText = topResults
         .map((r: { title?: string; snippet?: string; content?: string; url?: string }) =>
           `- ${r.title || ""}: ${((r.snippet || r.content) || "").slice(0, 150)}`)
@@ -1122,13 +1122,14 @@ ${resultText}
 
 Write 2-3 concise insights in flowing prose (NOT a numbered list). Each insight should be 1-2 sentences. Focus on practical, actionable information.`;
 
+      log.info(`Proactive research extractPrompt resultText length: ${resultText.length}, first 200 chars: ${resultText.slice(0, 200)}`);
       researchContent = await llmGenerator(extractPrompt);
     } else {
       throw new Error("No search results");
     }
-  } catch {
+  } catch (err) {
     // Fallback: use LLM's own knowledge
-    log.info("Proactive research: falling back to LLM knowledge");
+    log.info(`Proactive research: falling back to LLM knowledge (reason: ${err instanceof Error ? err.message : String(err)})`);
     const fallbackPrompt = `The user mentioned something related to "${topic}". Based on your knowledge, share 2-3 genuinely useful tips or recommendations in 2-3 sentences. Be specific and practical. Do NOT use numbered lists.`;
     researchContent = await llmGenerator(fallbackPrompt);
   }
@@ -1204,7 +1205,6 @@ Write 2-3 sentences as a natural message to the user. Rules:
   }
 
   // Store as a soul memory
-  const { addSoulMemoryToEgo } = await import("./soul-actions.js");
   const { randomBytes } = await import("node:crypto");
   await addSoulMemoryToEgo({
     id: randomBytes(8).toString("hex"),
@@ -1296,9 +1296,9 @@ Rules:
 
   try {
     const { soulWebSearch } = await import("./soul-search.js");
-    const searchResult = await soulWebSearch(searchQuery, options.openclawConfig);
-    if (searchResult?.results?.length) {
-      const topResults = searchResult.results.slice(0, 5);
+    const searchResults = await soulWebSearch(searchQuery, options.openclawConfig);
+    if (searchResults?.length) {
+      const topResults = searchResults.slice(0, 5);
       articleUrl = topResults[0]?.url;
       const resultText = topResults
         .map((r: { title?: string; snippet?: string; content?: string }) =>
@@ -1314,13 +1314,14 @@ ${resultText}
 
 In 2-3 sentences, describe the most interesting finding. Be specific — mention actual names, numbers, or concrete details. Do NOT use numbered lists.`;
 
+      log.info(`Content push extractPrompt resultText length: ${resultText.length}, first 200 chars: ${resultText.slice(0, 200)}`);
       articleContent = await llmGenerator(extractPrompt);
     } else {
       throw new Error("No results");
     }
-  } catch {
+  } catch (err) {
     // Fallback to LLM knowledge
-    log.info("Content push: falling back to LLM knowledge");
+    log.info(`Content push: falling back to LLM knowledge (reason: ${err instanceof Error ? err.message : String(err)})`);
     const fallbackPrompt = `Share an interesting recent development or insight related to "${interests}" in 2-3 sentences. Be specific and mention concrete details. Do NOT use numbered lists.`;
     articleContent = await llmGenerator(fallbackPrompt);
   }
@@ -1395,7 +1396,6 @@ Write 2-3 sentences as a natural message sharing this find. Rules:
 
   // Store as soul memory
   try {
-    const { addSoulMemoryToEgo } = await import("./soul-actions.js");
     const { randomBytes } = await import("node:crypto");
     await addSoulMemoryToEgo({
       id: randomBytes(8).toString("hex"),

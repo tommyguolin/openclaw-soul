@@ -845,6 +845,95 @@ export function detectThoughtOpportunities(
   return allOpportunities;
 }
 
+/**
+ * Re-rank top opportunities via LLM based on conversational context.
+ * Falls back to the original static ordering on any error.
+ */
+export async function llmReRankOpportunities(
+  opportunities: DetectedThoughtOpportunity[],
+  ctx: ThoughtGenerationContext,
+  recentActionHistory: string[],
+  llmGenerator: LLMThoughtGenerator,
+): Promise<DetectedThoughtOpportunity[]> {
+  if (opportunities.length <= 1) return opportunities;
+
+  // Build user context summary
+  const userFacts = ctx.ego.userFacts.slice(0, 5)
+    .map((f) => `[${f.category}] ${f.content}`)
+    .join("; ");
+  const recentMessages = ctx.ego.memories
+    .filter((m) => m.type === "interaction" && m.tags.includes("inbound"))
+    .slice(-3)
+    .map((m) => m.content.slice(0, 80))
+    .join(" | ");
+  const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+  // Build candidate list
+  const candidateLines = opportunities.map((o, i) => {
+    const action = o.suggestedAction ?? "auto";
+    return `${i}. [${o.type}] ${action} — "${o.triggerDetail.slice(0, 80)}" (base P=${o.priority.toFixed(0)})`;
+  }).join("\n");
+
+  const historyStr = recentActionHistory.length > 0
+    ? recentActionHistory.join(", ")
+    : "none";
+
+  const prompt = `Re-rank these AI companion actions by contextual value RIGHT NOW.
+
+User profile: ${userFacts || "limited"}
+Recent messages: ${recentMessages || "none"}
+Time: ${ctx.currentHour}:00 ${days[ctx.dayOfWeek]}
+Recent executed actions (avoid repeating): ${historyStr}
+
+Candidates:
+${candidateLines}
+
+Rules:
+- If user mentioned plans (travel, events, purchases, learning), boost proactive-research and proactive-content-push
+- If user is actively debugging/troubleshooting, boost observe-and-improve
+- If long silence (>2h), boost send-message or bond-deepen
+- If user expressed interests recently, boost proactive-content-push
+- Avoid repeating recently executed action types
+- Prefer diverse actions over time
+
+Output ONLY a JSON array of indices sorted by your recommended priority (best first). No explanation.
+Example: [3, 4, 2, 0, 1]`;
+
+  const raw = await llmGenerator(prompt);
+  const cleaned = raw.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
+
+  // Extract JSON array from response
+  const match = cleaned.match(/\[[\d,\s]+\]/);
+  if (!match) {
+    log.info(`LLM re-rank: no valid JSON array in response, using static order`);
+    return opportunities;
+  }
+
+  const indices: number[] = JSON.parse(match[0]);
+  if (!Array.isArray(indices) || indices.length === 0) {
+    return opportunities;
+  }
+
+  // Validate indices and build re-ranked list
+  const used = new Set<number>();
+  const reRanked: DetectedThoughtOpportunity[] = [];
+  for (const idx of indices) {
+    if (typeof idx === "number" && idx >= 0 && idx < opportunities.length && !used.has(idx)) {
+      reRanked.push(opportunities[idx]);
+      used.add(idx);
+    }
+  }
+  // Append any remaining opportunities that weren't in the LLM response
+  for (let i = 0; i < opportunities.length; i++) {
+    if (!used.has(i)) {
+      reRanked.push(opportunities[i]);
+    }
+  }
+
+  if (reRanked.length === 0) return opportunities;
+  return reRanked;
+}
+
 function getThoughtContentForOpportunity(
   opportunity: DetectedThoughtOpportunity,
   ego: EgoState,
@@ -1290,11 +1379,12 @@ export async function generateIntelligentThought(
       // triggerDetail/motivation. Check if the LLM wants to investigate,
       // read files/logs, or analyze something — these should route to
       // analyze-problem, not learn-topic.
-      // EXCEPTION: don't override suggestedAction "observe-and-improve" —
-      // that's a deliberate self-modification action that must not be downgraded.
+      // EXCEPTION: don't override explicit suggestedActions that are deliberate
+      // proactive actions (observe-and-improve, proactive-research, proactive-content-push).
       const diagnosticKeywords = /读取|读一下|查看|检查|观察|排查|分析|分析一下|日志|log|investigate|inspect|check|analyze|read.*(file|log)|diagnos/i;
-      const isSelfImprovementAction = selectedOpportunity.suggestedAction === "observe-and-improve";
-      if (!isSelfImprovementAction &&
+      const protectedActions = new Set(["observe-and-improve", "proactive-research", "proactive-content-push"]);
+      const isProtectedAction = protectedActions.has(selectedOpportunity.suggestedAction ?? "");
+      if (!isProtectedAction &&
           diagnosticKeywords.test(refinedContent) &&
           (selectedOpportunity.type === "opportunity-detected" ||
            selectedOpportunity.type === "conversation-replay" ||

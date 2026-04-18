@@ -12,7 +12,7 @@ import {
   getAwakeningMessage,
 } from "./awakening.js";
 import { loadEgoStore, updateEgoStore, resolveEgoStorePath } from "./ego-store.js";
-import { generateIntelligentThought, detectThoughtOpportunities } from "./intelligent-thought.js";
+import { generateIntelligentThought, detectThoughtOpportunities, llmReRankOpportunities } from "./intelligent-thought.js";
 import {
   analyzeSentiment,
   calculateEgoImpact,
@@ -112,6 +112,8 @@ export class ThoughtService {
   private lastWorkspaceRefresh = 0;
   private recentThoughtTypes: string[] = [];
   private recentThoughtTopics: string[] = [];
+  private recentActionHistory: string[] = [];
+  private consecutiveSkipCount = 0;
   private lastLLMCallTime = 0;
   private static readonly MIN_LLM_INTERVAL_MS = 10_000; // 10s between Soul LLM calls
   private thoughtAbortController: AbortController | null = null;
@@ -521,7 +523,27 @@ export class ThoughtService {
           const nonRepeatingOpportunities = this.recentThoughtTypes.length > 0
             ? opportunities.filter((o) => !this.recentThoughtTypes.includes(o.type))
             : opportunities;
-          const selectedOpportunity = nonRepeatingOpportunities[0] ?? opportunities[0] ?? undefined;
+
+          // Context-aware LLM re-ranking
+          let selectedOpportunity: typeof nonRepeatingOpportunities[0] | undefined;
+          if (this.llmGenerator && nonRepeatingOpportunities.length > 1) {
+            try {
+              const topCandidates = nonRepeatingOpportunities.slice(0, 8);
+              const reRanked = await llmReRankOpportunities(
+                topCandidates, ctx, this.recentActionHistory, this.llmGenerator,
+              );
+              selectedOpportunity = reRanked[0];
+              const newAction = selectedOpportunity?.suggestedAction ?? selectedOpportunity?.type ?? "?";
+              const oldAction = topCandidates[0]?.suggestedAction ?? topCandidates[0]?.type ?? "?";
+              if (newAction !== oldAction) {
+                log.info(`LLM re-ranked: selected ${newAction} (static winner was ${oldAction})`);
+              }
+            } catch {
+              selectedOpportunity = nonRepeatingOpportunities[0] ?? opportunities[0];
+            }
+          } else {
+            selectedOpportunity = nonRepeatingOpportunities[0] ?? opportunities[0];
+          }
           thought = await generateIntelligentThought(ctx, {
             llmGenerator: this.llmGenerator,
             preferOpportunity: selectedOpportunity,
@@ -533,9 +555,26 @@ export class ThoughtService {
 
           // Skip if this thought overlaps significantly with a recent one
           if (this.isRepeatTopic(thought.content)) {
-            log.info(`Skipping thought — topic too similar to recent thoughts`);
+            this.consecutiveSkipCount++;
+            const backoffMinutes = Math.min(this.consecutiveSkipCount * 2, 30);
+            log.info(`Skipping thought — topic too similar (skip #${this.consecutiveSkipCount}, backing off ${backoffMinutes}m)`);
             thought = null;
+            // Reschedule next tick with backoff
+            if (this.intervalId) {
+              clearInterval(this.intervalId);
+              const backoffMs = backoffMinutes * 60 * 1000;
+              setTimeout(() => {
+                this.intervalId = setInterval(() => {
+                  void this.tick();
+                }, this.checkIntervalMs);
+                void this.tick();
+              }, backoffMs);
+            }
+            return;
           }
+
+          // Thought was novel — reset skip counter
+          this.consecutiveSkipCount = 0;
         } catch (err) {
           if ((err as { name?: string })?.name === "AbortError") {
             log.info("Thought generation aborted");
@@ -653,6 +692,12 @@ export class ThoughtService {
       log.info(`Thought action executed: ${thought.actionType}`, {
         result: actionResult.result.result?.slice(0, 100),
       });
+
+      // Track action history for re-ranking diversity
+      this.recentActionHistory.push(thought.actionType ?? "none");
+      if (this.recentActionHistory.length > 5) {
+        this.recentActionHistory = this.recentActionHistory.slice(-5);
+      }
 
       const updatedEgo = await updateEgoStore(this.storePath, (e) => {
         for (const delta of actionResult.metricsChanged) {
