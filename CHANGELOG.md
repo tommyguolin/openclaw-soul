@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.3.1 (2026-04-19)
+
+### Fixes
+
+- **Fix tools.alsoAllow config command**: Updated README to use correct array syntax `'["message"]'` instead of bare `message`
+
 ## 2.3.0 (2026-04-19)
 
 ### Changes

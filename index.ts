@@ -259,7 +259,7 @@ const plugin = {
   id: "soul",
   name: "Soul",
   description: "Autonomous thinking, emotional awareness, and memory system",
-  version: "2.3.0",
+  version: "2.3.1",
   enabledByDefault: true,
   configSchema: {
     type: "object",
