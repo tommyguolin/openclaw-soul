@@ -320,7 +320,7 @@ Keep it to 1-2 sentences: what you found and what you did (if anything).`;
     message: agentMessage,
     gatewayPort: options.gatewayPort,
     hooksToken: options.hooksToken,
-    timeoutSeconds: 180,
+    timeoutSeconds: 300,
   });
 
   if (!fireResult.ok) {
@@ -630,7 +630,7 @@ Format: 1-2 sentences describing what you found/changed and why.`;
     message: prompt,
     gatewayPort: options.gatewayPort,
     hooksToken: options.hooksToken,
-    timeoutSeconds: 300,
+    timeoutSeconds: 600,
   });
 
   if (!fireResult.ok) {
@@ -773,7 +773,7 @@ async function persistTask(task: AutonomousTask): Promise<void> {
  * Returns list of newly completed tasks (with results from file capture).
  */
 export async function pollActiveTasks(storePath: string): Promise<AutonomousTask[]> {
-  const STALE_MS = 10 * 60 * 1000; // 10 minutes
+  const STALE_MS = 15 * 60 * 1000; // 15 minutes
   const MAX_TASKS = 20;
   const newlyCompleted: AutonomousTask[] = [];
 
