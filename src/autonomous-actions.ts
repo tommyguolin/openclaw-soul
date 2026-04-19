@@ -614,7 +614,9 @@ ${userContext || "Limited user info."}
 4. Verify the fix doesn't break anything (check for syntax errors, import issues)
 
 **Safety rules**:
-- **Always read a file before editing it** — use the read tool first, then use the exact text from the file content as oldText in the edit tool. Never guess or fabricate file content
+- **Always read a file before editing it** — use the read tool first
+- **CRITICAL for edit tool**: Copy oldText VERBATIM from the read output. Do NOT retype, paraphrase, or modify it — paste it character-for-character including all whitespace, indentation, and newlines. If the edit fails with "Could not find", re-read the file and copy the exact text again
+- Keep oldText small (3-10 lines) — target only the lines you need to change
 - Only modify files in ${soulDir}/
 - Make small, focused changes (one improvement per run)
 - Never delete existing functionality — only add or improve
