@@ -434,11 +434,17 @@ const plugin = {
         // Token cost: extractUserFacts ~300 tokens, extractUserPreferences
         // ~300 tokens. Only run these for substantive messages (>=15 chars)
         // to avoid wasting tokens on short replies like "ok", "收到", "好的".
+        // Delay LLM calls by 2 minutes to avoid competing with the agent's
+        // response LLM call for gateway/provider resources.
         if (text.length >= 15) {
+          const delayMs = 2 * 60 * 1000; // 2 minutes
           thoughtService.recordInteractionWithText({ type: "inbound", text })
-            .then(() => thoughtService.extractUserFacts(text))
-            .then(() => thoughtService.extractUserPreferences(text))
-            .catch((err) => log.warn(`Background message processing failed: ${String(err)}`));
+            .catch((err) => log.warn(`Record interaction failed: ${String(err)}`));
+          setTimeout(() => {
+            thoughtService.extractUserFacts(text)
+              .then(() => thoughtService.extractUserPreferences(text))
+              .catch((err) => log.warn(`Background message processing failed: ${String(err)}`));
+          }, delayMs);
         } else if (text.length >= 5) {
           thoughtService.recordInteractionWithText({ type: "inbound", text })
             .catch((err) => log.warn(`Record interaction failed: ${String(err)}`));
