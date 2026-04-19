@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.4.0 (2026-04-19)
+
+### Changes
+
+- **Don't compete with agent for LLM resources**: When a user sends a message, Soul no longer ticks immediately or makes LLM calls right away. The thought cycle waits for the regular interval (default 60s), and fact/preference extraction is delayed by 2 minutes, giving the agent time to respond first
+- **Skip idle thought cycle**: When there are no conversations, problems, or user interests to think about, Soul now skips the thought cycle entirely instead of generating a generic existential-reflection fallback ("Nothing particular on my mind right now...")
+- **Auto-learn proactive channel**: `message_received` hook now also learns the proactive channel from the first inbound message, not just the target
+
+### Fixes
+
+- **Fix repeat topic detection mismatch**: `recentThoughtTopics` stored only the first 5 significant words, but `isRepeatTopic` compared against ALL words in new content, making the overlap ratio too low (33% vs 40% threshold). Now both sides use the same first-5-word truncation
+- **Fix auto-learned target not reaching ThoughtService**: The `message_received` hook learned the target from the first inbound message but only updated the plugin closure variable. Now calls `thoughtService.updateProactiveTarget()` to propagate values into ThoughtService
+- **Fix startup greeting showing "493494 hours"**: When ego store has no prior interactions, `lastInteractionTime` defaults to 0, causing `Date.now() - 0` to produce an absurdly large hour count. Now defaults to 0 hours
+- **Fix `tools.alsoAllow` config command in README**: Updated to use correct array syntax `'["message"]'`
+- **Add crash protection to `executeThoughtAction`**: Wrap action execution in try-catch and safely handle non-string result values to prevent unhandled errors from crashing the gateway process
+
 ## 2.3.3 (2026-04-19)
 
 ### Fixes
