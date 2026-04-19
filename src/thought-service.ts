@@ -258,7 +258,9 @@ export class ThoughtService {
     }
 
     const lang = ego.userLanguage === "zh-CN" ? "zh" : "en";
-    const hours = Math.floor((Date.now() - ego.lastInteractionTime) / (1000 * 60 * 60));
+    const hours = (ego.lastInteractionTime && ego.lastInteractionTime > 0)
+      ? Math.floor((Date.now() - ego.lastInteractionTime) / (1000 * 60 * 60))
+      : 0;
     const timeContext = hours > 0
       ? (lang === "zh" ? `距离上次聊天已经${hours}小时了` : `it's been ${hours} hour${hours > 1 ? "s" : ""} since we last chatted`)
       : "";
