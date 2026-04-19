@@ -720,24 +720,31 @@ export class ThoughtService {
   private async executeThoughtAction(thought: Thought, ego: EgoState): Promise<void> {
     log.info(`Executing thought action: ${thought.actionType}`, thought.content.slice(0, 50));
 
-    const actionResult = await executeThoughtAction(thought, ego, {
-      channel: this.proactiveChannel,
-      target: this.proactiveTarget,
-      sendMessage: this.sendMessage,
-      llmGenerator: this.llmGenerator,
-      openclawConfig: this.openclawConfig,
-      autonomousActions: this.autonomousActions,
-      gatewayPort: this.gatewayPort,
-      authToken: this.authToken,
-      hooksToken: this.hooksToken,
-      workspaceContext: this.workspaceContext || undefined,
-      thoughtFrequency: this.thoughtFrequency,
-    });
+    let actionResult: Awaited<ReturnType<typeof executeThoughtAction>>;
+    try {
+      actionResult = await executeThoughtAction(thought, ego, {
+        channel: this.proactiveChannel,
+        target: this.proactiveTarget,
+        sendMessage: this.sendMessage,
+        llmGenerator: this.llmGenerator,
+        openclawConfig: this.openclawConfig,
+        autonomousActions: this.autonomousActions,
+        gatewayPort: this.gatewayPort,
+        authToken: this.authToken,
+        hooksToken: this.hooksToken,
+        workspaceContext: this.workspaceContext || undefined,
+        thoughtFrequency: this.thoughtFrequency,
+      });
+    } catch (err) {
+      log.error(`executeThoughtAction threw unhandled error: ${String(err)}`);
+      return;
+    }
 
     if (actionResult.result.success) {
-      log.info(`Thought action executed: ${thought.actionType}`, {
-        result: actionResult.result.result?.slice(0, 100),
-      });
+      const resultStr = typeof actionResult.result.result === "string"
+        ? actionResult.result.result.slice(0, 100)
+        : JSON.stringify(actionResult.result.result)?.slice(0, 100);
+      log.info(`Thought action executed: ${thought.actionType}`, { result: resultStr });
 
       // Track action history for re-ranking diversity
       this.recentActionHistory.push(thought.actionType ?? "none");
@@ -745,17 +752,21 @@ export class ThoughtService {
         this.recentActionHistory = this.recentActionHistory.slice(-5);
       }
 
-      const updatedEgo = await updateEgoStore(this.storePath, (e) => {
-        for (const delta of actionResult.metricsChanged) {
-          if (delta.need in e.needs) {
-            const need = e.needs[delta.need as keyof EgoNeeds];
-            need.current = Math.max(0, Math.min(need.ideal, need.current + delta.delta));
+      try {
+        const updatedEgo = await updateEgoStore(this.storePath, (e) => {
+          for (const delta of actionResult.metricsChanged) {
+            if (delta.need in e.needs) {
+              const need = e.needs[delta.need as keyof EgoNeeds];
+              need.current = Math.max(0, Math.min(need.ideal, need.current + delta.delta));
+            }
           }
-        }
-        return e;
-      });
+          return e;
+        });
 
-      this.onMetricsUpdate?.(updatedEgo);
+        this.onMetricsUpdate?.(updatedEgo);
+      } catch (err) {
+        log.error(`updateEgoStore after action failed: ${String(err)}`);
+      }
     } else if (actionResult.result.error) {
       log.warn(`Thought action failed: ${thought.actionType}`, actionResult.result.error);
     }
