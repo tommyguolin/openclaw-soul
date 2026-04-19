@@ -244,8 +244,10 @@ export class ThoughtService {
     this.intervalId = setInterval(() => {
       void this.tick();
     }, this.checkIntervalMs);
-    void this.tick();
-    log.info("Thought cycle resumed by user interaction");
+    // Do NOT tick immediately — the agent is processing the user's message
+    // right now. Let the regular interval handle the next tick so Soul's
+    // LLM calls don't compete with the agent's response.
+    log.info(`Thought cycle resumed by user interaction (next tick in ${this.checkIntervalMs / 1000}s)`);
   }
 
   /**
