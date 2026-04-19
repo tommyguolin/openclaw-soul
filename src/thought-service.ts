@@ -741,6 +741,13 @@ export class ThoughtService {
   private applySkipBackoff(reason: string): void {
     this.consecutiveSkipCount++;
 
+    // Update lastThoughtTime so shouldGenerateThought's minimum interval check works.
+    // Without this, the same skip would repeat every tick because lastThoughtTime never advances.
+    void updateEgoStore(this.storePath, (e) => {
+      e.lastThoughtTime = Date.now();
+      return e;
+    }).catch(() => { /* non-critical */ });
+
     const MAX_CONSECUTIVE_SKIPS = 3;
     if (this.consecutiveSkipCount >= MAX_CONSECUTIVE_SKIPS) {
       log.info(`Skipping thought — ${reason} (skip #${this.consecutiveSkipCount}, pausing until next user message)`);
