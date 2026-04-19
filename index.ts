@@ -259,7 +259,7 @@ const plugin = {
   id: "soul",
   name: "Soul",
   description: "Autonomous thinking, emotional awareness, and memory system",
-  version: "2.3.1",
+  version: "2.3.2",
   enabledByDefault: true,
   configSchema: {
     type: "object",
@@ -417,6 +417,7 @@ const plugin = {
         // Auto-learn proactive target from first inbound message
         if (from && channelId && !proactiveTarget) {
           proactiveTarget = from;
+          thoughtService.updateProactiveTarget(channelId, from);
           log.info(`Proactive target auto-learned from first message: ${channelId}/${from}`);
         }
 

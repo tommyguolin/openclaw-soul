@@ -158,6 +158,18 @@ export class ThoughtService {
     }
   }
 
+  /** Update proactive channel/target (called when auto-learned from message_received hook). */
+  updateProactiveTarget(channel: string, target: string): void {
+    if (!this.proactiveChannel && channel) {
+      this.proactiveChannel = channel;
+      log.info(`ThoughtService: proactive channel updated to ${channel}`);
+    }
+    if (!this.proactiveTarget && target) {
+      this.proactiveTarget = target;
+      log.info(`ThoughtService: proactive target updated to ${target}`);
+    }
+  }
+
   async start(): Promise<void> {
     if (this.running) {
       log.warn("Thought service already running");

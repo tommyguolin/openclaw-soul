@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.3.2 (2026-04-19)
+
+### Fixes
+
+- **Fix auto-learned proactive target not reaching ThoughtService**: `message_received` hook correctly learned the target from the first inbound message but only stored it in the plugin closure, not in ThoughtService itself. Now calls `thoughtService.updateProactiveTarget()` so `send-message` and `report-findings` can use it
+
 ## 2.3.1 (2026-04-19)
 
 ### Fixes
