@@ -573,7 +573,6 @@ export class ThoughtService {
             return;
           }
           log.warn(`LLM thought generation failed, using fallback: ${String(err)}`);
-          this.consecutiveSkipCount++;
           this.applySkipBackoff(`LLM failure: ${String(err).slice(0, 60)}`);
           return;
         }
@@ -595,7 +594,6 @@ export class ThoughtService {
           thought = buildThoughtFromOpportunity(nonRepeatingOpportunities[0], ego);
         } else {
           // All opportunities exhausted — back off instead of generating random thoughts
-          this.consecutiveSkipCount++;
           this.applySkipBackoff("no novel opportunities");
           return;
         }
@@ -612,7 +610,6 @@ export class ThoughtService {
     // Reject thought content that is actually an LLM error message
     if (isLLMErrorContent(thought.content)) {
       log.warn(`Rejecting thought — content is LLM error message: ${thought.content.slice(0, 80)}`);
-      this.consecutiveSkipCount++;
       this.applySkipBackoff("LLM error content");
       return;
     }
@@ -720,6 +717,7 @@ export class ThoughtService {
    * Safe against concurrent calls — cancels any pending backoff first.
    */
   private applySkipBackoff(reason: string): void {
+    this.consecutiveSkipCount++;
     const backoffMinutes = Math.min(this.consecutiveSkipCount * 2, 30);
     log.info(`Skipping thought — ${reason} (skip #${this.consecutiveSkipCount}, backing off ${backoffMinutes}m)`);
 
