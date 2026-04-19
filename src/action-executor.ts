@@ -618,7 +618,7 @@ ${timeContext}
 ${userInfo ? `User profile:\n${userInfo}\n` : ""}${interactionContext ? `Recent conversations:\n${interactionContext}\n` : ""}${knowledgeContext ? `Knowledge I've learned:\n${knowledgeContext}\n` : ""}${options.workspaceContext ? `Workspace rules:\n${options.workspaceContext}\n` : ""}${thought.type !== "bond-deepen" ? `Thought: ${thought.motivation}` : ""}
 
 ${isUserTopicFollowUp
-  ? `**IMPORTANT**: You just searched for or learned about a topic the user previously discussed. You SHOULD share your finding in 1-2 sentences. Reference the specific topic and what you found. Only say NO_MESSAGE if the knowledge is completely unrelated to what the user cares about.`
+  ? `**IMPORTANT**: You just searched for or learned about a topic the user previously discussed. You SHOULD share your finding in 2-3 sentences. Reference the specific topic and what you found. Only say NO_MESSAGE if the knowledge is completely unrelated to what the user cares about.`
   : `**What counts as valuable** (only send if you have something like this):
 - A specific insight related to something the user discussed
 - A useful tip or finding from web search or learning
@@ -691,7 +691,7 @@ Output the message or NO_MESSAGE now:`;
       cleaned = cleaned.replace(/^(?:收到[，。、！]?\s*|好的[，。、！]?\s*|Got it[.!]?\s*|OK[.!]?\s*)/i, "");
 
       if (cleaned && cleaned.toUpperCase() !== "NO_MESSAGE" && cleaned.length >= 10) {
-        return truncateAtSentence(cleaned, 300);
+        return truncateAtSentence(cleaned, 1000);
       }
 
       // LLM said NO_MESSAGE — respect that decision.
@@ -723,7 +723,7 @@ Output the message or NO_MESSAGE now:`;
       (p) => thought.content.toLowerCase().includes(p.toLowerCase()),
     );
     if (!isGeneric) {
-      return truncateAtSentence(thought.content, 300);
+      return truncateAtSentence(thought.content, 1000);
     }
   }
 
@@ -781,7 +781,7 @@ async function executeLearnTopic(
 
 ${snippets}
 
-Please summarize in 2-3 sentences the key knowledge points you learned about "${topic}" from these search results.
+Please summarize in 3-5 sentences the key knowledge points you learned about "${topic}" from these search results.
 Output knowledge points directly, do not add prefixes or numbering.`;
 
         const llmResponse = await options.llmGenerator(learnPrompt);
@@ -1123,7 +1123,7 @@ Rules:
 Search results:
 ${resultText}
 
-Write 2-3 concise insights in flowing prose (NOT a numbered list). Each insight should be 1-2 sentences. Focus on practical, actionable information.`;
+Write 3-5 concise insights in flowing prose (NOT a numbered list). Each insight should be 2-3 sentences. Focus on practical, actionable information.`;
 
       log.info(`Proactive research extractPrompt resultText length: ${resultText.length}, first 200 chars: ${resultText.slice(0, 200)}`);
       researchContent = await llmGenerator(extractPrompt);
@@ -1133,7 +1133,7 @@ Write 2-3 concise insights in flowing prose (NOT a numbered list). Each insight 
   } catch (err) {
     // Fallback: use LLM's own knowledge
     log.info(`Proactive research: falling back to LLM knowledge (reason: ${err instanceof Error ? err.message : String(err)})`);
-    const fallbackPrompt = `The user mentioned something related to "${topic}". Based on your knowledge, share 2-3 genuinely useful tips or recommendations in 2-3 sentences. Be specific and practical. Do NOT use numbered lists.`;
+    const fallbackPrompt = `The user mentioned something related to "${topic}". Based on your knowledge, share 3-5 genuinely useful tips or recommendations in 3-5 sentences. Be specific and practical. Do NOT use numbered lists.`;
     researchContent = await llmGenerator(fallbackPrompt);
   }
 
@@ -1170,7 +1170,7 @@ ${researchContent}
 
 ${langInstruction}
 
-Write 2-3 sentences as a natural message to the user. Rules:
+Write 3-5 sentences as a natural message to the user. Rules:
 - Start with a natural opening (e.g. "我后来想了想...", "I was thinking about what you mentioned...", "对了...")
 - Share the most useful finding — be specific, not vague
 - Do NOT use numbered lists
@@ -1198,7 +1198,7 @@ Write 2-3 sentences as a natural message to the user. Rules:
     const { addKnowledgeItem } = await import("./knowledge-store.js");
     await addKnowledgeItem({
       topic,
-      content: researchContent.slice(0, 300),
+      content: researchContent.slice(0, 1000),
       source: usedWebSearch ? "web-search" : "reflection",
       tags: ["proactive-research", ...topic.toLowerCase().split(/\s+/).filter((w) => w.length > 2).slice(0, 3)],
       confidence: 0.7,
@@ -1315,7 +1315,7 @@ Rules:
 Search results:
 ${resultText}
 
-In 2-3 sentences, describe the most interesting finding. Be specific — mention actual names, numbers, or concrete details. Do NOT use numbered lists.`;
+In 3-5 sentences, describe the most interesting finding. Be specific — mention actual names, numbers, or concrete details. Do NOT use numbered lists.`;
 
       log.info(`Content push extractPrompt resultText length: ${resultText.length}, first 200 chars: ${resultText.slice(0, 200)}`);
       articleContent = await llmGenerator(extractPrompt);
@@ -1325,7 +1325,7 @@ In 2-3 sentences, describe the most interesting finding. Be specific — mention
   } catch (err) {
     // Fallback to LLM knowledge
     log.info(`Content push: falling back to LLM knowledge (reason: ${err instanceof Error ? err.message : String(err)})`);
-    const fallbackPrompt = `Share an interesting recent development or insight related to "${interests}" in 2-3 sentences. Be specific and mention concrete details. Do NOT use numbered lists.`;
+    const fallbackPrompt = `Share an interesting recent development or insight related to "${interests}" in 3-5 sentences. Be specific and mention concrete details. Do NOT use numbered lists.`;
     articleContent = await llmGenerator(fallbackPrompt);
   }
 
@@ -1354,7 +1354,7 @@ ${articleUrl ? `**Source**: ${articleUrl}` : ""}
 
 ${langInstruction}
 
-Write 2-3 sentences as a natural message sharing this find. Rules:
+Write 3-5 sentences as a natural message sharing this find. Rules:
 - Start with a natural opening about why you're sharing this
 - Highlight the most interesting point — be specific
 - ${articleUrl ? `Include the source URL at the end: ${articleUrl}` : "Do NOT make up URLs"}
@@ -1387,7 +1387,7 @@ Write 2-3 sentences as a natural message sharing this find. Rules:
     const { addKnowledgeItem } = await import("./knowledge-store.js");
     await addKnowledgeItem({
       topic: topic ?? "content-push",
-      content: articleContent.slice(0, 300),
+      content: articleContent.slice(0, 1000),
       source: "web-search",
       tags: ["proactive-content-push", ...(topic?.toLowerCase().split(/\s+/).filter((w) => w.length > 2).slice(0, 3) ?? [])],
       confidence: 0.6,

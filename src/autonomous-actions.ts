@@ -434,7 +434,7 @@ export async function executeReportFindings(
 **What you investigated**:
 ${taskSummaries}
 
-Write 2-3 sentences in flowing prose (NOT a numbered list). Rules:
+Write 3-5 sentences in flowing prose (NOT a numbered list). Rules:
 - Start by mentioning WHAT you investigated and WHY (e.g. "我后来查了一下飞书消息发送超时的问题——", "我研究了一下那个 413 错误——", "I looked into the Discord delivery issue —")
 - Then share the CONCRETE finding: actual error messages, root causes, or actionable insights
 - If you investigated multiple things, pick the ONE most interesting finding — do NOT list them all
