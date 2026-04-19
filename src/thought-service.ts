@@ -561,6 +561,14 @@ export class ThoughtService {
           if (signal.aborted) { return; }
           await this.waitForLLMRateLimit(signal);
           const opportunities = detectThoughtOpportunities(ctx);
+
+          // No opportunities at all — nothing worth thinking about (no conversations,
+          // no problems, no interests). Skip instead of generating a generic fallback.
+          if (opportunities.length === 0) {
+            this.applySkipBackoff("no opportunities (idle — no conversations or problems)");
+            return;
+          }
+
           const nonRepeatingOpportunities = this.recentThoughtTypes.length > 0
             ? opportunities.filter((o) => !this.recentThoughtTypes.includes(o.type))
             : opportunities;
@@ -615,6 +623,10 @@ export class ThoughtService {
       } else {
         if (signal.aborted) { return; }
         const opportunities = detectThoughtOpportunities(ctx);
+        if (opportunities.length === 0) {
+          this.applySkipBackoff("no opportunities (idle — no conversations or problems)");
+          return;
+        }
         const nonRepeatingOpportunities = this.recentThoughtTypes.length > 0
           ? opportunities.filter((o) => !this.recentThoughtTypes.includes(o.type))
           : opportunities;

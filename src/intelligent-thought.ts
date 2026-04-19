@@ -1332,16 +1332,18 @@ export async function generateIntelligentThought(
   const opportunities = detectThoughtOpportunities(ctx);
 
   if (opportunities.length === 0) {
+    // No opportunities — caller should handle this (skip or back off).
+    // Return a minimal thought so callers that don't check length get a usable object.
     const fallback: Thought = {
       id: randomBytes(8).toString("hex"),
       type: "existential-reflection",
-      content: "Nothing particular on my mind right now, but I'll stay alert and wait for the right moment",
+      content: "idle",
       trigger: "curiosity",
       source: "scheduled",
       triggerDetail: "No urgent needs",
-      motivation: "Stay alert",
+      motivation: "Idle",
       targetMetrics: [],
-      priority: 20,
+      priority: 5,
       createdAt: Date.now(),
       expiresAt: Date.now() + 60 * 60 * 1000,
       executed: false,
