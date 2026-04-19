@@ -439,9 +439,12 @@ Write 3-5 sentences in flowing prose (NOT a numbered list). Rules:
 - Then share the CONCRETE finding: actual error messages, root causes, or actionable insights
 - If you investigated multiple things, pick the ONE most interesting finding — do NOT list them all
 - Sound natural, like a knowledgeable friend sharing something useful they discovered
-- Do NOT describe your own behavior (e.g. "Soul is producing proactive behavior", "I analyzed the logs")
+- Do NOT describe your own behavior, configuration changes, or self-modifications
+- Do NOT mention "Soul" by name — the user knows who you are
+- Do NOT report about fixing your own bugs, adding keywords, tuning your config, or improving yourself — that is internal maintenance, NOT a user-facing finding
 - Do NOT use numbered lists or bullet points — they get truncated and look bad in chat
-- Only report if you found a CONCRETE root cause or actionable insight
+- Only report if you found a CONCRETE root cause or actionable insight about an EXTERNAL system or real-world fact
+- If the task was about self-improvement (modifying your own code/config/keywords), output exactly: NO_MESSAGE
 
 **BAD examples** (NEVER do this):
 收到，问题已定位：...                          ← assistant-like prefix
@@ -449,6 +452,8 @@ Write 3-5 sentences in flowing prose (NOT a numbered list). Rules:
 我研究了一下那个问题——根因是...             ← WHAT problem? Too vague
 Soul 插件正在产生主动行为了！                ← describing Soul's own behavior
 好的，根据日志分析...                        ← assistant-like prefix
+我已经把旅游住宿相关的关键词加入了时效敏感模式 ← self-modification, NOT a user-facing finding
+我研究了一下 Soul 为什么没执行——根因是...    ← self-debugging, user doesn't care
 
 **GOOD examples**:
 我后来查了一下飞书消息发送超时的问题——根因是 OpenViking 的 embedding API 有 512 token 限制，不是 Soul 本身的问题。
@@ -484,8 +489,8 @@ Output ONLY the message, nothing else.`;
     return { result: { type: "report-findings", success: true, result: "nothing meaningful to report" }, metricsChanged: [] };
   }
 
-  // Filter self-referential messages about Soul's own behavior
-  if (/Soul\s*(插件)?\s*正在|插件.*主动行为|我分析了.*日志/i.test(message)) {
+  // Filter self-referential messages about Soul's own behavior or self-modifications
+  if (/Soul\s*(插件)?\s*(正在|为什么|没执行)|插件.*主动行为|我分析了.*日志|我已经把.*加入|我.*修改了.*(配置|关键词|模式)|时效敏感模式/i.test(message)) {
     log.info("Report-findings: message is self-referential, skipping");
     await updateEgoStore(resolveEgoStorePath(), (e) => {
       for (const t of e.activeTasks ?? []) {

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.3.0 (2026-04-19)
+
+### Changes
+
+- **Strengthened report-findings quality gate**: Soul no longer reports self-modifications (config changes, keyword additions, bug fixes) as user-facing findings. Self-improvement tasks are filtered out at both prompt and regex levels, so users only see genuinely useful external findings
+- **Broadened self-referential message filter**: Extended filter patterns to catch "Soul 为什么", "Soul 没执行", self-configuration changes, and time-sensitive mode modifications that previously leaked through
+
 ## 2.2.1 (2026-04-19)
 
 ### Changes
