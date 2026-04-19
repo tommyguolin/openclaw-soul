@@ -422,6 +422,7 @@ const plugin = {
 
         // Abort any in-progress thought — user interaction takes priority
         thoughtService.abortCurrentThought();
+        thoughtService.resume();
 
         // Run all processing in the background so we don't block the agent
         // turn. The hook must return quickly (<1s) to avoid feishu streaming

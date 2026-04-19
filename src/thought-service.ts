@@ -215,6 +215,28 @@ export class ThoughtService {
   }
 
   /**
+   * Resume the thought cycle after being paused by consecutive skips.
+   * Called when a new user message arrives. Resets skip counter and restarts the interval.
+   */
+  resume(): void {
+    if (!this.running) return;
+    if (this.intervalId) return; // already running
+
+    // Cancel any pending backoff
+    if (this.backoffTimeoutId) {
+      clearTimeout(this.backoffTimeoutId);
+      this.backoffTimeoutId = null;
+    }
+
+    this.consecutiveSkipCount = 0;
+    this.intervalId = setInterval(() => {
+      void this.tick();
+    }, this.checkIntervalMs);
+    void this.tick();
+    log.info("Thought cycle resumed by user interaction");
+  }
+
+  /**
    * Send a brief greeting on startup so the user immediately sees Soul is active.
    * Only sends if proactive messaging is configured.
    */
@@ -713,12 +735,30 @@ export class ThoughtService {
 
   /**
    * Apply exponential backoff when thoughts are repeatedly skipped or fail.
-   * Clears the current interval, waits with backoff, then resumes.
-   * Safe against concurrent calls — cancels any pending backoff first.
+   * After 3 consecutive skips, pauses the interval entirely until resume() is called
+   * (triggered by the next user message).
    */
   private applySkipBackoff(reason: string): void {
     this.consecutiveSkipCount++;
-    const backoffMinutes = Math.min(this.consecutiveSkipCount * 2, 30);
+
+    const MAX_CONSECUTIVE_SKIPS = 3;
+    if (this.consecutiveSkipCount >= MAX_CONSECUTIVE_SKIPS) {
+      log.info(`Skipping thought — ${reason} (skip #${this.consecutiveSkipCount}, pausing until next user message)`);
+
+      // Cancel any pending backoff
+      if (this.backoffTimeoutId) {
+        clearTimeout(this.backoffTimeoutId);
+        this.backoffTimeoutId = null;
+      }
+      // Stop the interval — resume() will restart it on next user message
+      if (this.intervalId) {
+        clearInterval(this.intervalId);
+        this.intervalId = null;
+      }
+      return;
+    }
+
+    const backoffMinutes = this.consecutiveSkipCount * 2;
     log.info(`Skipping thought — ${reason} (skip #${this.consecutiveSkipCount}, backing off ${backoffMinutes}m)`);
 
     // Cancel any pending backoff to prevent parallel intervals
