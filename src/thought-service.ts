@@ -812,10 +812,13 @@ export class ThoughtService {
   private isRepeatTopic(content: string): boolean {
     if (this.recentThoughtTopics.length === 0 || !content) return false;
 
+    // Use same truncation as topic storage (first 5 significant words) so
+    // the overlap ratio is comparable.
     const words = content
       .split(/[\s,，。.！!？?；;：:、]+/)
       .filter((w) => w.length >= 3)
-      .map((w) => w.toLowerCase());
+      .map((w) => w.toLowerCase())
+      .slice(0, 5);
     if (words.length === 0) return false;
 
     for (const recentTopic of this.recentThoughtTopics) {

@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.3.3 (2026-04-19)
+
+### Fixes
+
+- **Fix repeat topic detection mismatch**: `recentThoughtTopics` stored only the first 5 significant words, but `isRepeatTopic` compared against ALL words in new content. This made the overlap ratio too low (e.g. 5/15 = 33% < 40% threshold) and identical generic thoughts like "Nothing particular on my mind right now..." passed the dedup check every 5 minutes. Now both sides use the same first-5-word truncation
+
 ## 2.3.2 (2026-04-19)
 
 ### Fixes
