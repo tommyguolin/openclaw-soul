@@ -115,7 +115,7 @@ openclaw config set hooks.enabled true
 openclaw config set hooks.token your-secret-token
 
 # Allow the "message" tool — Soul uses this to deliver messages to you
-openclaw config set tools.alsoAllow message
+openclaw config set tools.alsoAllow '["message"]'
 ```
 
 ### 3. Restart gateway
