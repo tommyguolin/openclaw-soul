@@ -604,11 +604,37 @@ export class ThoughtService {
             `Thought: [${thought.type}] ${thought.trigger} - ${thought.content.slice(0, 80)}...`,
           );
 
-          // Skip if this thought overlaps significantly with a recent one
+          // Skip if this thought overlaps significantly with a recent one.
+          // Give one retry with a different opportunity type. If that also
+          // repeats, apply backoff to prevent infinite same-topic loops.
           if (this.isRepeatTopic(thought.content)) {
             thought = null;
-            this.applySkipBackoff("topic too similar");
-            return;
+            log.info("Skipping thought — topic too similar (will retry with different opportunity)");
+            // Try again with a different opportunity type
+            const remainingOpportunities = nonRepeatingOpportunities.filter(
+              (o) => o.type !== selectedOpportunity?.type,
+            );
+            if (remainingOpportunities.length > 0) {
+              selectedOpportunity = remainingOpportunities[0];
+              try {
+                thought = await generateIntelligentThought(ctx, {
+                  llmGenerator: this.llmGenerator,
+                  preferOpportunity: selectedOpportunity,
+                });
+                if (signal.aborted) { return; }
+                if (thought && this.isRepeatTopic(thought.content)) {
+                  log.info("Retry also repeated — backing off this tick");
+                  thought = null;
+                }
+              } catch {
+                thought = null;
+              }
+            }
+            if (!thought) {
+              // Both attempts hit the same topic — apply backoff to break the loop
+              this.applySkipBackoff("topic repeat (retry also repeated)");
+              return;
+            }
           }
 
           // Thought was novel — reset skip counter
