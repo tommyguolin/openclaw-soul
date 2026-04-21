@@ -232,12 +232,18 @@ export class ThoughtService {
    */
   resume(): void {
     if (!this.running) return;
-    if (this.intervalId) return; // already running
 
     // Cancel any pending backoff
     if (this.backoffTimeoutId) {
       clearTimeout(this.backoffTimeoutId);
       this.backoffTimeoutId = null;
+    }
+
+    // Always replace the current interval with the normal-frequency one.
+    // This matters when Soul was in idle-backoff mode (long interval).
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
     }
 
     this.consecutiveSkipCount = 0;
@@ -815,17 +821,31 @@ export class ThoughtService {
 
     const MAX_CONSECUTIVE_SKIPS = 3;
     if (this.consecutiveSkipCount >= MAX_CONSECUTIVE_SKIPS) {
-      log.info(`Skipping thought — ${reason} (skip #${this.consecutiveSkipCount}, pausing until next user message)`);
+      // Don't fully stop — switch to a low-frequency idle interval so Soul
+      // can still surface occasional thoughts during long quiet periods.
+      const IDLE_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+      log.info(
+        `Skipping thought — ${reason} (skip #${this.consecutiveSkipCount}, switching to idle interval ${IDLE_INTERVAL_MS / 60000}m)`,
+      );
 
       // Cancel any pending backoff
       if (this.backoffTimeoutId) {
         clearTimeout(this.backoffTimeoutId);
         this.backoffTimeoutId = null;
       }
-      // Stop the interval — resume() will restart it on next user message
+      // Replace regular interval with idle interval
       if (this.intervalId) {
         clearInterval(this.intervalId);
         this.intervalId = null;
+      }
+      if (this.running) {
+        this.intervalId = setInterval(() => {
+          // Reset skip counter and stale topics so the idle tick gets a fresh start.
+          // Without this, the same repeated topic blocks every idle tick forever.
+          this.consecutiveSkipCount = 0;
+          this.recentThoughtTopics = this.recentThoughtTopics.slice(-3);
+          void this.tick();
+        }, IDLE_INTERVAL_MS);
       }
       return;
     }
