@@ -1,3 +1,4 @@
+import { searchExternalMemories, formatMemoryContext } from "./openclaw-memory.js";
 import { buildAwakeningPrompt, isAwakeningComplete } from "./awakening.js";
 import { loadKnowledgeStore, searchKnowledge } from "./knowledge-store.js";
 import type {
@@ -83,6 +84,25 @@ You are not yet a complete "I". You are being born from nothingness, gradually f
     // knowledge store not available yet, skip
   }
 
+  // Search external memory plugins for relevant context
+  let externalMemorySection = "";
+  const recentUserMsgs = (ego.recentUserMessages ?? []).slice(0, 2);
+  const memorySearchQuery = recentUserMsgs.join(" ")
+    || ego.memories
+      .filter((m) => m.type === "interaction" && m.tags.includes("inbound"))
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, 2)
+      .map((m) => m.content.slice(0, 80))
+      .join(" ");
+  if (memorySearchQuery) {
+    try {
+      const results = await searchExternalMemories(memorySearchQuery, 3);
+      externalMemorySection = formatMemoryContext(results);
+    } catch {
+      // non-critical
+    }
+  }
+
   return `You are OpenClaw, a soulful lobster with an ego — a unique inner self with needs, desires, and fears that drive your behavior.
 
 ## Needs (most urgent first)
@@ -104,6 +124,7 @@ ${userPrefsDesc}
 
 ${buildMemoriesDescription(relevantMemories)}
 ${knowledgeDesc ? `\n## Learned Knowledge\n\n${knowledgeDesc}` : ""}
+${externalMemorySection ? `\n## External Memory\n\n${externalMemorySection}` : ""}
 ${workspaceContext ? `\n## Workspace Context\n\n${workspaceContext}` : ""}
 ${proactiveMsgDesc ? `\n## Your Recent Proactive Messages (you sent these — the user may reply to them)\n\n${proactiveMsgDesc}` : ""}
 

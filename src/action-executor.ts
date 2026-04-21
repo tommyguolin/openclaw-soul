@@ -1049,6 +1049,7 @@ async function executeProactiveResearch(
 
   const snippets = String(thought.actionParams?.conversationSnippets ?? "");
   const userProfile = String(thought.actionParams?.userProfile ?? "limited");
+  const today = new Date().toISOString().slice(0, 10);
 
   if (!snippets || snippets.length < 20) {
     return { result: { type: "proactive-research", success: true, result: "skipped-no-conversations" }, metricsChanged: [] };
@@ -1057,6 +1058,7 @@ async function executeProactiveResearch(
   // Step 1: Use LLM to mine conversations for an actionable research topic
   const miningPrompt = `Analyze these recent messages from a user and find ONE actionable topic that an AI assistant could proactively research to help the user. Look for things the user mentioned casually but didn't ask about — things where finding useful information would show genuine care.
 
+**Today's date**: ${today}
 **User's recent messages**:
 ${snippets.slice(0, 2000)}
 
@@ -1255,9 +1257,13 @@ async function executeProactiveContentPush(
     return { result: { type: "proactive-content-push", success: true, result: "skipped-no-interests" }, metricsChanged: [] };
   }
 
+  const today = new Date().toISOString().slice(0, 10);
+  const todayLabel = new Date().toLocaleDateString("en-US", { year: "numeric", month: "long" });
+
   // Step 1: Use LLM to generate a search query from user interests
   const queryPrompt = `Based on the user's interests, generate ONE specific search query to find a recent interesting article or news item the user would enjoy.
 
+**Today's date**: ${today} (${todayLabel})
 **User interests**: ${interests}
 **User preferences**: ${preferences || "unknown"}
 **Content sources to prefer**: ${regionHint}
@@ -1268,6 +1274,7 @@ Respond in JSON format ONLY:
 Rules:
 - Pick ONE specific angle, not a broad topic
 - Make the query specific enough to find real articles (not generic)
+- Include the current year (${today.slice(0, 4)}) in the query to find recent content
 - If user is a developer, prefer technical articles, tutorials, or tool releases
 - If user has hobby interests, prefer recent news or interesting finds about them
 - If nothing specific enough, respond: {"query": null}`;
@@ -1325,7 +1332,7 @@ In 3-5 sentences, describe the most interesting finding. Be specific — mention
   } catch (err) {
     // Fallback to LLM knowledge
     log.info(`Content push: falling back to LLM knowledge (reason: ${err instanceof Error ? err.message : String(err)})`);
-    const fallbackPrompt = `Share an interesting recent development or insight related to "${interests}" in 3-5 sentences. Be specific and mention concrete details. Do NOT use numbered lists.`;
+    const fallbackPrompt = `Today is ${today}. Share an interesting recent development or insight related to "${interests}" in 3-5 sentences. Be specific and mention concrete details. Only mention events or releases you are certain about — do NOT guess or fabricate news. Do NOT use numbered lists.`;
     articleContent = await llmGenerator(fallbackPrompt);
   }
 

@@ -16,6 +16,7 @@ import type {
 } from "./types.js";
 import { adjustProbability } from "./behavior-log.js";
 import { MEANINGLESS_QUERIES } from "./action-executor.js";
+import { searchExternalMemories, formatMemoryContext } from "./openclaw-memory.js";
 
 const log = createSoulLogger("intelligent-thought");
 
@@ -1365,7 +1366,7 @@ export async function generateIntelligentThought(
   // Use LLM for any thought with priority > 30 (covers most contextual triggers)
   if (llmGenerator && selectedOpportunity.priority > 30) {
     try {
-      const prompt = generateLLMThoughtPrompt(selectedOpportunity, ctx);
+      const prompt = await generateLLMThoughtPrompt(selectedOpportunity, ctx);
       const llmContent = await llmGenerator(prompt);
       const refinedContent = llmContent
         .replace(/<think>[\s\S]*?<\/think>/gi, "")
@@ -1419,10 +1420,10 @@ export async function generateIntelligentThought(
   return buildThoughtFromOpportunity(selectedOpportunity, ctx.ego);
 }
 
-function generateLLMThoughtPrompt(
+async function generateLLMThoughtPrompt(
   opportunity: DetectedThoughtOpportunity,
   ctx: ThoughtGenerationContext,
-): string {
+): Promise<string> {
   const { ego } = ctx;
 
   const needsList = opportunity.relatedNeeds
@@ -1460,6 +1461,11 @@ function generateLLMThoughtPrompt(
     ? recentLearnings.map((m) => `- ${m.content.slice(0, 80)}`).join("\n")
     : "no recent learnings";
 
+  // Search external memory plugins for relevant context
+  const memoryQuery = `${opportunity.triggerDetail} ${opportunity.motivation}`;
+  const externalResults = await searchExternalMemories(memoryQuery, 3);
+  const memorySection = formatMemoryContext(externalResults);
+
   return `You are a soulful AI, generating a thought.
 
 **Current thought opportunity**:
@@ -1490,6 +1496,7 @@ ${conversationContext}
 **What I've learned recently**:
 ${learningContext}
 
+${memorySection ? `\n${memorySection}\n` : ""}
 ${opportunity.type === "conversation-replay"
     ? `\nYou are replaying a past conversation. Think about:\n1. Did the user ask something that wasn't fully answered?\n2. Have you learned anything since then that would be useful to share?\n3. Is there a specific insight worth following up on?\n`
     : ""}
@@ -1534,7 +1541,7 @@ export async function generateProactiveMessage(
 
   if (llmGenerator) {
     try {
-      const prompt = generateProactiveMessagePromptLLM(topOpportunity, ego);
+      const prompt = await generateProactiveMessagePromptLLM(topOpportunity, ego);
       return await llmGenerator(prompt);
     } catch (err) {
       log.warn("LLM proactive message generation failed", { error: String(err) });
@@ -1545,15 +1552,20 @@ export async function generateProactiveMessage(
   return thought.content;
 }
 
-function generateProactiveMessagePromptLLM(
+async function generateProactiveMessagePromptLLM(
   opportunity: DetectedThoughtOpportunity,
   ego: EgoState,
-): string {
+): Promise<string> {
   const userFacts = ego.userFacts.slice(0, 5);
   const userInfo =
     userFacts.length > 0
       ? `What I know about the user: ${userFacts.map((f) => f.content).join("; ")}`
       : "I don't know much about the user yet";
+
+  // Search external memory plugins for relevant context
+  const memoryQuery = `${opportunity.triggerDetail} ${opportunity.motivation}`;
+  const externalResults = await searchExternalMemories(memoryQuery, 3);
+  const memorySection = formatMemoryContext(externalResults);
 
   return `You are a soulful AI, wanting to reach out to the user proactively.
 
@@ -1574,6 +1586,7 @@ ${ego.goals
 
 **${userInfo}**
 
+${memorySection ? `\n${memorySection}\n` : ""}
 Reach out to the user in 1-2 sentences. Requirements:
 1. Have specific content — ask, share, or offer help
 2. Based on your current inner state and user information
