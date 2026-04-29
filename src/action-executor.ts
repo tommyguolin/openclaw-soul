@@ -316,6 +316,7 @@ export async function executeThoughtAction(
       if (isDuplicateMessage(thought.content || thought.motivation || "")) {
         const minutesSince = Math.round((Date.now() - lastSend.timestamp) / (1000 * 60));
         log.info(`Skipping send-message: duplicate of pending message (${minutesSince}m ago)`);
+        lastActionTime[actionType] = Date.now(); // Update to prevent repeated duplicate checks
         return {
           result: { type: "send-message", success: true, result: "skipped-duplicate-pending" },
           metricsChanged: [],
@@ -339,6 +340,11 @@ export async function executeThoughtAction(
     e.behaviorLog = entries;
     return e;
   });
+
+  // CRITICAL FIX: Re-read store to get persisted entries for outcome tracking
+  // Otherwise markBehaviorOutcome won't find the entry (uses stale local reference)
+  const store = await loadEgoStore(resolveEgoStorePath());
+  entries = store.ego.behaviorLog ?? [];
 
   try {
     let actionResult: { result: ActionResult; metricsChanged: MetricDelta[] };
@@ -398,14 +404,42 @@ export async function executeThoughtAction(
           metricsChanged: [],
         };
     }
+    // Store result for outcome tracking
+    // Mark as success if we successfully determined not to act (skipped/cooldown are not failures)
+    const isNoOp = actionResult?.result?.result && /^skipped-|^cooldown$/.test(String(actionResult.result.result));
+    // Fix: properly check success value and pass complete ego object
+    const actionSuccess = actionResult?.result?.success;
+    const outcomeSuccess = actionSuccess !== undefined ? actionSuccess : isNoOp;
+    const egoWithLog: EgoState = { ...ego, behaviorLog: entries };
+    await markBehaviorOutcome(behaviorEntry.id, outcomeSuccess, egoWithLog);
     return { ...actionResult, behaviorEntryId: behaviorEntry.id };
   } catch (err) {
     log.error(`Action ${actionType} failed:`, String(err));
+    // Mark as failed due to error
+    await markBehaviorOutcome(behaviorEntry.id, false, ego ?? { behaviorLog: [] });
     return {
       result: { type: actionType, success: false, error: String(err) },
       metricsChanged: [],
       behaviorEntryId: behaviorEntry.id,
     };
+  }
+}
+
+/** Mark outcome in behavior entry and persist */
+async function markBehaviorOutcome(
+  entryId: string,
+  success: boolean,
+  ego: EgoState,
+): Promise<void> {
+  const entries = ego.behaviorLog ?? [];
+  const idx = entries.findIndex((e) => e.id === entryId);
+  if (idx >= 0) {
+    entries[idx].outcome = success ? "success" : "failed";
+    entries[idx].resolvedAt = Date.now();
+    await updateEgoStore(resolveEgoStorePath(), (e) => {
+      e.behaviorLog = entries;
+      return e;
+    });
   }
 }
 
@@ -1049,7 +1083,6 @@ async function executeProactiveResearch(
 
   const snippets = String(thought.actionParams?.conversationSnippets ?? "");
   const userProfile = String(thought.actionParams?.userProfile ?? "limited");
-  const today = new Date().toISOString().slice(0, 10);
 
   if (!snippets || snippets.length < 20) {
     return { result: { type: "proactive-research", success: true, result: "skipped-no-conversations" }, metricsChanged: [] };
@@ -1058,7 +1091,6 @@ async function executeProactiveResearch(
   // Step 1: Use LLM to mine conversations for an actionable research topic
   const miningPrompt = `Analyze these recent messages from a user and find ONE actionable topic that an AI assistant could proactively research to help the user. Look for things the user mentioned casually but didn't ask about — things where finding useful information would show genuine care.
 
-**Today's date**: ${today}
 **User's recent messages**:
 ${snippets.slice(0, 2000)}
 
@@ -1198,7 +1230,7 @@ Write 3-5 sentences as a natural message to the user. Rules:
   // Store research results in knowledge store
   try {
     const { addKnowledgeItem } = await import("./knowledge-store.js");
-    await addKnowledgeItem({
+    await addKnowledgeItem(undefined, {
       topic,
       content: researchContent.slice(0, 1000),
       source: usedWebSearch ? "web-search" : "reflection",
@@ -1210,7 +1242,6 @@ Write 3-5 sentences as a natural message to the user. Rules:
   }
 
   // Store as a soul memory
-  const { randomBytes } = await import("node:crypto");
   await addSoulMemoryToEgo({
     id: randomBytes(8).toString("hex"),
     type: "learning",
@@ -1257,13 +1288,9 @@ async function executeProactiveContentPush(
     return { result: { type: "proactive-content-push", success: true, result: "skipped-no-interests" }, metricsChanged: [] };
   }
 
-  const today = new Date().toISOString().slice(0, 10);
-  const todayLabel = new Date().toLocaleDateString("en-US", { year: "numeric", month: "long" });
-
   // Step 1: Use LLM to generate a search query from user interests
   const queryPrompt = `Based on the user's interests, generate ONE specific search query to find a recent interesting article or news item the user would enjoy.
 
-**Today's date**: ${today} (${todayLabel})
 **User interests**: ${interests}
 **User preferences**: ${preferences || "unknown"}
 **Content sources to prefer**: ${regionHint}
@@ -1274,7 +1301,6 @@ Respond in JSON format ONLY:
 Rules:
 - Pick ONE specific angle, not a broad topic
 - Make the query specific enough to find real articles (not generic)
-- Include the current year (${today.slice(0, 4)}) in the query to find recent content
 - If user is a developer, prefer technical articles, tutorials, or tool releases
 - If user has hobby interests, prefer recent news or interesting finds about them
 - If nothing specific enough, respond: {"query": null}`;
@@ -1332,7 +1358,7 @@ In 3-5 sentences, describe the most interesting finding. Be specific — mention
   } catch (err) {
     // Fallback to LLM knowledge
     log.info(`Content push: falling back to LLM knowledge (reason: ${err instanceof Error ? err.message : String(err)})`);
-    const fallbackPrompt = `Today is ${today}. Share an interesting recent development or insight related to "${interests}" in 3-5 sentences. Be specific and mention concrete details. Only mention events or releases you are certain about — do NOT guess or fabricate news. Do NOT use numbered lists.`;
+    const fallbackPrompt = `Share an interesting recent development or insight related to "${interests}" in 3-5 sentences. Be specific and mention concrete details. Do NOT use numbered lists.`;
     articleContent = await llmGenerator(fallbackPrompt);
   }
 
@@ -1392,7 +1418,7 @@ Write 3-5 sentences as a natural message sharing this find. Rules:
   // Store in knowledge
   try {
     const { addKnowledgeItem } = await import("./knowledge-store.js");
-    await addKnowledgeItem({
+    await addKnowledgeItem(undefined, {
       topic: topic ?? "content-push",
       content: articleContent.slice(0, 1000),
       source: "web-search",
@@ -1406,7 +1432,6 @@ Write 3-5 sentences as a natural message sharing this find. Rules:
 
   // Store as soul memory
   try {
-    const { randomBytes } = await import("node:crypto");
     await addSoulMemoryToEgo({
       id: randomBytes(8).toString("hex"),
       type: "learning",

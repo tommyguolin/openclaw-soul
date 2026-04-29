@@ -13,8 +13,8 @@ const log = createSoulLogger("behavior-log");
 /** Max entries to keep. Oldest are pruned during resolve cycles. */
 const MAX_ENTRIES = 200;
 
-/** How long before a "pending" entry is auto-expired (2 hours). */
-const PENDING_EXPIRY_MS = 2 * 60 * 60 * 1000;
+/** How long before a "pending" entry is auto-expired (8 hours - increased for long-running autonomous tasks). */
+const PENDING_EXPIRY_MS = 8 * 60 * 60 * 1000;
 
 /** Only consider entries from the last N days for success rate calculations. */
 const LOOKBACK_DAYS = 14;
@@ -54,6 +54,18 @@ export function markSuccess(entries: BehaviorEntry[], actionId: string): boolean
     entry.outcome = "success";
     entry.resolvedAt = Date.now();
     return true;
+  }
+  // Also try fuzzy match if exact id not found (handles sub-agent spawned tasks)
+  if (actionId && entries.length > 0) {
+    const fuzzyMatch = entries.find((e) => 
+      e.id.includes(actionId.slice(0, 6)) || 
+      actionId.includes(e.id.slice(0, 6))
+    );
+    if (fuzzyMatch && fuzzyMatch.outcome === "pending") {
+      fuzzyMatch.outcome = "success";
+      fuzzyMatch.resolvedAt = Date.now();
+      return true;
+    }
   }
   return false;
 }
@@ -141,6 +153,9 @@ export function getAllSuccessRates(entries: BehaviorEntry[]): ActionSuccessRate[
     "analyze-problem",
     "run-agent-task",
     "report-findings",
+    "observe-and-improve",
+    "proactive-research",
+    "proactive-content-push",
   ];
 
   return actionTypes.map((at) => getActionSuccessRate(at, entries));

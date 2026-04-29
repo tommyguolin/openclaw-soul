@@ -17,7 +17,7 @@ export async function searchExternalMemories(
 
   try {
     const { listMemoryCorpusSupplements } = await import(
-      "openclaw/plugin-sdk/memory-host-core"
+      "openclaw:plugin-sdk/memory-host-core"
     );
     const supplements = listMemoryCorpusSupplements();
     if (supplements.length === 0) return [];
