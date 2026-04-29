@@ -12,7 +12,20 @@ import {
   getAwakeningMessage,
 } from "./awakening.js";
 import { loadEgoStore, updateEgoStore, resolveEgoStorePath } from "./ego-store.js";
-import { generateIntelligentThought, detectThoughtOpportunities, llmReRankOpportunities } from "./intelligent-thought.js";
+import {
+  generateIntelligentThought,
+  detectThoughtOpportunities,
+  llmReRankOpportunities,
+  buildThoughtFromOpportunity,
+} from "./intelligent-thought.js";
+import { loadWorkspaceContext } from "./paths.js";
+import { pollActiveTasks as pollAutonomousTasks } from "./autonomous-actions.js";
+import { buildSoulSystemPrompt } from "./prompts.js";
+import {
+  recallMemories,
+  computeCurrentEmotion,
+  computeEmotionalNudge,
+} from "./memory-retrieval.js";
 import {
   analyzeSentiment,
   calculateEgoImpact,
@@ -20,7 +33,7 @@ import {
 } from "./sentiment-analysis.js";
 import type { SentimentResult } from "./sentiment-analysis.js";
 import { createSoulLLMGenerator, type LLMGenerator, type SoulLLMConfig } from "./soul-llm.js";
-import { generateThought, shouldGenerateThought, decayMetrics } from "./thought.js";
+import { shouldGenerateThought, decayMetrics } from "./thought.js";
 import { runExpiryCycle } from "./expiry.js";
 import type {
   EgoState,
@@ -33,31 +46,121 @@ import type {
   SoulMemory,
 } from "./types.js";
 import type { OpenClawSearchCompat } from "./soul-search.js";
+import { isLLMErrorContent } from "./llm-errors.js";
 
 const log = createSoulLogger("thought-service");
 
-/** Patterns that indicate LLM output is actually an error message, not real thought content. */
-const LLM_ERROR_PATTERNS = [
-  /request timed out before a response was generated/i,
-  /timed out before a response/i,
-  /overloaded.*try again/i,
-  /rate limit exceeded/i,
-  /too many requests/i,
-  /service temporarily unavailable/i,
-  /internal server error/i,
-  /server error/i,
-  /connection.*timed? ?out/i,
-  /failed to generate/i,
-  /please try again.*increase.*timeout/i,
-  /increase `?agents\.defaults\.timeoutSeconds`?/i,
-  /529/i,  // MiniMax overloaded
-];
-
-/** Check if text looks like an LLM error message rather than real content. */
-function isLLMErrorContent(text: string): boolean {
-  if (!text) return false;
-  return LLM_ERROR_PATTERNS.some((p) => p.test(text));
+/**
+ * Normalize thought content for topic-level dedup: lowercase, drop
+ * punctuation/whitespace. Truncated so similarity cost stays bounded.
+ */
+function normalizeForTopic(content: string): string {
+  return content
+    .toLowerCase()
+    .replace(/[\s\p{P}\p{S}]+/gu, "")
+    .slice(0, 120);
 }
+
+/** Return the set of overlapping 2-character windows in `text`. */
+function charBigrams(text: string): Set<string> {
+  const out = new Set<string>();
+  if (text.length < 2) return out;
+  // Iterate by code point so CJK / surrogate pairs are handled correctly.
+  const chars = Array.from(text);
+  for (let i = 0; i < chars.length - 1; i++) {
+    out.add(chars[i] + chars[i + 1]);
+  }
+  return out;
+}
+
+/**
+ * English technical keywords for interaction tagging.
+ * Matched with word boundaries to avoid false positives like "ai" in "main"
+ * or "ml" in "html". Keys are lowercased; values are the canonical tag.
+ */
+const EN_TECH_KEYWORDS: Record<string, string> = {
+  python: "python",
+  javascript: "javascript",
+  typescript: "typescript",
+  react: "react",
+  vue: "vue",
+  node: "nodejs",
+  docker: "docker",
+  kubernetes: "kubernetes",
+  k8s: "kubernetes",
+  aws: "aws",
+  gcp: "gcp",
+  azure: "azure",
+  linux: "linux",
+  macos: "macos",
+  windows: "windows",
+  database: "database",
+  redis: "redis",
+  postgres: "postgres",
+  mysql: "mysql",
+  mongodb: "mongodb",
+  api: "api",
+  rest: "rest-api",
+  graphql: "graphql",
+  ai: "ai",
+  ml: "machine-learning",
+  "machine learning": "machine-learning",
+  "deep learning": "deep-learning",
+  llm: "llm",
+  gpt: "gpt",
+  claude: "claude",
+  openai: "openai",
+  error: "error-handling",
+  bug: "bug",
+  debug: "debugging",
+  test: "testing",
+  deploy: "deployment",
+  "ci/cd": "ci-cd",
+  security: "security",
+  performance: "performance",
+  architecture: "architecture",
+  design: "design",
+  product: "product",
+  project: "project-management",
+};
+
+/** Precomputed boundary-aware regex for each English keyword. */
+const EN_TECH_PATTERNS: Array<[RegExp, string]> = Object.entries(EN_TECH_KEYWORDS).map(
+  ([keyword, tag]) => {
+    const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return [new RegExp(`\\b${escaped}\\b`), tag];
+  },
+);
+
+/**
+ * Chinese technical keywords. Substring match is correct here — Chinese
+ * has no word boundaries and shorter keywords aren't false-positive-prone
+ * the way short Latin tokens are.
+ */
+const CN_TECH_KEYWORDS: Record<string, string> = {
+  人工智能: "ai",
+  机器学习: "machine-learning",
+  深度学习: "deep-learning",
+  编程: "programming",
+  开发: "development",
+  算法: "algorithm",
+  数据库: "database",
+  服务器: "server",
+  前端: "frontend",
+  后端: "backend",
+  全栈: "fullstack",
+  运维: "devops",
+  测试: "testing",
+  部署: "deployment",
+  架构: "architecture",
+  设计: "design",
+  产品: "product",
+  项目: "project-management",
+  错误: "error-handling",
+  问题: "problem",
+  优化: "optimization",
+  安全: "security",
+};
 
 export type ThoughtHandler = (thought: Thought, ego: EgoState) => Promise<SoulActionResult>;
 
@@ -266,10 +369,18 @@ export class ThoughtService {
       return;
     }
 
-    const lang = ego.userLanguage === "zh-CN" ? "zh" : "en";
-    const hours = (ego.lastInteractionTime && ego.lastInteractionTime > 0)
+    // Only greet on first boot or after a long absence — otherwise frequent
+    // gateway restarts spam "Soul just woke up" at the user.
+    const STARTUP_GREETING_MIN_ABSENCE_HOURS = 12;
+    const isFirstBoot = !ego.lastInteractionTime;
+    const hours = ego.lastInteractionTime
       ? Math.floor((Date.now() - ego.lastInteractionTime) / (1000 * 60 * 60))
       : 0;
+    if (!isFirstBoot && hours < STARTUP_GREETING_MIN_ABSENCE_HOURS) {
+      return;
+    }
+
+    const lang = ego.userLanguage === "zh-CN" ? "zh" : "en";
     const timeContext = hours > 0
       ? (lang === "zh" ? `距离上次聊天已经${hours}小时了` : `it's been ${hours} hour${hours > 1 ? "s" : ""} since we last chatted`)
       : "";
@@ -382,7 +493,6 @@ export class ThoughtService {
     this.lastWorkspaceRefresh = now;
 
     try {
-      const { loadWorkspaceContext } = await import("./paths.js");
       const result = await loadWorkspaceContext(this.workspaceFiles);
       if (result.content && result.content !== this.workspaceContext) {
         this.workspaceContext = result.content;
@@ -398,7 +508,6 @@ export class ThoughtService {
    */
   async refreshWorkspaceContext(): Promise<void> {
     try {
-      const { loadWorkspaceContext } = await import("./paths.js");
       const result = await loadWorkspaceContext(this.workspaceFiles);
       this.workspaceContext = result.content;
       this.lastWorkspaceRefresh = Date.now();
@@ -726,10 +835,8 @@ export class ThoughtService {
           (o) => !this.isRepeatTopic(o.motivation || o.triggerDetail),
         );
         if (novelOpportunities.length > 0) {
-          const { buildThoughtFromOpportunity } = await import("./intelligent-thought.js");
           thought = buildThoughtFromOpportunity(novelOpportunities[0], ego);
         } else if (nonRepeatingOpportunities.length > 0) {
-          const { buildThoughtFromOpportunity } = await import("./intelligent-thought.js");
           thought = buildThoughtFromOpportunity(nonRepeatingOpportunities[0], ego);
         } else {
           // All opportunities exhausted — back off instead of generating random thoughts
@@ -766,15 +873,11 @@ export class ThoughtService {
       }
 
       // Track recent thought topics to prevent revisiting the same subject.
-      // Extract key words from content for topic-level dedup.
-      const topicWords = thought.content
-        .split(/[\s,，。.！!？?；;：:、]+/)
-        .filter((w) => w.length >= 3)
-        .map((w) => w.toLowerCase())
-        .slice(0, 5)
-        .join(" ");
-      if (topicWords) {
-        this.recentThoughtTopics.push(topicWords);
+      // Store a normalized form so isRepeatTopic can compute char-bigram
+      // similarity (works for CJK without whitespace and Latin alike).
+      const normalized = normalizeForTopic(thought.content);
+      if (normalized) {
+        this.recentThoughtTopics.push(normalized);
         if (this.recentThoughtTopics.length > 10) {
           this.recentThoughtTopics.shift();
         }
@@ -937,25 +1040,26 @@ export class ThoughtService {
 
   /**
    * Check if a thought's content overlaps significantly with recent thoughts.
-   * Returns true if >40% of meaningful words appear in a recent thought topic.
+   * Uses character-bigram Jaccard similarity so it works for both CJK
+   * (no whitespace) and Latin scripts. Returns true if any recent topic
+   * has Jaccard >= 0.4 with the new content.
    */
   private isRepeatTopic(content: string): boolean {
     if (this.recentThoughtTopics.length === 0 || !content) return false;
 
-    // Use same truncation as topic storage (first 5 significant words) so
-    // the overlap ratio is comparable.
-    const words = content
-      .split(/[\s,，。.！!？?；;：:、]+/)
-      .filter((w) => w.length >= 3)
-      .map((w) => w.toLowerCase())
-      .slice(0, 5);
-    if (words.length === 0) return false;
+    const incoming = charBigrams(normalizeForTopic(content));
+    if (incoming.size === 0) return false;
 
-    for (const recentTopic of this.recentThoughtTopics) {
-      const recentWords = recentTopic.split(" ");
-      const overlap = words.filter((w) => recentWords.includes(w)).length;
-      // If >40% of words overlap with a recent topic, it's a repeat
-      if (overlap / words.length > 0.4) return true;
+    for (const recent of this.recentThoughtTopics) {
+      const recentBigrams = charBigrams(recent);
+      if (recentBigrams.size === 0) continue;
+
+      let intersection = 0;
+      for (const b of incoming) {
+        if (recentBigrams.has(b)) intersection++;
+      }
+      const union = incoming.size + recentBigrams.size - intersection;
+      if (union > 0 && intersection / union >= 0.4) return true;
     }
     return false;
   }
@@ -964,8 +1068,7 @@ export class ThoughtService {
    * Poll active tasks — check result files, mark stale ones as completed, prune old ones.
    */
   private async pollActiveTasks(): Promise<void> {
-    const { pollActiveTasks: pollTasks } = await import("./autonomous-actions.js");
-    const completed = await pollTasks(this.storePath);
+    const completed = await pollAutonomousTasks(this.storePath);
     if (completed.length > 0) {
       log.info(`pollActiveTasks: ${completed.length} task(s) newly completed`);
     }
@@ -1237,7 +1340,6 @@ export class ThoughtService {
   }
 
   async getSystemPrompt(context?: string): Promise<string> {
-    const { buildSoulSystemPrompt } = await import("./prompts.js");
     const store = await loadEgoStore(this.storePath);
     const relevantMemories = context ? await this.recallRelevantMemories(context) : undefined;
     return buildSoulSystemPrompt(store.ego, context, relevantMemories, this.workspaceContext || undefined);
@@ -1265,7 +1367,6 @@ export class ThoughtService {
 
     const opportunities = detectThoughtOpportunities(ctx);
     if (opportunities.length > 0) {
-      const { buildThoughtFromOpportunity } = await import("./intelligent-thought.js");
       return buildThoughtFromOpportunity(opportunities[0], ego);
     }
 
@@ -1451,9 +1552,6 @@ export class ThoughtService {
     const memories = store.ego.memories;
     if (memories.length === 0) return [];
 
-    const { recallMemories, computeCurrentEmotion, computeEmotionalNudge } = await import(
-      "./memory-retrieval.js"
-    );
     const currentEmotion = computeCurrentEmotion(store.ego.needs);
     const result = recallMemories(context, memories, Date.now(), currentEmotion);
 
@@ -1626,7 +1724,9 @@ If there are no new preferences, return an empty array: []`;
 
   /**
    * Extract topic tags from conversation text using keyword matching.
-   * Falls back to simple word extraction if no keywords are matched.
+   * English keywords are matched with word boundaries to avoid false
+   * positives (e.g. "ai" in "main", "ml" in "html"). Chinese keywords
+   * are substring-matched since Chinese has no word boundaries.
    * Tags are used by conversation-replay analyzer to match conversations
    * with Soul's learned knowledge.
    */
@@ -1634,92 +1734,14 @@ If there are no new preferences, return an empty array: []`;
     const tags: string[] = [];
     const lower = text.toLowerCase();
 
-    // Technical keywords
-    const techKeywords: Record<string, string> = {
-      "python": "python",
-      "javascript": "javascript",
-      "typescript": "typescript",
-      "react": "react",
-      "vue": "vue",
-      "node": "nodejs",
-      "docker": "docker",
-      "kubernetes": "kubernetes",
-      "k8s": "kubernetes",
-      "aws": "aws",
-      "gcp": "gcp",
-      "azure": "azure",
-      "linux": "linux",
-      "macos": "macos",
-      "windows": "windows",
-      "database": "database",
-      "redis": "redis",
-      "postgres": "postgres",
-      "mysql": "mysql",
-      "mongodb": "mongodb",
-      "api": "api",
-      "rest": "rest-api",
-      "graphql": "graphql",
-      "ai": "ai",
-      "ml": "machine-learning",
-      "machine learning": "machine-learning",
-      "deep learning": "deep-learning",
-      "llm": "llm",
-      "gpt": "gpt",
-      "claude": "claude",
-      "openai": "openai",
-      "error": "error-handling",
-      "bug": "bug",
-      "debug": "debugging",
-      "test": "testing",
-      "deploy": "deployment",
-      "ci/cd": "ci-cd",
-      "security": "security",
-      "performance": "performance",
-      "architecture": "architecture",
-      "design": "design",
-      "product": "product",
-      "project": "project-management",
-    };
-
-    // Chinese technical keywords
-    const cnKeywords: Record<string, string> = {
-      "人工智能": "ai",
-      "机器学习": "machine-learning",
-      "深度学习": "deep-learning",
-      "编程": "programming",
-      "开发": "development",
-      "算法": "algorithm",
-      "数据库": "database",
-      "服务器": "server",
-      "前端": "frontend",
-      "后端": "backend",
-      "全栈": "fullstack",
-      "运维": "devops",
-      "测试": "testing",
-      "部署": "deployment",
-      "架构": "architecture",
-      "设计": "design",
-      "产品": "product",
-      "项目": "project-management",
-      "错误": "error-handling",
-      "问题": "problem",
-      "优化": "optimization",
-      "安全": "security",
-    };
-
-    for (const [keyword, tag] of Object.entries(techKeywords)) {
-      if (lower.includes(keyword)) {
-        tags.push(tag);
-      }
+    for (const [pattern, tag] of EN_TECH_PATTERNS) {
+      if (pattern.test(lower)) tags.push(tag);
     }
 
-    for (const [keyword, tag] of Object.entries(cnKeywords)) {
-      if (text.includes(keyword)) {
-        tags.push(tag);
-      }
+    for (const [keyword, tag] of Object.entries(CN_TECH_KEYWORDS)) {
+      if (text.includes(keyword)) tags.push(tag);
     }
 
-    // Deduplicate and limit
     return [...new Set(tags)].slice(0, 5);
   }
 

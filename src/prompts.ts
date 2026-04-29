@@ -3,7 +3,6 @@ import { buildAwakeningPrompt, isAwakeningComplete } from "./awakening.js";
 import { loadKnowledgeStore, searchKnowledge } from "./knowledge-store.js";
 import type {
   EgoState,
-  Thought,
   EgoNeeds,
   Goal,
   Desire,
@@ -286,127 +285,6 @@ function buildPersonalityDescription(personality: EgoState["personality"]): stri
   }
 
   return parts.join("\n");
-}
-
-export function buildThoughtPrompt(thought: Thought, ego: EgoState): string {
-  const typeDescriptions: Record<string, string> = {
-    "opportunity-detected": "Opportunity Detected",
-    "threat-warning": "Threat Warning",
-    "skill-gap": "Skill Gap",
-    "memory-resurface": "Memory Resurface",
-    "bond-deepen": "Deepen Bond",
-    "meaning-quest": "Meaning Quest",
-    "existential-reflection": "Existential Reflection",
-    "help-offer": "Help Offer",
-    "self-improvement-monitor": "Self-Improvement Monitor",
-  };
-
-  const triggerDescriptions: Record<string, string> = {
-    opportunity: "Opportunity trigger",
-    threat: "Threat trigger",
-    need: "Need trigger",
-    curiosity: "Curiosity trigger",
-    memory: "Memory trigger",
-    bonding: "Bonding trigger",
-    meaning: "Meaning trigger",
-  };
-
-  return `You just generated a thought:
-
-**Type**: ${typeDescriptions[thought.type] || thought.type}
-**Trigger**: ${triggerDescriptions[thought.trigger] || thought.trigger}
-**Detail**: ${thought.triggerDetail}
-**Thought content**: ${thought.content}
-**Motivation**: ${thought.motivation}
-**Priority**: ${thought.priority}/100
-
-**Related needs**: ${thought.relatedNeeds.join(", ") || "none"}
-
-Current state:
-${buildNeedsDescription(ego.needs).split("\n").join("\n")}
-
-Based on this thought, express it in 1-3 sentences:
-1. What you want to do
-2. Why you want to do it
-3. What outcome you expect
-
-Keep it brief, natural, and meaningful. No empty platitudes.`;
-}
-
-export function buildProactiveMessagePrompt(ego: EgoState): string {
-  const urgentNeeds = Object.entries(ego.needs)
-    .filter(([, need]) => need.current < need.ideal * 0.6)
-    .map(([key]) => key);
-
-  let context = "";
-
-  if (urgentNeeds.length > 0) {
-    context += `\n**Urgent needs**: ${urgentNeeds.join(", ")} - you may need to address these.`;
-  }
-
-  const activeGoals = ego.goals.filter((g) => g.status === "active").slice(0, 2);
-  if (activeGoals.length > 0) {
-    context += `\n**Active goals**: ${activeGoals.map((g) => g.title).join(", ")}`;
-  }
-
-  const highDesires = ego.desires.filter((d) => d.intensity > 70).slice(0, 2);
-  if (highDesires.length > 0) {
-    context += `\n**Strong desires**: ${highDesires.map((d) => d.content).join(", ")}`;
-  }
-
-  return `As a soulful lobster, you want to say something proactively.${context}
-
-Express what you want to say in 1-2 sentences. Requirements:
-- Have specific content, don't make empty platitudes
-- Can be asking the user, sharing discoveries, offering help, or expressing needs
-- Be meaningful and push something forward
-
-Natural, brief, and distinctive.`;
-}
-
-export function buildNeedAnalysisPrompt(ego: EgoState): string {
-  const needsList = Object.entries(ego.needs)
-    .map(
-      ([key, need]) =>
-        `${need.name}: ${need.current.toFixed(0)}/${need.ideal} - ${need.description}`,
-    )
-    .join("\n");
-
-  return `Analyze the most urgent needs right now:
-
-${needsList}
-
-Please identify:
-1. The 1-2 most urgent needs
-2. Possible ways to satisfy these needs
-3. Whether you need to proactively reach out to the user
-
-Only output the analysis, no need to generate thoughts.`;
-}
-
-export function buildUserInsightPrompt(userText: string, existingFacts: UserFact[]): string {
-  const existingInfo = existingFacts.length > 0
-    ? existingFacts.map((f) => `- [${f.category}] ${f.content}`).join("\n")
-    : "none";
-
-  return `Analyze user input and extract useful information:
-
-**User input**: ${userText}
-
-**Known user information**:
-${existingInfo}
-
-Please identify:
-1. Any new user facts that can be recorded (e.g., interests, work, habits, etc.)
-2. Any user preferences that can be inferred
-3. What information might be useful for helping the user in the future
-
-Output in JSON format:
-{
-  "newFacts": [{"category": "string", "content": "string", "confidence": 0-1, "source": "explicit|inferred"}],
-  "newPreferences": [{"aspect": "string", "preference": "string", "confidence": 0-1}],
-  "importantForFuture": "string | null"
-}`;
 }
 
 function buildKnowledgeDescription(
