@@ -298,6 +298,7 @@ export function buildThoughtPrompt(thought: Thought, ego: EgoState): string {
     "meaning-quest": "Meaning Quest",
     "existential-reflection": "Existential Reflection",
     "help-offer": "Help Offer",
+    "self-improvement-monitor": "Self-Improvement Monitor",
   };
 
   const triggerDescriptions: Record<string, string> = {

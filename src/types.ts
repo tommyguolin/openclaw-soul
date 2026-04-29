@@ -14,7 +14,8 @@ export type ThoughtType =
   | "learn-topic"
   | "search-web"
   | "reflect-on-memory"
-  | "conversation-replay";
+  | "conversation-replay"
+  | "self-improvement-monitor";
 
 export type ActionType =
   | "none"

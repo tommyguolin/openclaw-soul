@@ -805,23 +805,31 @@ function analyzeContextualTriggers(ctx: ThoughtGenerationContext): DetectedThoug
   // --- Self-improvement goal trigger ---
   // When user has assigned Soul a self-improvement goal, generate opportunities
   // to observe and improve itself via the agent.
+  const IMPROVE_RE = /优化|improve|self|自主|观察|self-improvement|助理/i;
   const improvementGoals = ego.goals.filter(
-    (g) => g.status === "active" &&
-      /优化|improve|self|自主|观察|self-improvement|助理/i.test(g.title + g.description),
+    (g) => g.status === "active" && IMPROVE_RE.test(g.title + g.description),
   );
-  if (improvementGoals.length > 0) {
-    // Keep at moderate priority so message-sending actions (send-message,
-    // proactive-research, etc.) can still be picked. The cooldown in
-    // action-executor prevents runaway self-modification.
-    const basePriority = hasConversationReplay ? 45 : 50;
+  // Also check userFacts/userPreferences for self-improvement directives
+  const hasImproveFact = (ego.userFacts ?? []).some(
+    (f) => f.confidence >= 0.8 && /优化|observe.*log|自主|self.?improv|proactive.*optim/i.test(f.content),
+  );
+  const hasImprovePref = (ego.userPreferences ?? []).some(
+    (p) => p.confidence >= 0.8 && /优化|improve|self.?improv/i.test(p.preference),
+  );
+
+  if (improvementGoals.length > 0 || hasImproveFact || hasImprovePref) {
+    // Priority must beat memory-resurface (65) to make top 8 candidates.
+    // The 4-hour cooldown in action-executor prevents runaway.
+    const basePriority = 75;
+    const goalTitle = improvementGoals[0]?.title ?? "self-improvement directive from user";
     opportunities.push({
-      type: "opportunity-detected",
+      type: "self-improvement-monitor",
       trigger: "opportunity",
-      triggerDetail: `Active self-improvement goal: ${improvementGoals[0].title}`,
+      triggerDetail: `Active self-improvement goal: ${goalTitle}`,
       priority: basePriority,
       source: "system-monitor",
       relatedNeeds: ["growth", "meaning"],
-      motivation: `I have an active goal to improve myself: ${improvementGoals[0].title}`,
+      motivation: `I have an active goal to improve myself: ${goalTitle}`,
       suggestedAction: "observe-and-improve",
     });
   }
@@ -945,6 +953,12 @@ function getThoughtContentForOpportunity(
   const needName = need?.name || "a certain";
 
   switch (opportunity.type) {
+    case "self-improvement-monitor":
+      return {
+        content: `I have a self-improvement goal active — time to observe my logs and find things to optimize`,
+        expectedOutcome: "Identify issues in my own behavior and fix them",
+      };
+
     case "opportunity-detected":
       if (opportunity.relatedNeeds.includes("connection")) {
         return {
@@ -1162,6 +1176,11 @@ function determineActionForOpportunity(
   }
 
   // --- Standard action routing ---
+
+  // self-improvement-monitor: route to observe-and-improve for self-optimization
+  if (type === "self-improvement-monitor") {
+    return { actionType: "observe-and-improve" };
+  }
 
   if (
     type === "skill-gap" ||

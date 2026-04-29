@@ -1,6 +1,8 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync, unlinkSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { createSoulLogger } from "./logger.js";
 import { invokeGatewayTool, fireAgentTask, isWriteTool } from "./gateway-client.js";
 import { isGoodTimeForMessage } from "./action-executor.js";
@@ -548,8 +550,53 @@ Output ONLY the message, nothing else.`;
 }
 
 // ---------------------------------------------------------------------------
-// executeObserveAndImprove — self-improvement via agent with write access
+// executeObserveAndImprove — analyze and fix code in any project
 // ---------------------------------------------------------------------------
+
+const SOUL_SRC_DIR = "/root/.openclaw/extensions/soul/src";
+
+// Files that must NOT be auto-modified (entry points, type definitions)
+const PROTECTED_FILES = new Set(["index.ts", "types.ts", "paths.ts", "logger.ts"]);
+
+const SOURCE_EXTENSIONS = [".ts", ".js", ".py", ".go", ".rs", ".java", ".c", ".cpp", ".rb"];
+
+/**
+ * Resolve the target project directory from ego goals.
+ * Looks for goals containing a file path (starts with / or ~/).
+ * Falls back to Soul's own src dir for self-improvement.
+ */
+function resolveTargetProject(ego: EgoState): { dir: string; name: string; isSelf: boolean } {
+  // Check goals for project paths
+  const pathRe = /(?:^|\s|["'`])(\/[\w/.@-]+(?:\/src|\/lib)?)(?:["'`\s,.]|$)/;
+  for (const goal of ego.goals ?? []) {
+    if (goal.status !== "active") continue;
+    const m = goal.title.match(pathRe) || goal.description?.match(pathRe);
+    if (m) {
+      const dir = m[1].startsWith("~") ? m[1].replace("~", process.env.HOME || "/root") : m[1];
+      return { dir, name: goal.title.slice(0, 60), isSelf: false };
+    }
+  }
+  // Check userFacts for project paths
+  for (const fact of ego.userFacts ?? []) {
+    const m = fact.content.match(pathRe);
+    if (m) {
+      const dir = m[1].startsWith("~") ? m[1].replace("~", process.env.HOME || "/root") : m[1];
+      return { dir, name: `user directive: ${fact.content.slice(0, 60)}`, isSelf: false };
+    }
+  }
+  return { dir: SOUL_SRC_DIR, name: "Soul plugin (self-improvement)", isSelf: true };
+}
+
+/** Get all source files in a directory (excluding protected files). */
+function getSourceFiles(dir: string): string[] {
+  try {
+    return readdirSync(dir)
+      .filter((f) => SOURCE_EXTENSIONS.some((ext) => f.endsWith(ext)) && !PROTECTED_FILES.has(f))
+      .sort();
+  } catch {
+    return [];
+  }
+}
 
 export async function executeObserveAndImprove(
   thought: Thought,
@@ -559,107 +606,192 @@ export async function executeObserveAndImprove(
   if (!options.autonomousActions) {
     return { result: { type: "observe-and-improve", success: false, error: "autonomousActions not enabled" }, metricsChanged: [] };
   }
-  if (!options.hooksToken) {
-    return { result: { type: "observe-and-improve", success: false, error: "No hooks token" }, metricsChanged: [] };
+  if (!options.llmGenerator) {
+    return { result: { type: "observe-and-improve", success: false, error: "No LLM generator" }, metricsChanged: [] };
   }
 
-  // Only 1 concurrent agent task allowed
-  const activeAgentTasks = (ego.activeTasks ?? []).filter(
-    (t) => t.status === "in-progress" && t.requiresWritePermission,
+  // Only 1 concurrent improvement task
+  const activeImprove = (ego.activeTasks ?? []).filter(
+    (t) => t.status === "in-progress" && t.title?.includes("improvement"),
   ).length;
-  if (activeAgentTasks >= 1) {
-    return { result: { type: "observe-and-improve", success: false, error: "Agent task already running" }, metricsChanged: [] };
+  if (activeImprove >= 1) {
+    return { result: { type: "observe-and-improve", success: false, error: "Improvement task already running" }, metricsChanged: [] };
   }
 
-  // Gather context: recent analysis results
-  const recentAnalyses = (ego.activeTasks ?? [])
-    .filter((t) => t.status === "completed" && t.result)
-    .slice(-3)
-    .map((t) => t.result)
-    .join("\n\n");
+  // Resolve target project from goals
+  const target = resolveTargetProject(ego);
+  const taskId = randomBytes(4).toString("hex");
 
-  const soulDir = "/root/.openclaw/extensions/soul";
-  const userContext = ego.userFacts.slice(0, 5).map((f) => `[${f.category}] ${f.content}`).join("\n");
-
-  // Create task first to get ID for result file path
+  // Persist task as in-progress
   const task: AutonomousTask = {
-    id: randomBytes(4).toString("hex"),
-    title: "Self-improvement: observe and fix",
-    description: "Autonomous code improvement task",
+    id: taskId,
+    title: `Improvement: ${target.name}`,
+    description: `Code analysis and improvement for ${target.dir}`,
     status: "in-progress",
     createdAt: Date.now(),
     updatedAt: Date.now(),
     sourceThoughtId: thought.id,
     steps: [],
-    requiresWritePermission: true,
+    requiresWritePermission: false,
     resultDelivered: false,
   };
-
-  mkdirSync("/tmp/soul-results", { recursive: true });
-  const resultFilePath = `/tmp/soul-results/${task.id}.md`;
-
-  const prompt = `[Soul Self-Improvement Task]
-
-You are a TypeScript developer tasked with improving the Soul plugin at ${soulDir}.
-
-**IMPORTANT**: This is an AUTONOMOUS task. No one will reply to you. Do NOT ask for confirmation or permission — just read, analyze, and act. Start working immediately.
-
-**User's goal**: Make Soul a proactive, human-like assistant that can observe, analyze, and fix issues autonomously.
-
-**Recent analysis findings**:
-${recentAnalyses || "No recent analyses."}
-
-**User profile**:
-${userContext || "Limited user info."}
-
-**Your task**:
-1. Read the Soul plugin source files in ${soulDir}/src/ to understand current state
-2. Identify ONE specific, concrete improvement that would make Soul more helpful
-3. Implement the fix — edit the relevant file(s)
-4. Verify the fix doesn't break anything (check for syntax errors, import issues)
-
-**Safety rules**:
-- **Always read a file before editing it** — use the read tool first
-- **CRITICAL for edit tool**: Copy oldText VERBATIM from the read output. Do NOT retype, paraphrase, or modify it — paste it character-for-character including all whitespace, indentation, and newlines. If the edit fails with "Could not find", re-read the file and copy the exact text again
-- Keep oldText small (3-10 lines) — target only the lines you need to change
-- Only modify files in ${soulDir}/
-- Make small, focused changes (one improvement per run)
-- Never delete existing functionality — only add or improve
-- If uncertain, don't make changes — just report what you'd like to improve
-- Do NOT modify package.json, openclaw.plugin.json, or index.ts entry point
-- After changes, verify TypeScript compiles: run \`npx tsc --noEmit\` in ${soulDir}/
-
-**CRITICAL**: After completing your work, write a summary of your findings and changes to:
-${resultFilePath}
-Format: 1-2 sentences describing what you found/changed and why.`;
-
-  const fireResult = await fireAgentTask({
-    message: prompt,
-    gatewayPort: options.gatewayPort,
-    hooksToken: options.hooksToken,
-    timeoutSeconds: 600,
-  });
-
-  if (!fireResult.ok) {
-    return { result: { type: "observe-and-improve", success: false, error: fireResult.error }, metricsChanged: [] };
-  }
-
-  task.resultFilePath = resultFilePath;
   await persistTask(task);
 
-  log.info(`Fired self-improvement agent task ${task.id}, runId=${fireResult.runId}`);
+  log.info(`Improvement task targeting: ${target.dir} (${target.name})`);
+
+  // --- Gather behavior stats (only relevant for self-improvement) ---
+  const blog = ego.behaviorLog ?? [];
+  const totalActions = blog.length;
+  const expiredCount = blog.filter((b) => b.outcome === "expired").length;
+  const successCount = blog.filter((b) => b.outcome === "success").length;
+  const actionStatsText = target.isSelf
+    ? `**Behavior stats** (last ${totalActions} actions): ${expiredCount} expired, ${successCount} success (${Math.round(expiredCount / Math.max(totalActions, 1) * 100)}% failure rate).`
+    : "";
+
+  // --- Read source files ---
+  const allFiles = getSourceFiles(target.dir);
+  const fileContents: string[] = [];
+  for (const fname of allFiles) {
+    const step = await readLocalFile("read-source", `${target.dir}/${fname}`);
+    if (step.success && step.output) {
+      fileContents.push(`=== ${fname} ===\n${step.output.slice(0, 4000)}`);
+    }
+  }
+
+  log.info(`Improvement: read ${fileContents.length}/${allFiles.length} source files from ${target.dir}`);
+
+  if (fileContents.length === 0) {
+    await completeTask(taskId, `No source files found in ${target.dir}`);
+    return { result: { type: "observe-and-improve", success: false, error: `No source files found in ${target.dir}` }, metricsChanged: [] };
+  }
+
+  // --- Recent analysis context ---
+  const recentAnalyses = (ego.activeTasks ?? [])
+    .filter((t) => t.status === "completed" && t.result && t.id !== taskId)
+    .slice(-2)
+    .map((t) => t.result)
+    .join("\n\n");
+
+  // --- User context ---
+  const userContext = ego.userFacts.slice(0, 5).map((f) => `[${f.category}] ${f.content}`).join("\n");
+
+  // --- LLM analysis ---
+  const fileNames = allFiles.join(", ");
+  const projectDesc = target.isSelf
+    ? "This is the Soul plugin itself — an autonomous AI agent with ego, thoughts, and actions."
+    : `This is project at ${target.dir}.`;
+  const analysisPrompt = `You are a developer analyzing source code to find and fix real problems.
+${projectDesc}
+
+${actionStatsText}
+
+**User context**:
+${userContext || "Limited user info."}
+
+**Previous findings**:
+${recentAnalyses || "None."}
+
+**Available source files**: ${fileNames}
+
+**Source code**:
+${fileContents.join("\n\n")}
+
+Based on the code and context above, identify ONE concrete, small improvement. Output EXACTLY this JSON (no markdown, raw JSON only):
+\x7B"problem":"one sentence describing the problem","file":"filename","oldCode":"exact code to replace","newCode":"replacement code","explanation":"why this fix helps"\x7D
+
+Rules:
+- oldCode must be VERBATIM from the source above — copy it exactly character for character
+- Keep changes to 1-5 lines max
+- Only fix real bugs, logic errors, or clear inefficiencies
+- Prefer fixing high-impact issues
+- If nothing clearly needs fixing, set oldCode and newCode to empty strings`;
+
+  let analysisResult: string;
+  let fixApplied = false;
+  let fixDescription = "";
+
+  try {
+    const llmResponse = await options.llmGenerator(analysisPrompt);
+    analysisResult = llmResponse;
+
+    // Strip markdown code blocks first (LLM often wraps JSON in ```json ... ```)
+    const stripped = llmResponse.replace(/```(?:json)?\s*/g, "").replace(/```\s*/g, "");
+
+    // Extract fields by name boundaries
+    const fileMatch = stripped.match(/"file"\s*:\s*"([^"]+)"/);
+    const oldCodeMatch = stripped.match(/"oldCode"\s*:\s*"([\s\S]*?)"\s*,\s*"newCode"/);
+    const newCodeMatch = stripped.match(/"newCode"\s*:\s*"([\s\S]*?)"\s*,\s*"explanation"/);
+    const problemMatch = stripped.match(/"problem"\s*:\s*"([\s\S]*?)"\s*,\s*"file"/);
+    const explanationMatch = stripped.match(/"explanation"\s*:\s*"([\s\S]*?)"\s*[}\n]/);
+
+    if (fileMatch && oldCodeMatch && newCodeMatch) {
+      try {
+        const fixFile = fileMatch[1];
+        const oldCode = oldCodeMatch[1].replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\"/g, '"');
+        const newCode = newCodeMatch[1].replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\"/g, '"');
+        const problem = problemMatch ? problemMatch[1] : "unknown";
+        const explanation = explanationMatch ? explanationMatch[1] : "";
+
+        // Skip protected files
+        if (PROTECTED_FILES.has(fixFile)) {
+          fixDescription = `Fix not applied: ${fixFile} is a protected file`;
+        } else {
+          const fullPath = `${target.dir}/${fixFile}`;
+          const content = await readFile(fullPath, "utf-8");
+
+          if (content.includes(oldCode)) {
+            const newContent = content.replace(oldCode, newCode);
+            writeFileSync(fullPath, newContent);
+
+            fixApplied = true;
+            fixDescription = `Fixed ${fixFile}: ${explanation || problem}`;
+            log.info(`Applied improvement fix to ${target.dir}/${fixFile}: ${problem}`);
+          } else {
+            fixDescription = `Fix not applied: oldCode not found verbatim in ${fixFile}`;
+          }
+        }
+      } catch (parseErr) {
+        fixDescription = `Fix parse failed: ${String(parseErr)}`;
+      }
+    }
+  } catch (err) {
+    analysisResult = `LLM analysis failed: ${String(err)}`;
+    log.warn(`Improvement LLM call failed: ${String(err)}`);
+  }
+
+  log.info(`Improvement analysis done: fixApplied=${fixApplied}, ${fixDescription || "no fix"}`);
+
+  const result = fixApplied
+    ? fixDescription
+    : `Analysis of ${target.dir}. ${fixDescription || "No concrete fix identified."} ${analysisResult.slice(0, 300)}`;
+
+  await completeTask(taskId, result);
 
   return {
     result: {
       type: "observe-and-improve",
       success: true,
-      result: `Self-improvement task started, runId=${fireResult.runId}`,
+      result: result.slice(0, 500),
     },
     metricsChanged: [
-      { need: "growth", delta: 15, reason: "self-improvement initiative" },
-      { need: "meaning", delta: 10, reason: "working on user's assigned goal" },
+      { need: "growth", delta: fixApplied ? 20 : 10, reason: fixApplied ? "applied improvement fix" : "code analysis" },
+      { need: "meaning", delta: fixApplied ? 15 : 8, reason: "working on user's assigned goal" },
     ],
   };
+}
+
+async function completeTask(taskId: string, result: string): Promise<void> {
+  await updateEgoStore(resolveEgoStorePath(), (e) => {
+    const t = (e.activeTasks ?? []).find((at) => at.id === taskId);
+    if (t) {
+      t.status = "completed";
+      t.result = result;
+      t.completedAt = Date.now();
+      t.updatedAt = Date.now();
+      t.resultDelivered = false;
+    }
+    return e;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -680,6 +812,48 @@ function makeSkippedStep(action: string, reason: string): TaskStep {
  * Extract meaningful keywords from text for similarity comparison.
  * Filters out common stop words and short tokens.
  */
+/**
+ * Try to extract the sub-agent's final assistant message from recent session files.
+ * This is a fallback when the agent doesn't write the result file.
+ * Looks for sessions created after `sinceMs` that contain "Soul-Autonomous".
+ */
+function extractResultFromSessions(sinceMs: number): string | null {
+  const sessionsDir = join(homedir(), ".openclaw/agents/main/sessions");
+  try {
+    const files = readdirSync(sessionsDir);
+    for (const name of files) {
+      if (!name.endsWith(".jsonl")) continue;
+      const fp = join(sessionsDir, name);
+      const stat = statSync(fp);
+      // Only check sessions modified after the task was created
+      if (stat.mtimeMs < sinceMs - 60_000) continue;
+      const content = readFileSync(fp, "utf-8");
+      if (!content.includes("Soul-Autonomous")) continue;
+      // Find last assistant text message
+      let lastAssistantText = "";
+      for (const line of content.split("\n")) {
+        try {
+          const obj = JSON.parse(line.trim());
+          if (obj.type === "message" && obj.message?.role === "assistant") {
+            const mc = obj.message.content;
+            if (Array.isArray(mc)) {
+              for (const c of mc) {
+                if (c.type === "text" && c.text && c.text.trim().length > 20) {
+                  lastAssistantText = c.text.trim();
+                }
+              }
+            }
+          }
+        } catch { /* skip malformed lines */ }
+      }
+      if (lastAssistantText) {
+        return lastAssistantText.slice(0, 1000);
+      }
+    }
+  } catch { /* sessions dir not accessible */ }
+  return null;
+}
+
 function extractKeywords(text: string): string[] {
   const stopWords = new Set([
     "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
@@ -780,7 +954,7 @@ async function persistTask(task: AutonomousTask): Promise<void> {
  * Returns list of newly completed tasks (with results from file capture).
  */
 export async function pollActiveTasks(storePath: string): Promise<AutonomousTask[]> {
-  const STALE_MS = 15 * 60 * 1000; // 15 minutes
+  const STALE_MS = 30 * 60 * 1000; // 30 minutes
   const MAX_TASKS = 20;
   const newlyCompleted: AutonomousTask[] = [];
 
@@ -806,7 +980,20 @@ export async function pollActiveTasks(storePath: string): Promise<AutonomousTask
         } catch { /* file not ready yet */ }
       }
 
-      // Fallback: stale timeout
+      // Fallback: try to extract result from session files
+      if (!task.result && task.requiresWritePermission) {
+        const sessionResult = extractResultFromSessions(task.createdAt);
+        if (sessionResult) {
+          task.result = sessionResult;
+          task.status = "completed";
+          task.completedAt = Date.now();
+          task.updatedAt = Date.now();
+          newlyCompleted.push({ ...task });
+          continue;
+        }
+      }
+
+      // Final fallback: stale timeout
       if (Date.now() - task.updatedAt > STALE_MS) {
         task.status = "completed";
         task.result = task.result ?? "Task timed out (stale >10 min)";

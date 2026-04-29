@@ -119,6 +119,7 @@ export class ThoughtService {
   private static readonly MIN_LLM_INTERVAL_MS = 10_000; // 10s between Soul LLM calls
   private thoughtAbortController: AbortController | null = null;
   private thoughtInProgress = false;
+  private selfImprovementGoalSynced = false;
 
   constructor(options: ThoughtServiceOptions = {}) {
     this.storePath = resolveEgoStorePath(options.storePath);
@@ -307,6 +308,7 @@ export class ThoughtService {
       await this.applyDecay();
       await this.runExpiryIfDue();
       await this.resolveStalePendingEntries();
+      await this.syncSelfImprovementGoal();
       await this.maybeRefreshWorkspaceContext();
       await this.flushPendingMessage();
       await this.pollActiveTasks();
@@ -314,6 +316,61 @@ export class ThoughtService {
     } catch (err) {
       log.error("Error in thought service tick", String(err));
     }
+  }
+
+  /**
+   * Detect userFacts about self-improvement tasks (e.g. 终极任务) and
+   * ensure a matching Goal exists so observe-and-improve can trigger.
+   * Runs once per boot; skips if goal already present.
+   */
+  private async syncSelfImprovementGoal(): Promise<void> {
+    if (this.selfImprovementGoalSynced) return;
+
+    const store = await loadEgoStore(this.storePath);
+    const ego = store.ego;
+
+    // Check if a matching goal already exists
+    const IMPROVE_RE = /优化|improve|self|自主|观察|self-improvement|助理/i;
+    const hasGoal = ego.goals.some(
+      (g) => g.status === "active" && IMPROVE_RE.test(g.title + g.description),
+    );
+    if (hasGoal) {
+      this.selfImprovementGoalSynced = true;
+      return;
+    }
+
+    // Check if userFacts indicate a self-improvement directive
+    const hasSelfImproveFact = (ego.userFacts ?? []).some(
+      (f) =>
+        f.confidence >= 0.8 &&
+        /优化|observe.*log|自主|self.?improv|proactive.*optim/i.test(f.content),
+    );
+
+    if (!hasSelfImproveFact) {
+      this.selfImprovementGoalSynced = true;
+      return;
+    }
+
+    // Create the goal
+    await updateEgoStore(this.storePath, (e) => {
+      // Double-check inside lock
+      if (e.goals.some((g) => g.status === "active" && IMPROVE_RE.test(g.title + g.description))) {
+        return e;
+      }
+      e.goals.push({
+        id: "goal-self-improve",
+        title: "Self-Improve",
+        description: "Observe own logs, analyze problems, and proactively optimize Soul plugin code and behavior",
+        progress: 0,
+        status: "active",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      return e;
+    });
+
+    log.info("Created goal-self-improve from userFacts directive");
+    this.selfImprovementGoalSynced = true;
   }
 
   /**
@@ -945,7 +1002,8 @@ export class ThoughtService {
 
       if (
         result.thought.type === "opportunity-detected" ||
-        result.thought.type === "help-offer"
+        result.thought.type === "help-offer" ||
+        result.thought.type === "self-improvement-monitor"
       ) {
         ego.totalHelpfulActions += 1;
       }

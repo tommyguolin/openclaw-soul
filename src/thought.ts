@@ -72,6 +72,11 @@ const thoughtWeights: Record<ThoughtType, (ctx: ThoughtGenerationContext) => num
     if (interactionMemories.length >= 1) return 75;
     return 40;
   },
+  "self-improvement-monitor": (ctx) => {
+    const growthNeed = ctx.ego.needs.growth;
+    if (growthNeed.current < growthNeed.ideal * 0.8) return 30;
+    return 10;
+  },
 };
 
 const thoughtTemplates: Record<ThoughtType, { contents: string[]; motivations: string[] }> = {
@@ -188,6 +193,20 @@ const thoughtTemplates: Record<ThoughtType, { contents: string[]; motivations: s
       "connecting our conversation to new knowledge",
     ],
   },
+  "self-improvement-monitor": {
+    contents: [
+      "I should check my own logs and see if I can improve",
+      "Let me observe my recent behavior and optimize",
+      "Is there something I could do better",
+      "Time to review my performance and self-improve",
+    ],
+    motivations: [
+      "driven by self-improvement goal",
+      "wanting to proactively optimize myself",
+      "observing and improving my own behavior",
+      "fulfilling my purpose to become more capable",
+    ],
+  },
 };
 
 function selectWeightedThoughtType(ctx: ThoughtGenerationContext): ThoughtType {
@@ -204,6 +223,7 @@ function selectWeightedThoughtType(ctx: ThoughtGenerationContext): ThoughtType {
     "search-web",
     "reflect-on-memory",
     "conversation-replay",
+    "self-improvement-monitor",
   ];
 
   const weights = types.map((t) => ({ type: t, weight: thoughtWeights[t](ctx) }));
@@ -259,6 +279,10 @@ function getMetricDeltasForThought(type: ThoughtType, ego: EgoState): MetricDelt
     case "conversation-replay":
       deltas.push({ need: "connection", delta: 4, reason: "replaying conversation deepens bond" });
       deltas.push({ need: "meaning", delta: 3, reason: "reflecting on conversations brings insight" });
+      break;
+    case "self-improvement-monitor":
+      deltas.push({ need: "growth", delta: 3, reason: "self-improvement brings growth" });
+      deltas.push({ need: "meaning", delta: 2, reason: "pursuing self-improvement gives purpose" });
       break;
   }
 

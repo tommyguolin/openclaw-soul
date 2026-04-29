@@ -37,6 +37,10 @@ export async function executeThought(
 
   try {
     switch (thought.type) {
+      case "self-improvement-monitor":
+        // Handled via resolveActionType → observe-and-improve in intelligent-thought
+        break;
+
       case "opportunity-detected":
         action = await handleOpportunityDetected(thought, ctx);
         break;
