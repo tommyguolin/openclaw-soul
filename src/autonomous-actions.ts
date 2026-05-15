@@ -1,8 +1,9 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { homedir, tmpdir } from "node:os";
 import { createSoulLogger } from "./logger.js";
 import { invokeGatewayTool, fireAgentTask, isWriteTool } from "./gateway-client.js";
 import { isGoodTimeForMessage } from "./action-executor.js";
@@ -10,6 +11,7 @@ import type { LLMGenerator } from "./soul-llm.js";
 import type { Thought, EgoState, ActionResult, MetricDelta, AutonomousTask, TaskStep, ActionType } from "./types.js";
 import type { MessageSender } from "./soul-actions.js";
 import { updateEgoStore, resolveEgoStorePath } from "./ego-store.js";
+import { SOUL_DIR } from "./paths.js";
 
 const log = createSoulLogger("autonomous-actions");
 
@@ -183,8 +185,8 @@ export async function executeAnalyzeProblem(
   if (gatheredInfo.length === 0) {
     const today = new Date().toISOString().slice(0, 10);
     const defaultPaths = [
-      `/tmp/openclaw/openclaw-${today}.log`,
-      "/tmp/openclaw-gateway.log",
+      join(tmpdir(), "openclaw", `openclaw-${today}.log`),
+      join(tmpdir(), "openclaw-gateway.log"),
       `/var/log/syslog`,
       `/var/log/nginx/error.log`,
     ];
@@ -300,8 +302,9 @@ export async function executeRunAgentTask(
 
   // Create task first to get ID for result file path
   const taskId = randomBytes(4).toString("hex");
-  mkdirSync("/tmp/soul-results", { recursive: true });
-  const resultFilePath = `/tmp/soul-results/${taskId}.md`;
+  const resultDir = join(SOUL_DIR, "results");
+  mkdirSync(resultDir, { recursive: true });
+  const resultFilePath = join(resultDir, `${taskId}.md`);
 
   const agentMessage = `[Soul Autonomous Task]
 ${thought.content}
@@ -553,7 +556,7 @@ Output ONLY the message, nothing else.`;
 // executeObserveAndImprove — analyze and fix code in any project
 // ---------------------------------------------------------------------------
 
-const SOUL_SRC_DIR = "/root/.openclaw/extensions/soul/src";
+const SOUL_SRC_DIR = dirname(fileURLToPath(import.meta.url));
 
 // Files that must NOT be auto-modified (entry points, type definitions)
 const PROTECTED_FILES = new Set(["index.ts", "types.ts", "paths.ts", "logger.ts"]);
@@ -572,7 +575,7 @@ function resolveTargetProject(ego: EgoState): { dir: string; name: string; isSel
     if (goal.status !== "active") continue;
     const m = goal.title.match(pathRe) || goal.description?.match(pathRe);
     if (m) {
-      const dir = m[1].startsWith("~") ? m[1].replace("~", process.env.HOME || "/root") : m[1];
+      const dir = m[1].startsWith("~") ? resolve(homedir(), m[1].slice(1)) : m[1];
       return { dir, name: goal.title.slice(0, 60), isSelf: false };
     }
   }
@@ -580,7 +583,7 @@ function resolveTargetProject(ego: EgoState): { dir: string; name: string; isSel
   for (const fact of ego.userFacts ?? []) {
     const m = fact.content.match(pathRe);
     if (m) {
-      const dir = m[1].startsWith("~") ? m[1].replace("~", process.env.HOME || "/root") : m[1];
+      const dir = m[1].startsWith("~") ? resolve(homedir(), m[1].slice(1)) : m[1];
       return { dir, name: `user directive: ${fact.content.slice(0, 60)}`, isSelf: false };
     }
   }

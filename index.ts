@@ -376,10 +376,11 @@ const plugin = {
 
     // --- 5. Inject soul system prompt via before_prompt_build hook ---
     api.on("before_prompt_build", async (_event, _ctx) => {
-      if (!thoughtService?.isRunning()) return;
+      const service = thoughtService;
+      if (!service?.isRunning()) return;
 
       try {
-        const prompt = await thoughtService.getSystemPrompt(
+        const prompt = await service.getSystemPrompt(
           typeof _event === "object" && _event !== null && "prompt" in _event
             ? String((_event as { prompt?: string }).prompt ?? "")
             : "",
@@ -411,20 +412,21 @@ const plugin = {
       // Unconditional diagnostic — fires regardless of service state
       log.info(`message_received hook fired: text=${text.length} chars, from=${from || "(none)"}, channel=${channelId || "(none)"}, running=${thoughtService?.isRunning() ?? "no service"}`);
 
-      if (!thoughtService?.isRunning()) return;
+      const service = thoughtService;
+      if (!service?.isRunning()) return;
 
       try {
         // Auto-learn proactive channel/target from first inbound message
         if (from && channelId && !proactiveTarget) {
           if (!proactiveChannel) proactiveChannel = channelId;
           proactiveTarget = from;
-          thoughtService.updateProactiveTarget(channelId, from);
+          service.updateProactiveTarget(channelId, from);
           log.info(`Proactive target auto-learned from first message: ${channelId}/${from}`);
         }
 
         // Abort any in-progress thought — user interaction takes priority
-        thoughtService.abortCurrentThought();
-        thoughtService.resume();
+        service.abortCurrentThought();
+        service.resume();
 
         // Run all processing in the background so we don't block the agent
         // turn. The hook must return quickly (<1s) to avoid feishu streaming
@@ -438,18 +440,18 @@ const plugin = {
         // response LLM call for gateway/provider resources.
         if (text.length >= 15) {
           const delayMs = 2 * 60 * 1000; // 2 minutes
-          thoughtService.recordInteractionWithText({ type: "inbound", text })
+          service.recordInteractionWithText({ type: "inbound", text })
             .catch((err) => log.warn(`Record interaction failed: ${String(err)}`));
           setTimeout(() => {
-            thoughtService.extractUserFacts(text)
-              .then(() => thoughtService.extractUserPreferences(text))
+            service.extractUserFacts(text)
+              .then(() => service.extractUserPreferences(text))
               .catch((err) => log.warn(`Background message processing failed: ${String(err)}`));
           }, delayMs);
         } else if (text.length >= 5) {
-          thoughtService.recordInteractionWithText({ type: "inbound", text })
+          service.recordInteractionWithText({ type: "inbound", text })
             .catch((err) => log.warn(`Record interaction failed: ${String(err)}`));
         } else {
-          thoughtService.recordInteraction({ type: "inbound" }).catch((err) =>
+          service.recordInteraction({ type: "inbound" }).catch((err) =>
             log.warn(`Record interaction failed: ${String(err)}`),
           );
         }

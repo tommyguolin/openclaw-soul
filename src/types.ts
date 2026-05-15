@@ -363,7 +363,13 @@ export interface RecallResult {
 
 // --- Behavior Log (action → outcome feedback loop) ---
 
-export type BehaviorOutcome = "pending" | "success" | "no-response" | "irrelevant" | "expired";
+export type BehaviorOutcome =
+  | "pending"
+  | "success"
+  | "failed"
+  | "no-response"
+  | "irrelevant"
+  | "expired";
 
 export interface BehaviorEntry {
   id: string;

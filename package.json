@@ -22,6 +22,10 @@
   "author": "Tommy Guo",
   "type": "module",
   "main": "index.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
   "files": [
     "index.ts",
     "src/**/*.ts",
@@ -56,6 +60,7 @@
     }
   },
   "devDependencies": {
+    "@types/node": "^22.15.0",
     "typescript": "^6.0.2"
   }
 }

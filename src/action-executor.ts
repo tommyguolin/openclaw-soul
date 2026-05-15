@@ -386,10 +386,12 @@ export async function executeThoughtAction(
     }
     // Store result for outcome tracking
     // Mark as success if we successfully determined not to act (skipped/cooldown are not failures)
-    const isNoOp = actionResult?.result?.result && /^skipped-|^cooldown$/.test(String(actionResult.result.result));
+    const isNoOp = Boolean(
+      actionResult?.result?.result && /^skipped-|^cooldown$/.test(String(actionResult.result.result)),
+    );
     // Fix: properly check success value and pass complete ego object
     const actionSuccess = actionResult?.result?.success;
-    const outcomeSuccess = actionSuccess !== undefined ? actionSuccess : isNoOp;
+    const outcomeSuccess = actionSuccess ?? isNoOp;
     const egoWithLog: EgoState = { ...ego, behaviorLog: entries };
     await markBehaviorOutcome(behaviorEntry.id, outcomeSuccess, egoWithLog);
     return { ...actionResult, behaviorEntryId: behaviorEntry.id };

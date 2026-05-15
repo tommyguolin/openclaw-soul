@@ -1116,6 +1116,22 @@ function determineActionForOpportunity(
   const connectionNeed = ego.needs.connection;
   const growthNeed = ego.needs.growth;
 
+  if (type === "conversation-replay") {
+    const problemKeywords = /error|bug|issue|problem|stuck|failed|broken|crash|timeout|optimize|improve|enhance|refactor|fix|debug|analyze/i;
+    const combinedText = opportunity.triggerDetail + " " + opportunity.motivation;
+    if (problemKeywords.test(combinedText)) {
+      const filePaths = extractFilePaths(combinedText);
+      return {
+        actionType: "analyze-problem",
+        actionParams: {
+          reason: opportunity.motivation,
+          logPaths: filePaths,
+          sourcePaths: [],
+        },
+      };
+    }
+  }
+
   // conversation-replay: honor the suggested action from the analyzer
   // (search-web if Soul doesn't know the answer, send-message if it does,
   //  learn-topic for follow-up research)
@@ -1159,7 +1175,7 @@ function determineActionForOpportunity(
   // conversation-replay AND opportunity-detected: if the user discussed a
   // problem/error/optimization, route to analyze-problem instead of learn-topic.
   // Must be checked BEFORE the learn-topic branch below to take priority.
-  if (type === "conversation-replay" || type === "opportunity-detected") {
+  if (type === "opportunity-detected") {
     const problemKeywords = /error|bug|issue|problem|stuck|failed|broken|crash|timeout|optimize|improve|enhance|refactor|fix|debug|analyze|观察|检查|排查|报错|错误|失败|崩溃|超时|挂了|异常|不能|无法|不行|优化|改进|改善|提升|修复|调试|分析/i;
     const combinedText = opportunity.triggerDetail + " " + opportunity.motivation;
     if (problemKeywords.test(combinedText)) {
