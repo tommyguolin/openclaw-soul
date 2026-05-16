@@ -49,6 +49,73 @@ export interface DetectedThoughtOpportunity {
   actionParams?: Record<string, unknown>;
 }
 
+type TopicFocusProfile = {
+  active: string[];
+  deprioritized: string[];
+  summary: string;
+};
+
+function uniqueTopics(items: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of items) {
+    const clean = item.replace(/\s+/g, " ").trim();
+    const key = clean.toLowerCase();
+    if (clean.length < 2 || seen.has(key)) continue;
+    seen.add(key);
+    out.push(clean);
+  }
+  return out.slice(0, 6);
+}
+
+function isDeprioritizedTopicPreference(text: string): boolean {
+  return /不再|不用|不需要|别再|少提|停止|暂停|过时|no longer|not interested|deprioriti[sz]e|avoid|stop|less/i.test(text);
+}
+
+function buildTopicFocusProfile(ego: EgoState): TopicFocusProfile {
+  const topicPrefs = [...(ego.userPreferences ?? [])]
+    .filter((p) => p.aspect === "topic_preference" && p.confidence >= 0.4)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+  const deprioritized = uniqueTopics(
+    topicPrefs
+      .filter((p) => isDeprioritizedTopicPreference(p.preference))
+      .map((p) => p.preference),
+  );
+  const positivePrefs = topicPrefs
+    .filter((p) => !isDeprioritizedTopicPreference(p.preference))
+    .map((p) => p.preference);
+  const factTopics = [...(ego.userFacts ?? [])]
+    .filter((f) => ["interest", "project", "tech_stack"].includes(f.category) && f.confidence >= 0.4)
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .map((f) => f.content);
+  const active = uniqueTopics([...positivePrefs, ...factTopics]);
+  const summary = [
+    active.length > 0 ? `active: ${active.join("; ")}` : "",
+    deprioritized.length > 0 ? `deprioritized: ${deprioritized.join("; ")}` : "",
+  ].filter(Boolean).join(" | ");
+  return { active, deprioritized, summary };
+}
+
+function topicTokens(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}\u4e00-\u9fff]+/u)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 2 && !MEANINGLESS_QUERIES.has(t));
+}
+
+function matchesAnyTopic(text: string, topics: string[]): boolean {
+  const lower = text.toLowerCase();
+  const textTokens = new Set(topicTokens(text));
+  for (const topic of topics) {
+    const clean = topic.toLowerCase();
+    if (clean.length >= 4 && lower.includes(clean)) return true;
+    const tokens = topicTokens(topic);
+    if (tokens.length > 0 && tokens.some((t) => t.length >= 2 && (textTokens.has(t) || lower.includes(t)))) return true;
+  }
+  return false;
+}
+
 function analyzeNeedGaps(needs: EgoNeeds): DetectedThoughtOpportunity[] {
   const opportunities: DetectedThoughtOpportunity[] = [];
 
@@ -382,8 +449,8 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
     .sort((a, b) => b.timestamp - a.timestamp);
 
   const userFacts = ego.userFacts;
-  const userPrefs = ego.userPreferences;
   const userProfile = buildUserProfile(ego);
+  const topicFocus = buildTopicFocusProfile(ego);
 
   // Need at least 1 interaction OR user facts to generate conversation-replay
   const hasUserData = recentInteractions.length > 0 || userFacts.length > 0;
@@ -404,7 +471,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
   //    meta-questions, etc.
   // =====================================================
   const questionMemories = recentInteractions.filter((m) =>
-    isGenuineQuestion(m.content),
+    isGenuineQuestion(m.content) && !matchesAnyTopic(m.content, topicFocus.deprioritized),
   );
 
   for (const qMem of questionMemories.slice(0, 2)) {
@@ -480,7 +547,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
     const meaningfulTags = m.tags.filter(
       (t) => t !== "conversation" && t !== "inbound" && t !== "outbound",
     );
-    return meaningfulTags.length > 0 && m.content.length >= 20;
+    return meaningfulTags.length > 0 && m.content.length >= 20 && !matchesAnyTopic(m.content, topicFocus.deprioritized);
   });
 
   for (const mem of substantiveInteractions.slice(0, 5)) {
@@ -532,10 +599,11 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
   // If user works on X and Soul hasn't learned about X recently, go learn
   // =====================================================
   const userTopics = [
+    ...topicFocus.active.map((topic) => ({ topic, source: "interest" as const })),
     ...userProfile.projects.map((p) => ({ topic: p, source: "project" as const })),
     ...userProfile.interests.slice(0, 3).map((i) => ({ topic: i, source: "interest" as const })),
     ...userProfile.skills.slice(0, 2).map((s) => ({ topic: s, source: "skill" as const })),
-  ];
+  ].filter(({ topic }) => !matchesAnyTopic(topic, topicFocus.deprioritized));
 
   for (const { topic, source } of userTopics.slice(0, 3)) {
     // Check if Soul has recent (< 24h) knowledge about this topic
@@ -585,7 +653,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
         latestChallenge.split(/\s+/).some((word) => m.content.toLowerCase().includes(word.toLowerCase()) && word.length > 3),
     );
 
-    if (!hasRecentSearch && isSearchableContent(latestChallenge)) {
+    if (!hasRecentSearch && isSearchableContent(latestChallenge) && !matchesAnyTopic(latestChallenge, topicFocus.deprioritized)) {
       const searchQuery = latestChallenge.slice(0, 50);
       opportunities.push({
         type: "conversation-replay",
@@ -644,7 +712,11 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
   //    LLM mining happens in the action executor, not here.
   // =====================================================
   const recentInbound = recentInteractions
-    .filter((m) => m.tags.includes("inbound") && m.timestamp > now - 3 * 24 * 60 * 60 * 1000)
+    .filter((m) =>
+      m.tags.includes("inbound") &&
+      m.timestamp > now - 3 * 24 * 60 * 60 * 1000 &&
+      !matchesAnyTopic(m.content, topicFocus.deprioritized),
+    )
     .slice(0, 8);
 
   if (recentInbound.length >= 2) {
@@ -673,7 +745,10 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
         suggestedAction: "proactive-research",
         actionParams: {
           conversationSnippets: snippets,
-          userProfile: (ego.userFacts ?? []).slice(0, 5).map((f) => f.content).join("; ") || "limited",
+          userProfile: [
+            (ego.userFacts ?? []).slice(0, 5).map((f) => f.content).join("; ") || "limited",
+            topicFocus.summary ? `topic focus: ${topicFocus.summary}` : "",
+          ].filter(Boolean).join("; "),
         },
       });
     }
@@ -687,12 +762,13 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
   // =====================================================
   const userInterests = (ego.userFacts ?? [])
     .filter((f) => ["interest", "tech_stack", "project"].includes(f.category) && f.confidence >= 0.4)
+    .filter((f) => !matchesAnyTopic(f.content, topicFocus.deprioritized))
     .slice(0, 5);
   const topicPrefs = (ego.userPreferences ?? [])
     .filter((p) => p.aspect === "topic_preference" && p.confidence >= 0.4)
     .slice(0, 3);
 
-  if (userInterests.length > 0) {
+  if (userInterests.length > 0 || topicFocus.active.length > 0) {
     const hasRecentPush = ego.memories.some(
       (m) =>
         m.type === "learning" &&
@@ -701,7 +777,10 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
     );
 
     if (!hasRecentPush) {
-      const interestsSummary = userInterests.map((f) => `[${f.category}] ${f.content}`).join("; ");
+      const interestsSummary = [
+        ...topicFocus.active.map((topic) => `[focus] ${topic}`),
+        ...userInterests.map((f) => `[${f.category}] ${f.content}`),
+      ].join("; ");
       const prefsSummary = topicPrefs.map((p) => p.preference).join("; ") || "";
 
       // Infer country/region from language for content source hints
@@ -738,7 +817,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
         suggestedAction: "proactive-content-push",
         actionParams: {
           interests: interestsSummary,
-          preferences: prefsSummary,
+          preferences: [prefsSummary, topicFocus.summary].filter(Boolean).join("; "),
           regionHint: contentRegionHint,
         },
       });
@@ -870,6 +949,7 @@ export async function llmReRankOpportunities(
   const userFacts = ctx.ego.userFacts.slice(0, 5)
     .map((f) => `[${f.category}] ${f.content}`)
     .join("; ");
+  const topicFocus = buildTopicFocusProfile(ctx.ego);
   const recentMessages = ctx.ego.memories
     .filter((m) => m.type === "interaction" && m.tags.includes("inbound"))
     .slice(-3)
@@ -890,6 +970,7 @@ export async function llmReRankOpportunities(
   const prompt = `Re-rank these AI companion actions by contextual value RIGHT NOW.
 
 User profile: ${userFacts || "limited"}
+Topic focus: ${topicFocus.summary || "none"}
 Recent messages: ${recentMessages || "none"}
 Time: ${ctx.currentHour}:00 ${days[ctx.dayOfWeek]}
 Recent executed actions (avoid repeating): ${historyStr}
@@ -902,6 +983,7 @@ Rules:
 - If user is actively debugging/troubleshooting, boost observe-and-improve
 - If long silence (>2h), boost send-message or bond-deepen
 - If user expressed interests recently, boost proactive-content-push
+- Prefer active topic focus and avoid deprioritized topics
 - Avoid repeating recently executed action types
 - Prefer diverse actions over time
 
@@ -1355,6 +1437,37 @@ function extractFilePaths(text: string): string[] {
   return results.slice(0, 5);
 }
 
+function normalizeQueryText(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\u4e00-\u9fff]+/gu, " ")
+    .replace(/\b(?:the|and|for|with|about|this|that|from|into|user|should|would|could|have|has|been)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function queryOverlapsThought(query: string, thoughtContent: string): boolean {
+  const normalizedQuery = normalizeQueryText(query);
+  const normalizedThought = normalizeQueryText(thoughtContent);
+  if (!normalizedQuery || !normalizedThought) return false;
+  if (normalizedThought.includes(normalizedQuery) || normalizedQuery.includes(normalizedThought)) return true;
+
+  const queryTerms = normalizedQuery.split(/\s+/).filter((term) => term.length >= 3);
+  if (queryTerms.length === 0) return normalizedQuery.length >= 2 && normalizedThought.includes(normalizedQuery);
+  const overlappingTerms = queryTerms.filter((term) => normalizedThought.includes(term));
+  return overlappingTerms.length / queryTerms.length >= 0.35;
+}
+
+function deriveSearchQueryFromThought(thoughtContent: string): string {
+  const cleaned = thoughtContent
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/\b(?:I should|I need to|I want to|I will|Given our previous discussion about|Regarding our past discussion on)\b/gi, "")
+    .replace(/[。？！.!?].*$/s, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned.slice(0, 58).trim();
+}
+
 async function expandThoughtActionWithAdjacentIdea(
   thought: Thought,
   opportunity: DetectedThoughtOpportunity,
@@ -1382,25 +1495,49 @@ async function expandThoughtActionWithAdjacentIdea(
     .sort((a, b) => b.timestamp - a.timestamp)
     .slice(0, 6)
     .map((m) => m.content);
+  const topicFocus = buildTopicFocusProfile(ctx.ego);
 
-  const sourceText = [
-    `Thought: ${thought.content}`,
-    `Trigger: ${opportunity.triggerDetail}`,
-    `Motivation: ${opportunity.motivation}`,
-    thought.actionParams ? `Action params: ${JSON.stringify(thought.actionParams).slice(0, 500)}` : "",
-  ].filter(Boolean).join("\n");
+  const isSearchAction = actionType === "search-web";
+  const sourceText = isSearchAction
+    ? [
+      `Final thought intent: ${thought.content}`,
+      "Generate the query from the final thought intent only. Ignore any older replay/search wording that may appear elsewhere.",
+    ].join("\n")
+    : [
+      `Thought: ${thought.content}`,
+      `Trigger: ${opportunity.triggerDetail}`,
+      `Motivation: ${opportunity.motivation}`,
+      thought.actionParams ? `Action params: ${JSON.stringify(thought.actionParams).slice(0, 500)}` : "",
+    ].filter(Boolean).join("\n");
 
   const ideas = await generateAdjacentContentIdeas({
     llmGenerator,
     actionType,
-    sourceLabel: "Selected thought before action execution",
+    sourceLabel: isSearchAction ? "Final thought before search execution" : "Selected thought before action execution",
     sourceText,
+    preferences: topicFocus.summary || undefined,
     recentUserMessages,
-    recentAvoidItems,
+    recentAvoidItems: [...recentAvoidItems, ...topicFocus.deprioritized.map((topic) => `deprioritized topic: ${topic}`)],
     requireSearchQuery: actionType === "search-web" || actionType === "proactive-research" || actionType === "proactive-content-push",
   });
   const selected = ideas[0];
-  if (!selected) return;
+  if (!selected) {
+    if (actionType === "search-web") {
+      const existingQuery = typeof thought.actionParams?.query === "string" ? thought.actionParams.query : "";
+      if (existingQuery && !queryOverlapsThought(existingQuery, thought.content)) {
+        const derivedQuery = deriveSearchQueryFromThought(thought.content);
+        if (derivedQuery) {
+          log.info(`Replacing stale search query "${existingQuery.slice(0, 60)}" with thought-derived query "${derivedQuery}"`);
+          thought.actionParams = {
+            ...(thought.actionParams ?? {}),
+            query: derivedQuery,
+            derivedFromThought: true,
+          };
+        }
+      }
+    }
+    return;
+  }
 
   log.info(`Adjacent thought expansion for ${actionType}: ${selected.topic} (bridge: ${selected.bridge})`);
 

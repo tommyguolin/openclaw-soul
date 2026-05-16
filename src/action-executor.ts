@@ -166,6 +166,51 @@ function stripMetaAnalysis(text: string): string {
   return cleaned;
 }
 
+function extractBlockquote(text: string): string {
+  const lines = text.split("\n");
+  let best: string[] = [];
+  let current: string[] = [];
+  for (const line of lines) {
+    const match = line.match(/^\s*>\s?(.*)$/);
+    if (match) {
+      current.push(match[1]);
+      continue;
+    }
+    if (current.length > 0) {
+      if (current.join("").length > best.join("").length) best = current;
+      current = [];
+    }
+  }
+  if (current.length > 0 && current.join("").length > best.join("").length) best = current;
+  return best.join("\n").trim();
+}
+
+function cleanOutgoingGeneratedMessage(raw: string, maxLen: number): string {
+  let cleaned = raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/<think>[\s\S]*$/gi, "")
+    .trim();
+
+  const optionMatch = cleaned.match(/(?:\*\*)?Option\s*1[\s\S]*?\n\s*>\s?([\s\S]*?)(?=\n\s*(?:\*\*)?Option\s*\d|\n\s*---|\n\s*请告诉|$)/i);
+  if (optionMatch?.[1]) {
+    cleaned = optionMatch[1].replace(/^\s*>\s?/gm, "").trim();
+  } else {
+    const quote = extractBlockquote(cleaned);
+    if (quote) cleaned = quote;
+  }
+
+  cleaned = stripMetaAnalysis(cleaned)
+    .replace(/\n\s*请告诉我[\s\S]*$/i, "")
+    .replace(/\n\s*(?:---|\*\*选择最佳回复|\*\*Option\s*\d)[\s\S]*$/i, "")
+    .trim();
+
+  if (/核心要点|供参考|选择最佳回复|Option\s*\d|撰写这条消息|please tell me/i.test(cleaned)) {
+    return "";
+  }
+
+  return truncateAtSentence(cleaned, maxLen);
+}
+
 const ACTION_COOLDOWNS_MS: Record<ActionType, number> = {
   none: 0,
   "send-message": 5 * 60 * 1000,
@@ -249,9 +294,21 @@ function parseAdjacentContentIdeas(text: string, requireSearchQuery = false): Ad
   try {
     const parsed = JSON.parse(stripJsonFence(text)) as unknown;
     const root = parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
-    const ideas = Array.isArray(root.ideas) ? root.ideas : [];
+    const ideas = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(root.ideas)
+        ? root.ideas
+        : Array.isArray(root.recommendations)
+          ? root.recommendations
+          : Array.isArray(root.topics)
+            ? root.topics
+            : asString(root.topic)
+            ? [root]
+            : [];
     const legacyQueryFrom = (obj: Record<string, unknown>): string => {
-      const topic = asString(obj.topic);
+      const topic = asString(obj.topic) || asString(obj.topic_name) || asString(obj.topicName) ||
+        asString(obj.name) || asString(obj.title);
+      const queryAddition = asString(obj.query_addition) || asString(obj.queryAddition);
       const keywords = Array.isArray(obj.keywords)
         ? obj.keywords
           .map((k) => asString(k))
@@ -261,6 +318,8 @@ function parseAdjacentContentIdeas(text: string, requireSearchQuery = false): Ad
       if (asString(obj.query)) return asString(obj.query);
       if (asString(obj.search_query)) return asString(obj.search_query);
       if (asString(obj.searchQuery)) return asString(obj.searchQuery);
+      if (queryAddition && topic) return `${topic} ${queryAddition}`.trim();
+      if (queryAddition) return queryAddition;
       if (topic && keywords.length > 0) return `${topic} ${keywords.join(" ")}`.trim();
       if (topic) return topic;
       return "";
@@ -270,16 +329,18 @@ function parseAdjacentContentIdeas(text: string, requireSearchQuery = false): Ad
       .map((item): AdjacentContentIdea | null => {
         if (!item || typeof item !== "object") return null;
         const obj = item as Record<string, unknown>;
-        const topic = asString(obj.topic);
+        const topic = asString(obj.topic) || asString(obj.topic_name) || asString(obj.topicName) ||
+          asString(obj.name) || asString(obj.title);
         const legacyDescription = asString(obj.description);
         const legacyWhy = asString(obj.why_relevant);
         const legacyExplanation = asString(obj.explanation);
+        const legacyReasoning = asString(obj.reasoning) || asString(obj.reason);
         const keywords = Array.isArray(obj.keywords)
           ? obj.keywords.map((k) => asString(k)).filter((k) => k.length > 0)
           : [];
         const query = legacyQueryFrom(obj);
-        const bridge = asString(obj.bridge) || legacyExplanation || legacyDescription || legacyWhy;
-        const why = asString(obj.why) || legacyWhy || legacyExplanation || legacyDescription;
+        const bridge = asString(obj.bridge) || legacyReasoning || legacyExplanation || legacyDescription || legacyWhy;
+        const why = asString(obj.why) || legacyWhy || legacyReasoning || legacyExplanation || legacyDescription || bridge;
         if (!topic || !bridge || !why) return null;
         if (requireSearchQuery && !query) return null;
         return {
@@ -287,7 +348,7 @@ function parseAdjacentContentIdeas(text: string, requireSearchQuery = false): Ad
           query: query ? query.slice(0, 100) : undefined,
           bridge: bridge.slice(0, 180),
           why: (keywords.length > 0 ? `${why} Keywords: ${keywords.slice(0, 3).join(", ")}` : why).slice(0, 180),
-          score: Math.max(0, Math.min(100, asNumber(obj.score))),
+          score: Math.max(0, Math.min(100, asNumber(obj.score) || 50)),
         };
       })
       .filter((idea): idea is AdjacentContentIdea => idea !== null)
@@ -1465,7 +1526,7 @@ Write 3-5 sentences as a natural message to the user. Rules:
 - Sound like a knowledgeable friend who cares`;
 
   const message = await llmGenerator(messagePrompt);
-  const cleanedMessage = message.replace(/<think[\s\S]*?<\/think>/gi, "").trim().slice(0, 400);
+  const cleanedMessage = cleanOutgoingGeneratedMessage(message, 400);
 
   if (!cleanedMessage || cleanedMessage.length < 10) {
     return { result: { type: "proactive-research", success: true, result: "no-message-generated" }, metricsChanged: [] };
@@ -1654,7 +1715,7 @@ Write 3-5 sentences as a natural message sharing this find. Rules:
 - Do NOT say "I searched" or "I found an article" — share naturally like a friend would`;
 
   const message = await llmGenerator(messagePrompt);
-  const cleanedMessage = message.replace(/<think[\s\S]*?<\/think>/gi, "").trim().slice(0, 500);
+  const cleanedMessage = cleanOutgoingGeneratedMessage(message, 500);
 
   if (!cleanedMessage || cleanedMessage.length < 10) {
     return { result: { type: "proactive-content-push", success: true, result: "no-message" }, metricsChanged: [] };

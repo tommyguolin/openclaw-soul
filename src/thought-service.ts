@@ -61,6 +61,62 @@ function normalizeForTopic(content: string): string {
     .slice(0, 120);
 }
 
+const TOPIC_STOP_WORDS = new Set([
+  "the", "and", "for", "with", "about", "that", "this", "from", "into", "user", "should", "would",
+  "could", "have", "been", "need", "want", "think", "thinking", "discussion", "previous", "regarding",
+  "关于", "用户", "应该", "需要", "可以", "之前", "讨论", "这个", "那个",
+]);
+
+const ANGLE_TERMS = [
+  "qualia", "hard problem", "functionalism", "self-model", "self model", "world model",
+  "theory of mind", "embodied cognition", "personhood", "digital rights", "ethics",
+  "memory", "architecture", "interpretability", "emergent", "意识", "自我模型", "心智理论",
+  "具身", "人格", "伦理", "记忆", "架构", "涌现", "可解释",
+];
+
+function topicTerms(content: string): string[] {
+  return content
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}\u4e00-\u9fff]+/u)
+    .map((term) => term.trim())
+    .filter((term) => term.length >= 3 && !TOPIC_STOP_WORDS.has(term))
+    .slice(0, 10);
+}
+
+function extractAngleTerms(content: string): string[] {
+  const lower = content.toLowerCase();
+  return ANGLE_TERMS.filter((term) => lower.includes(term.toLowerCase())).slice(0, 5);
+}
+
+function topicSignature(content: string): string {
+  const terms = topicTerms(content).slice(0, 8).join(",");
+  const angles = extractAngleTerms(content).join(",");
+  return `terms=${terms}|angles=${angles}|raw=${normalizeForTopic(content)}`;
+}
+
+function parseTopicSignature(value: string): { terms: Set<string>; angles: Set<string>; raw: string } {
+  if (!value.includes("terms=") || !value.includes("|raw=")) {
+    return { terms: new Set(), angles: new Set(), raw: value };
+  }
+  const terms = value.match(/terms=([^|]*)/)?.[1] ?? "";
+  const angles = value.match(/angles=([^|]*)/)?.[1] ?? "";
+  const raw = value.match(/raw=([^|]*)/)?.[1] ?? "";
+  return {
+    terms: new Set(terms.split(",").filter(Boolean)),
+    angles: new Set(angles.split(",").filter(Boolean)),
+    raw,
+  };
+}
+
+function overlapRatio(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let overlap = 0;
+  for (const item of a) {
+    if (b.has(item)) overlap++;
+  }
+  return overlap / Math.min(a.size, b.size);
+}
+
 /** Return the set of overlapping 2-character windows in `text`. */
 function charBigrams(text: string): Set<string> {
   const out = new Set<string>();
@@ -873,11 +929,11 @@ export class ThoughtService {
       }
 
       // Track recent thought topics to prevent revisiting the same subject.
-      // Store a normalized form so isRepeatTopic can compute char-bigram
-      // similarity (works for CJK without whitespace and Latin alike).
-      const normalized = normalizeForTopic(thought.content);
-      if (normalized) {
-        this.recentThoughtTopics.push(normalized);
+      // Store topic terms plus angle markers so broad topics can continue
+      // through new angles without being treated as duplicate thoughts.
+      const signature = topicSignature(thought.content);
+      if (signature) {
+        this.recentThoughtTopics.push(signature);
         if (this.recentThoughtTopics.length > 10) {
           this.recentThoughtTopics.shift();
         }
@@ -1039,19 +1095,20 @@ export class ThoughtService {
   }
 
   /**
-   * Check if a thought's content overlaps significantly with recent thoughts.
-   * Uses character-bigram Jaccard similarity so it works for both CJK
-   * (no whitespace) and Latin scripts. Returns true if any recent topic
-   * has Jaccard >= 0.4 with the new content.
+   * Check if a thought repeats a recent topic and angle.
+   * Broad same-topic thoughts with different angle markers are allowed; exact
+   * or near-exact wording is still blocked.
    */
   private isRepeatTopic(content: string): boolean {
     if (this.recentThoughtTopics.length === 0 || !content) return false;
 
-    const incoming = charBigrams(normalizeForTopic(content));
+    const incomingSig = parseTopicSignature(topicSignature(content));
+    const incoming = charBigrams(incomingSig.raw);
     if (incoming.size === 0) return false;
 
     for (const recent of this.recentThoughtTopics) {
-      const recentBigrams = charBigrams(recent);
+      const recentSig = parseTopicSignature(recent);
+      const recentBigrams = charBigrams(recentSig.raw);
       if (recentBigrams.size === 0) continue;
 
       let intersection = 0;
@@ -1059,7 +1116,18 @@ export class ThoughtService {
         if (recentBigrams.has(b)) intersection++;
       }
       const union = incoming.size + recentBigrams.size - intersection;
-      if (union > 0 && intersection / union >= 0.4) return true;
+      const charSimilarity = union > 0 ? intersection / union : 0;
+      const termOverlap = overlapRatio(incomingSig.terms, recentSig.terms);
+      const angleOverlap = overlapRatio(incomingSig.angles, recentSig.angles);
+      const bothHaveDifferentAngles =
+        incomingSig.angles.size > 0 && recentSig.angles.size > 0 && angleOverlap === 0;
+
+      if (charSimilarity >= 0.58) return true;
+      if (bothHaveDifferentAngles) continue;
+      if (charSimilarity >= 0.4 && angleOverlap > 0) return true;
+      if (termOverlap >= 0.7 && (angleOverlap > 0 || incomingSig.angles.size === 0 || recentSig.angles.size === 0)) {
+        return true;
+      }
     }
     return false;
   }
@@ -1641,9 +1709,12 @@ Please analyze and extract preferences of the following types:
 4. question style (question_style)
 5. feedback preference (feedback_preference)
 6. tone preference (tone)
-7. topic preference (topic_preference)
+7. topic preference (topic_preference), including:
+   - current topics the user explicitly wants to focus on
+   - topics the user no longer wants, wants less of, or says are not needed
 
 Only return preferences that can genuinely improve the conversation experience.
+For topic preferences, preserve direction clearly, e.g. "focus on AI consciousness and Theory of Mind" or "deprioritize image-to-Word layout preservation".
 
 Return in JSON array format:
 [

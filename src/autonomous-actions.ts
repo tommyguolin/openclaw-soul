@@ -606,12 +606,10 @@ export async function executeObserveAndImprove(
   ego: EgoState,
   options: AutonomousActionOptions,
 ): Promise<{ result: ActionResult; metricsChanged: MetricDelta[] }> {
-  if (!options.autonomousActions) {
-    return { result: { type: "observe-and-improve", success: false, error: "autonomousActions not enabled" }, metricsChanged: [] };
-  }
   if (!options.llmGenerator) {
     return { result: { type: "observe-and-improve", success: false, error: "No LLM generator" }, metricsChanged: [] };
   }
+  const readOnlyMode = !options.autonomousActions;
 
   // Only 1 concurrent improvement task
   const activeImprove = (ego.activeTasks ?? []).filter(
@@ -628,8 +626,8 @@ export async function executeObserveAndImprove(
   // Persist task as in-progress
   const task: AutonomousTask = {
     id: taskId,
-    title: `Improvement: ${target.name}`,
-    description: `Code analysis and improvement for ${target.dir}`,
+    title: `${readOnlyMode ? "Read-only improvement" : "Improvement"}: ${target.name}`,
+    description: `${readOnlyMode ? "Read-only code analysis" : "Code analysis and improvement"} for ${target.dir}`,
     status: "in-progress",
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -641,6 +639,9 @@ export async function executeObserveAndImprove(
   await persistTask(task);
 
   log.info(`Improvement task targeting: ${target.dir} (${target.name})`);
+  if (readOnlyMode) {
+    log.info("Improvement running in read-only mode because autonomousActions is false");
+  }
 
   // --- Gather behavior stats (only relevant for self-improvement) ---
   const blog = ego.behaviorLog ?? [];
@@ -707,6 +708,7 @@ Rules:
 - Keep changes to 1-5 lines max
 - Only fix real bugs, logic errors, or clear inefficiencies
 - Prefer fixing high-impact issues
+- ${readOnlyMode ? "Read-only mode is active: still propose oldCode/newCode, but the system will not apply changes automatically" : "Autonomous write mode is active: propose a fix that can be applied automatically"}
 - If nothing clearly needs fixing, set oldCode and newCode to empty strings`;
 
   let analysisResult: string;
@@ -735,8 +737,9 @@ Rules:
         const problem = problemMatch ? problemMatch[1] : "unknown";
         const explanation = explanationMatch ? explanationMatch[1] : "";
 
-        // Skip protected files
-        if (PROTECTED_FILES.has(fixFile)) {
+        if (readOnlyMode) {
+          fixDescription = `Read-only recommendation for ${fixFile}: ${explanation || problem}`;
+        } else if (PROTECTED_FILES.has(fixFile)) {
           fixDescription = `Fix not applied: ${fixFile} is a protected file`;
         } else {
           const fullPath = `${target.dir}/${fixFile}`;
@@ -775,10 +778,11 @@ Rules:
       type: "observe-and-improve",
       success: true,
       result: result.slice(0, 500),
+      data: { readOnly: readOnlyMode, fixApplied },
     },
     metricsChanged: [
       { need: "growth", delta: fixApplied ? 20 : 10, reason: fixApplied ? "applied improvement fix" : "code analysis" },
-      { need: "meaning", delta: fixApplied ? 15 : 8, reason: "working on user's assigned goal" },
+      { need: "meaning", delta: fixApplied ? 15 : 8, reason: readOnlyMode ? "observing self-improvement opportunities" : "working on user's assigned goal" },
     ],
   };
 }
