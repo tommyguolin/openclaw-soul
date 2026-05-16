@@ -893,12 +893,53 @@ async function executeSearchWeb(
     };
   }
 
-  // Skip non-time-sensitive topics — LLM can answer from training data
+  // Non-time-sensitive topics: don't spend web search budget, but still produce
+  // a useful result via LLM fallback (otherwise the user sees "search-web"
+  // actions that do nothing).
   if (!isTimeSensitiveTopic(query)) {
-    log.info(`Skipping non-time-sensitive search: "${query}" (LLM can answer)`);
+    log.info(`Non-time-sensitive search: using LLM fallback for "${query}"`);
+
+    let searchResult = "";
+    if (options.llmGenerator) {
+      try {
+        const prompt = `You want to better understand: "${query}"
+
+Based on your existing knowledge, explain the key points of this topic in 2-3 sentences.
+Be concrete and practical; avoid generic filler.`;
+        searchResult = await options.llmGenerator(prompt);
+        searchResult = searchResult.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
+
+        if (isLLMErrorOutput(searchResult)) {
+          log.warn(`Non-time-sensitive LLM fallback returned error content: ${searchResult.slice(0, 80)}`);
+          searchResult = "";
+        }
+
+        if (searchResult) {
+          const memory: SoulMemory = {
+            id: randomBytes(8).toString("hex"),
+            type: "learning",
+            content: `Search topic (LLM): ${query}. Understanding: ${searchResult.slice(0, 160)}`,
+            emotion: 0.4,
+            valence: "positive",
+            importance: 0.55,
+            timestamp: Date.now(),
+            tags: ["search", "llm-fallback", query.toLowerCase()],
+          };
+          await addSoulMemoryToEgo(memory);
+        }
+      } catch (err) {
+        log.warn("Non-time-sensitive LLM fallback failed", String(err));
+      }
+    }
+
     return {
-      result: { type: "search-web", success: true, result: "skipped-not-time-sensitive" },
-      metricsChanged: [],
+      result: {
+        type: "search-web",
+        success: true,
+        result: searchResult || `Search: ${query}`,
+        data: { query, fallback: true, skippedWebSearch: true },
+      },
+      metricsChanged: [{ need: "growth", delta: 2, reason: "used LLM knowledge instead of web search" }],
     };
   }
 
