@@ -2,9 +2,21 @@
 
 ## Unreleased
 
+## 2.5.0 (2026-05-16)
+
+### Changes
+
+- **Expand proactive thought topics**: Added adjacent-topic generation for proactive research, content pushes, web search, learning, and message drafting so Soul can broaden from known user interests instead of repeating literal keywords.
+- **Add explicit topic focus handling**: Soul now uses remembered topic preferences to prioritize active interests and deprioritize topics the user no longer wants, improving follow-up relevance.
+- **Improve repeat detection by topic angle**: Repetition checks now distinguish broad topics from specific angles, allowing related but genuinely new thoughts such as Theory of Mind, qualia, and cognitive architectures.
+- **Read-only self-improvement mode**: `observe-and-improve` now performs read-only analysis when `autonomousActions` is disabled instead of failing outright.
+
 ### Fixes
 
 - **Start Soul on OpenClaw gateway startup**: Added `activation.onStartup` to the plugin manifest so OpenClaw 2026.5.x loads Soul as a startup sidecar. Without this, `openclaw plugins list` could show Soul as enabled while the gateway never started the thought service.
+- **Prevent stale action parameters**: Search actions now derive queries from the final selected thought and replace stale replay queries when they no longer match the current intent.
+- **Parse more LLM recommendation formats**: Adjacent-topic parsing now accepts direct arrays, single objects, alternate containers, and fields like `query_addition`, `reasoning`, and `topic_name`.
+- **Clean proactive outbound messages**: Proactive research and content push messages now strip draft/option scaffolding before delivery and skip messages that still contain meta-writing artifacts.
 
 ## 2.4.0 (2026-04-19)
 
