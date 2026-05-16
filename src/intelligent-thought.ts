@@ -15,7 +15,7 @@ import type {
   ActionType,
 } from "./types.js";
 import { adjustProbability } from "./behavior-log.js";
-import { MEANINGLESS_QUERIES } from "./action-executor.js";
+import { generateAdjacentContentIdeas, MEANINGLESS_QUERIES } from "./action-executor.js";
 import { searchExternalMemories, formatMemoryContext } from "./openclaw-memory.js";
 
 const log = createSoulLogger("intelligent-thought");
@@ -1355,6 +1355,106 @@ function extractFilePaths(text: string): string[] {
   return results.slice(0, 5);
 }
 
+async function expandThoughtActionWithAdjacentIdea(
+  thought: Thought,
+  opportunity: DetectedThoughtOpportunity,
+  ctx: ThoughtGenerationContext,
+  llmGenerator: LLMThoughtGenerator,
+): Promise<void> {
+  const actionType = thought.actionType;
+  if (!actionType || actionType === "none") return;
+
+  const expandableActions: ActionType[] = [
+    "send-message",
+    "learn-topic",
+    "search-web",
+    "proactive-research",
+    "proactive-content-push",
+  ];
+  if (!expandableActions.includes(actionType)) return;
+
+  const recentUserMessages = (ctx.ego.recentUserMessages ?? []).slice(-5);
+  const recentAvoidItems = ctx.ego.memories
+    .filter((m) =>
+      (m.type === "interaction" && m.tags.includes("outbound")) ||
+      (m.type === "learning" && (m.tags.includes("proactive-content-push") || m.tags.includes("proactive-research"))),
+    )
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, 6)
+    .map((m) => m.content);
+
+  const sourceText = [
+    `Thought: ${thought.content}`,
+    `Trigger: ${opportunity.triggerDetail}`,
+    `Motivation: ${opportunity.motivation}`,
+    thought.actionParams ? `Action params: ${JSON.stringify(thought.actionParams).slice(0, 500)}` : "",
+  ].filter(Boolean).join("\n");
+
+  const ideas = await generateAdjacentContentIdeas({
+    llmGenerator,
+    actionType,
+    sourceLabel: "Selected thought before action execution",
+    sourceText,
+    recentUserMessages,
+    recentAvoidItems,
+    requireSearchQuery: actionType === "search-web" || actionType === "proactive-research" || actionType === "proactive-content-push",
+  });
+  const selected = ideas[0];
+  if (!selected) return;
+
+  log.info(`Adjacent thought expansion for ${actionType}: ${selected.topic} (bridge: ${selected.bridge})`);
+
+  if (actionType === "learn-topic") {
+    const expandedTopics = ideas
+      .map((idea) => idea.topic)
+      .filter((topic) => topic.length >= 3)
+      .slice(0, 3);
+    if (expandedTopics.length > 0) {
+      const existingReason = typeof thought.actionParams?.reason === "string"
+        ? thought.actionParams.reason
+        : thought.motivation;
+      thought.actionParams = {
+        ...(thought.actionParams ?? {}),
+        topics: expandedTopics,
+        reason: `${existingReason}; adjacent expansion: ${selected.bridge}`,
+        adjacentBridge: selected.bridge,
+      };
+    }
+    return;
+  }
+
+  if (actionType === "search-web" && selected.query) {
+    thought.actionParams = {
+      ...(thought.actionParams ?? {}),
+      query: selected.query,
+      adjacentTopic: selected.topic,
+      adjacentBridge: selected.bridge,
+    };
+    return;
+  }
+
+  if (actionType === "proactive-content-push") {
+    const currentInterests = typeof thought.actionParams?.interests === "string"
+      ? thought.actionParams.interests
+      : opportunity.motivation;
+    thought.actionParams = {
+      ...(thought.actionParams ?? {}),
+      interests: `${currentInterests}\nAdjacent seed: ${selected.topic}\nBridge: ${selected.bridge}`,
+      adjacentTopic: selected.topic,
+      adjacentBridge: selected.bridge,
+    };
+    return;
+  }
+
+  thought.actionParams = {
+    ...(thought.actionParams ?? {}),
+    adjacentTopic: selected.topic,
+    adjacentBridge: selected.bridge,
+    adjacentWhy: selected.why,
+    ...(selected.query ? { adjacentQuery: selected.query } : {}),
+  };
+}
+
 export async function generateIntelligentThought(
   ctx: ThoughtGenerationContext,
   options?: {
@@ -1446,13 +1546,18 @@ export async function generateIntelligentThought(
         }
       }
 
+      await expandThoughtActionWithAdjacentIdea(thought, selectedOpportunity, ctx, llmGenerator);
       return thought;
     } catch (err) {
       log.warn(`LLM thought refinement failed, using structured thought: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
-  return buildThoughtFromOpportunity(selectedOpportunity, ctx.ego);
+  const thought = buildThoughtFromOpportunity(selectedOpportunity, ctx.ego);
+  if (llmGenerator) {
+    await expandThoughtActionWithAdjacentIdea(thought, selectedOpportunity, ctx, llmGenerator);
+  }
+  return thought;
 }
 
 async function generateLLMThoughtPrompt(

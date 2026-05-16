@@ -208,6 +208,152 @@ function recordSentMessage(content: string): void {
   recentSentMessages.set(normalized, Date.now());
 }
 
+export type AdjacentContentIdea = {
+  topic: string;
+  query?: string;
+  bridge: string;
+  why: string;
+  score: number;
+};
+
+export type AdjacentContentOptions = {
+  llmGenerator: LLMGenerator;
+  actionType: ActionType;
+  sourceLabel: string;
+  sourceText: string;
+  preferences?: string;
+  regionHint?: string;
+  recentUserMessages?: string[];
+  recentAvoidItems?: string[];
+  requireSearchQuery?: boolean;
+};
+
+function stripJsonFence(text: string): string {
+  return text.replace(/```json\n?|```\n?/g, "").trim();
+}
+
+function asString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function asNumber(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Number(value.trim());
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+function parseAdjacentContentIdeas(text: string, requireSearchQuery = false): AdjacentContentIdea[] {
+  try {
+    const parsed = JSON.parse(stripJsonFence(text)) as unknown;
+    const root = parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
+    const ideas = Array.isArray(root.ideas) ? root.ideas : [];
+    const legacyQueryFrom = (obj: Record<string, unknown>): string => {
+      const topic = asString(obj.topic);
+      const keywords = Array.isArray(obj.keywords)
+        ? obj.keywords
+          .map((k) => asString(k))
+          .filter((k) => k.length > 2)
+          .slice(0, 3)
+        : [];
+      if (asString(obj.query)) return asString(obj.query);
+      if (asString(obj.search_query)) return asString(obj.search_query);
+      if (asString(obj.searchQuery)) return asString(obj.searchQuery);
+      if (topic && keywords.length > 0) return `${topic} ${keywords.join(" ")}`.trim();
+      if (topic) return topic;
+      return "";
+    };
+
+    return ideas
+      .map((item): AdjacentContentIdea | null => {
+        if (!item || typeof item !== "object") return null;
+        const obj = item as Record<string, unknown>;
+        const topic = asString(obj.topic);
+        const legacyDescription = asString(obj.description);
+        const legacyWhy = asString(obj.why_relevant);
+        const legacyExplanation = asString(obj.explanation);
+        const keywords = Array.isArray(obj.keywords)
+          ? obj.keywords.map((k) => asString(k)).filter((k) => k.length > 0)
+          : [];
+        const query = legacyQueryFrom(obj);
+        const bridge = asString(obj.bridge) || legacyExplanation || legacyDescription || legacyWhy;
+        const why = asString(obj.why) || legacyWhy || legacyExplanation || legacyDescription;
+        if (!topic || !bridge || !why) return null;
+        if (requireSearchQuery && !query) return null;
+        return {
+          topic: topic.slice(0, 80),
+          query: query ? query.slice(0, 100) : undefined,
+          bridge: bridge.slice(0, 180),
+          why: (keywords.length > 0 ? `${why} Keywords: ${keywords.slice(0, 3).join(", ")}` : why).slice(0, 180),
+          score: Math.max(0, Math.min(100, asNumber(obj.score))),
+        };
+      })
+      .filter((idea): idea is AdjacentContentIdea => idea !== null)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+  } catch {
+    return [];
+  }
+}
+
+export async function generateAdjacentContentIdeas(options: AdjacentContentOptions): Promise<AdjacentContentIdea[]> {
+  const sourceText = options.sourceText.trim();
+  if (!sourceText) return [];
+
+  const recentUserMessages = options.recentUserMessages?.length
+    ? options.recentUserMessages
+      .slice(-5)
+      .map((m, i) => `${i + 1}. ${m.slice(0, 140)}`)
+      .join("\n")
+    : "";
+  const recentAvoidItems = options.recentAvoidItems?.length
+    ? options.recentAvoidItems
+      .slice(0, 6)
+      .map((item) => `- ${item.slice(0, 140)}`)
+      .join("\n")
+    : "";
+
+  const prompt = `You are the shared recommendation engine for a proactive AI companion.
+
+Generate 3-5 adjacent ideas for action "${options.actionType}". Do NOT merely restate the literal keywords. Expand from the source context to neighboring useful domains, hidden needs, complementary tools, or next-step concepts.
+
+**${options.sourceLabel}**:
+${sourceText.slice(0, 2400)}
+${options.preferences ? `\n**User preferences**: ${options.preferences}` : ""}
+${options.regionHint ? `\n**Content sources to prefer**: ${options.regionHint}` : ""}
+${recentUserMessages ? `\n**Recent user messages**:\n${recentUserMessages}` : ""}
+${recentAvoidItems ? `\n**Recently used topics/messages to avoid repeating**:\n${recentAvoidItems}` : ""}
+
+Respond in JSON format ONLY:
+{"ideas":[{"topic":"adjacent topic","query":"specific search query if this action needs search","bridge":"how this connects to the source context","why":"why the user may care","score":0-100}]}
+
+Rules:
+- Prefer adjacent topics that broaden the user's view while still being practical.
+- Good: "image to Word exact layout" -> OCR layout reconstruction, document AI pipelines, scanned table extraction, PDF structure recovery.
+- Good: "quant strategy" -> slippage, limit-up execution risk, factor IC decay, backtest fill modeling.
+- The bridge must make the connection explicit, not vague.
+- Avoid repeating recently used topics unless the new angle is clearly different.
+- ${options.requireSearchQuery ? "Every idea must include a concrete, search-engine-friendly query." : "A query is optional unless search would be useful."}
+- If nothing specific enough, respond: {"ideas":[]}`;
+
+  try {
+    const response = await options.llmGenerator(prompt);
+    const ideas = parseAdjacentContentIdeas(response, options.requireSearchQuery);
+    const searchableIdeas = options.requireSearchQuery
+      ? ideas.filter((idea) => idea.query && isWorthSearching(idea.query))
+      : ideas;
+    if (searchableIdeas.length > 0) {
+      log.info(`Adjacent ideas for ${options.actionType}: ${searchableIdeas.map((idea) => idea.topic).join(", ")}`);
+    }
+    return searchableIdeas;
+  } catch (err) {
+    log.debug(`Adjacent idea generation failed for ${options.actionType}`, String(err));
+    return [];
+  }
+}
+
 /** Generic words that are not meaningful search queries */
 export const MEANINGLESS_QUERIES = new Set([
   "code", "ai", "the", "app", "web", "api", "ios", "sdk", "url",
@@ -571,6 +717,12 @@ async function generateValuableMessage(
         .sort((a, b) => b.timestamp - a.timestamp)
         .slice(0, 5);
 
+      const recentOutbound = ego.memories
+        .filter((m) => m.type === "interaction" && m.tags.includes("outbound"))
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, 5)
+        .map((m) => m.content);
+
       // User profile section
       const userInfo = userFacts.length > 0
         ? userFacts.map((f) => `[${f.category}] ${f.content}`).join("\n")
@@ -591,6 +743,29 @@ async function generateValuableMessage(
         ? recentKnowledge
           .map((m) => `- ${m.content.slice(0, 100)}`)
           .join("\n")
+        : "";
+
+      const adjacentSource = [
+        thought.motivation ? `Thought: ${thought.motivation}` : "",
+        interactionContext ? `Recent conversations:\n${interactionContext}` : "",
+        knowledgeContext ? `Recent learning:\n${knowledgeContext}` : "",
+      ].filter(Boolean).join("\n\n");
+      const adjacentIdeas = await generateAdjacentContentIdeas({
+        llmGenerator: options.llmGenerator,
+        actionType: "send-message",
+        sourceLabel: "Conversation context, thought, and recent learning",
+        sourceText: adjacentSource,
+        recentUserMessages: ego.recentUserMessages,
+        recentAvoidItems: recentOutbound,
+      });
+      const adjacentIdea = adjacentIdeas[0];
+      const adjacentGuidance = adjacentIdea
+        ? `**Adjacent angle to consider**:
+Topic: ${adjacentIdea.topic}
+Bridge: ${adjacentIdea.bridge}
+Why it may matter: ${adjacentIdea.why}
+${adjacentIdea.query ? `Possible search/query angle: ${adjacentIdea.query}\n` : ""}
+Use this angle if it fits naturally. Make the bridge explicit so the message feels insightful, not random.\n`
         : "";
 
       // Language instruction based on detected user language or message samples
@@ -632,6 +807,7 @@ ${timeContext}
 
 **Context**:
 ${userInfo ? `User profile:\n${userInfo}\n` : ""}${interactionContext ? `Recent conversations:\n${interactionContext}\n` : ""}${knowledgeContext ? `Knowledge I've learned:\n${knowledgeContext}\n` : ""}${options.workspaceContext ? `Workspace rules:\n${options.workspaceContext}\n` : ""}${thought.type !== "bond-deepen" ? `Thought: ${thought.motivation}` : ""}
+${adjacentGuidance}
 
 ${isUserTopicFollowUp
   ? `**IMPORTANT**: You just searched for or learned about a topic the user previously discussed. You SHOULD share your finding in 2-3 sentences. Reference the specific topic and what you found. Only say NO_MESSAGE if the knowledge is completely unrelated to what the user cares about.`
@@ -764,6 +940,44 @@ async function executeLearnTopic(
   }
 
   const allLearnings: string[] = [];
+  const storeLearning = async (
+    topic: string,
+    learned: string,
+    source: "web-search" | "reflection",
+    confidence: number,
+    sourceUrl?: string,
+  ): Promise<void> => {
+    if (!learned || isLLMErrorOutput(learned)) return;
+
+    allLearnings.push(learned);
+
+    await addKnowledgeItem(undefined, {
+      topic,
+      content: learned,
+      source,
+      sourceUrl,
+      tags: [
+        topic.toLowerCase(),
+        ...topic
+          .toLowerCase()
+          .split(/\s+/)
+          .filter((t) => t.length > 1),
+      ],
+      confidence,
+    });
+
+    const memory: SoulMemory = {
+      id: randomBytes(8).toString("hex"),
+      type: "learning",
+      content: `Learned "${topic}": ${learned.slice(0, 100)}`,
+      emotion: 0.6,
+      valence: "positive",
+      importance: source === "web-search" ? 0.7 : 0.55,
+      timestamp: Date.now(),
+      tags: ["learning", source, topic.toLowerCase()],
+    };
+    await addSoulMemoryToEgo(memory);
+  };
 
   for (const topic of topics) {
     // Skip generic/meaningless topics that won't produce useful search results
@@ -776,9 +990,25 @@ async function executeLearnTopic(
       log.info(`Skipping ego-state query: "${topic}"`);
       continue;
     }
-    // Skip non-time-sensitive topics — the LLM already knows these from training data
+    // Non-time-sensitive topics do not need web search, but they should still
+    // become knowledge so Soul can broaden from them in later thoughts.
     if (!isTimeSensitiveTopic(topic)) {
-      log.info(`Skipping non-time-sensitive learn-topic: "${topic}" (LLM can answer)`);
+      if (!options.llmGenerator) {
+        log.info(`Skipping non-time-sensitive learn-topic: "${topic}" (no LLM available)`);
+        continue;
+      }
+      try {
+        const prompt = `You are learning about "${topic}" for future proactive help.
+
+Explain the most useful practical knowledge in 3-5 sentences. Include adjacent concepts, hidden constraints, or next-step ideas that would help someone interested in this topic.
+Output knowledge directly, do not add prefixes or numbering.`;
+        const llmResponse = await options.llmGenerator(prompt);
+        const learned = llmResponse.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
+        await storeLearning(topic, learned, "reflection", 0.55);
+        log.info(`Learned "${topic}" from LLM knowledge`);
+      } catch (err) {
+        log.warn(`Learn topic "${topic}" LLM fallback failed`, String(err));
+      }
       continue;
     }
     const searchResults = await soulWebSearch(topic, options.openclawConfig);
@@ -804,34 +1034,7 @@ Output knowledge points directly, do not add prefixes or numbering.`;
         const learned = llmResponse.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
 
         if (learned) {
-          allLearnings.push(learned);
-
-          await addKnowledgeItem(undefined, {
-            topic,
-            content: learned,
-            source: "web-search",
-            sourceUrl: searchResults[0]?.url,
-            tags: [
-              topic.toLowerCase(),
-              ...topic
-                .toLowerCase()
-                .split(/\s+/)
-                .filter((t) => t.length > 1),
-            ],
-            confidence: 0.75,
-          });
-
-          const memory: SoulMemory = {
-            id: randomBytes(8).toString("hex"),
-            type: "learning",
-            content: `Learned "${topic}": ${learned.slice(0, 100)}`,
-            emotion: 0.6,
-            valence: "positive",
-            importance: 0.7,
-            timestamp: Date.now(),
-            tags: ["learning", "web-search", topic.toLowerCase()],
-          };
-          await addSoulMemoryToEgo(memory);
+          await storeLearning(topic, learned, "web-search", 0.75, searchResults[0]?.url);
           log.info(`Learned "${topic}" from web search (${searchResults.length} results)`);
         }
       } catch (err) {
@@ -1140,13 +1343,40 @@ Rules:
     const parsed = JSON.parse(cleaned);
     topic = parsed.topic || null;
     reason = parsed.reason || null;
-    searchQuery = parsed.query || null;
+    searchQuery = parsed.query || parsed.search_query || parsed.searchQuery || null;
   } catch {
     log.debug("Proactive research: LLM mining failed");
   }
 
   if (!topic || !searchQuery) {
     return { result: { type: "proactive-research", success: true, result: "no-actionable-topic-found" }, metricsChanged: [] };
+  }
+
+  const recentResearches = ego.memories
+    .filter((m) => m.type === "learning" && m.tags.includes("proactive-research"))
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, 5)
+    .map((m) => m.content);
+  const adjacentIdeas = await generateAdjacentContentIdeas({
+    llmGenerator,
+    actionType: "proactive-research",
+    sourceLabel: "Mined research topic and recent conversation",
+    sourceText: `Mined topic: ${topic}
+Reason: ${reason ?? "unknown"}
+Initial query: ${searchQuery}
+
+Recent messages:
+${snippets.slice(0, 1800)}`,
+    preferences: userProfile,
+    recentUserMessages: ego.recentUserMessages,
+    recentAvoidItems: recentResearches,
+    requireSearchQuery: true,
+  });
+  const adjacentIdea = adjacentIdeas[0];
+  if (adjacentIdea?.query) {
+    topic = adjacentIdea.topic;
+    searchQuery = adjacentIdea.query;
+    reason = `${adjacentIdea.bridge} ${adjacentIdea.why}`;
   }
 
   log.info(`Proactive research topic: "${topic}", query: "${searchQuery}"`);
@@ -1311,43 +1541,41 @@ async function executeProactiveContentPush(
     return { result: { type: "proactive-content-push", success: true, result: "skipped-no-interests" }, metricsChanged: [] };
   }
 
-  // Step 1: Use LLM to generate a search query from user interests
-  const queryPrompt = `Based on the user's interests, generate ONE specific search query to find a recent interesting article or news item the user would enjoy.
-
-**User interests**: ${interests}
-**User preferences**: ${preferences || "unknown"}
-**Content sources to prefer**: ${regionHint}
-
-Respond in JSON format ONLY:
-{"query": "search query (15-40 chars, specific and search-engine friendly)", "topic": "brief topic description", "why": "why this would interest the user"}
-
-Rules:
-- Pick ONE specific angle, not a broad topic
-- Make the query specific enough to find real articles (not generic)
-- If user is a developer, prefer technical articles, tutorials, or tool releases
-- If user has hobby interests, prefer recent news or interesting finds about them
-- If nothing specific enough, respond: {"query": null}`;
+  const recentPushes = ego.memories
+    .filter((m) => m.type === "learning" && m.tags.includes("proactive-content-push"))
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, 5)
+    .map((m) => m.content);
 
   let searchQuery: string | null = null;
   let topic: string | null = null;
   let why: string | null = null;
+  let bridge: string | null = null;
 
-  try {
-    const response = await llmGenerator(queryPrompt);
-    const cleaned = response.replace(/```json\n?|```\n?/g, "").trim();
-    const parsed = JSON.parse(cleaned);
-    searchQuery = parsed.query || null;
-    topic = parsed.topic || null;
-    why = parsed.why || null;
-  } catch {
-    log.debug("Content push: LLM query generation failed");
+  const ideas = await generateAdjacentContentIdeas({
+    llmGenerator,
+    actionType: "proactive-content-push",
+    sourceLabel: "User interests",
+    sourceText: interests,
+    preferences: preferences || "unknown",
+    regionHint,
+    recentUserMessages: ego.recentUserMessages,
+    recentAvoidItems: recentPushes,
+    requireSearchQuery: true,
+  });
+  const selected = ideas[0];
+  if (selected?.query) {
+    searchQuery = selected.query;
+    topic = selected.topic;
+    why = selected.why;
+    bridge = selected.bridge;
   }
 
   if (!searchQuery) {
     return { result: { type: "proactive-content-push", success: true, result: "no-query-generated" }, metricsChanged: [] };
   }
 
-  log.info(`Content push query: "${searchQuery}" (topic: ${topic})`);
+  log.info(`Content push query: "${searchQuery}" (topic: ${topic}, bridge: ${bridge})`);
 
   // Step 2: Search the web
   let articleContent: string;
@@ -1367,6 +1595,7 @@ Rules:
       const extractPrompt = `From these search results about "${topic}", extract the most interesting finding for the user.
 
 **User interests**: ${interests}
+**Recommendation bridge**: ${bridge ?? why ?? "related to the user's interests"}
 
 Search results:
 ${resultText}
@@ -1381,7 +1610,11 @@ In 3-5 sentences, describe the most interesting finding. Be specific — mention
   } catch (err) {
     // Fallback to LLM knowledge
     log.info(`Content push: falling back to LLM knowledge (reason: ${err instanceof Error ? err.message : String(err)})`);
-    const fallbackPrompt = `Share an interesting recent development or insight related to "${interests}" in 3-5 sentences. Be specific and mention concrete details. Do NOT use numbered lists.`;
+    const fallbackPrompt = `Share an interesting insight about "${topic ?? searchQuery}" for a user interested in "${interests}".
+
+Explain the bridge: ${bridge ?? why ?? "why this adjacent topic may matter"}.
+
+Write 3-5 sentences. Be specific and mention concrete details. Do NOT use numbered lists.`;
     articleContent = await llmGenerator(fallbackPrompt);
   }
 
@@ -1405,6 +1638,8 @@ In 3-5 sentences, describe the most interesting finding. Be specific — mention
   const messagePrompt = `You found an interesting article/news item for the user based on their interests.
 
 **User interests**: ${interests}
+**Adjacent topic**: ${topic ?? searchQuery}
+**Why this connects**: ${bridge ?? why ?? "It is related to the user's interests."}
 **What you found**: ${articleContent}
 ${articleUrl ? `**Source**: ${articleUrl}` : ""}
 
@@ -1412,6 +1647,7 @@ ${langInstruction}
 
 Write 3-5 sentences as a natural message sharing this find. Rules:
 - Start with a natural opening about why you're sharing this
+- Make the connection to the user's original interest clear in one sentence
 - Highlight the most interesting point — be specific
 - ${articleUrl ? `Include the source URL at the end: ${articleUrl}` : "Do NOT make up URLs"}
 - Do NOT use numbered lists
