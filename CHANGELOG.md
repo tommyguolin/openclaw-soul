@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **Start Soul on OpenClaw gateway startup**: Added `activation.onStartup` to the plugin manifest so OpenClaw 2026.5.x loads Soul as a startup sidecar. Without this, `openclaw plugins list` could show Soul as enabled while the gateway never started the thought service.
+
 ## 2.4.0 (2026-04-19)
 
 ### Changes

@@ -124,6 +124,21 @@ openclaw config set tools.alsoAllow '["message"]'
 openclaw gateway restart
 ```
 
+Verify that Soul was loaded as a gateway startup plugin:
+
+```bash
+openclaw logs --plain --limit 200 | rg soul
+```
+
+For local linked installs, if `openclaw plugins list` shows Soul as enabled but the
+gateway logs do not show `[soul:plugin]` or `Soul thought service started`, refresh
+the plugin registry and restart the gateway:
+
+```bash
+openclaw plugins registry --refresh
+openclaw gateway restart
+```
+
 Soul auto-detects everything else:
 - **LLM** — Uses your `agents.defaults.model` config (the same model your AI assistant uses)
 - **Search** — Uses your `tools.web.search` provider

@@ -3,6 +3,9 @@
   "name": "Soul",
   "description": "Autonomous thinking, emotional awareness, and memory system for OpenClaw",
   "version": "2.4.0",
+  "activation": {
+    "onStartup": true
+  },
   "enabledByDefault": true,
   "configSchema": {
     "type": "object",
