@@ -118,6 +118,10 @@ openclaw config set hooks.token your-secret-token
 openclaw config set tools.alsoAllow '["message"]'
 ```
 
+Soul's plugin manifest includes `activation.onStartup`, so OpenClaw 2026.5.x
+loads the thought service automatically during gateway startup. This is bundled
+with the plugin; you do not need to add it to your OpenClaw config.
+
 ### 3. Restart gateway
 
 ```bash
