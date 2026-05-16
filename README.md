@@ -118,30 +118,20 @@ openclaw config set hooks.token your-secret-token
 openclaw config set tools.alsoAllow '["message"]'
 ```
 
-Soul's plugin manifest includes `activation.onStartup`, so OpenClaw 2026.5.x
-loads the thought service automatically during gateway startup. This is bundled
-with the plugin; you do not need to add it to your OpenClaw config.
-
 ### 3. Restart gateway
 
 ```bash
 openclaw gateway restart
 ```
 
-Verify that Soul was loaded as a gateway startup plugin:
+Verify that Soul started:
 
 ```bash
 openclaw logs --plain --limit 200 | rg soul
 ```
 
-For local linked installs, if `openclaw plugins list` shows Soul as enabled but the
-gateway logs do not show `[soul:plugin]` or `Soul thought service started`, refresh
-the plugin registry and restart the gateway:
-
-```bash
-openclaw plugins registry --refresh
-openclaw gateway restart
-```
+For local linked installs, run `openclaw plugins registry --refresh` before
+restarting if OpenClaw still uses stale plugin metadata.
 
 Soul auto-detects everything else:
 - **LLM** — Uses your `agents.defaults.model` config (the same model your AI assistant uses)
