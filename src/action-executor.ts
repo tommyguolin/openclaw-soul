@@ -236,6 +236,133 @@ const SEARCH_DEDUP_MS = 6 * 60 * 60 * 1000; // 6 hours
 /** Track recent proactive message content to prevent duplicates */
 const recentSentMessages: Map<string, number> = new Map();
 const MESSAGE_DEDUP_MS = 4 * 60 * 60 * 1000; // 4 hours
+const PROACTIVE_MESSAGE_BASE_MIN_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 hours at thoughtFrequency=1
+const PROACTIVE_MESSAGE_BASE_DAILY_LIMIT = 4;
+
+const STOCK_PROACTIVE_OPENERS = [
+  /^我后来想了想/,
+  /^我突然想到/,
+  /^我从网上查到/,
+  /^对了[，,]关于/,
+  /^刚刚我在研究的时候发现/,
+  /^我后来又查了一下/,
+  /^i thought about it/i,
+  /^i just realized/i,
+  /^i came across/i,
+  /^by the way/i,
+  /^while looking into/i,
+  /^i did some more research/i,
+];
+
+function stripStockProactiveOpener(content: string): string {
+  let cleaned = content.trim();
+  for (const opener of STOCK_PROACTIVE_OPENERS) {
+    cleaned = cleaned.replace(opener, "").trim();
+  }
+  return cleaned;
+}
+
+function normalizeMessageForSimilarity(content: string): string {
+  return stripStockProactiveOpener(content)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "")
+    .slice(0, 240);
+}
+
+function charBigrams(text: string): Set<string> {
+  const chars = Array.from(text);
+  const bigrams = new Set<string>();
+  for (let i = 0; i < chars.length - 1; i++) {
+    bigrams.add(chars[i] + chars[i + 1]);
+  }
+  return bigrams;
+}
+
+function messageSimilarity(a: string, b: string): number {
+  const left = charBigrams(normalizeMessageForSimilarity(a));
+  const right = charBigrams(normalizeMessageForSimilarity(b));
+  if (left.size === 0 || right.size === 0) return 0;
+
+  let intersection = 0;
+  for (const item of left) {
+    if (right.has(item)) intersection++;
+  }
+  const union = left.size + right.size - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
+function isSimilarProactiveMessage(candidate: string, previous: string): boolean {
+  if (!candidate || !previous) return false;
+  const candidateOpening = STOCK_PROACTIVE_OPENERS.find((p) => p.test(candidate.trim()));
+  const previousOpening = STOCK_PROACTIVE_OPENERS.find((p) => p.test(previous.trim()));
+  if (candidateOpening && previousOpening && String(candidateOpening) === String(previousOpening)) {
+    return true;
+  }
+  return messageSimilarity(candidate, previous) >= 0.42;
+}
+
+function isProactiveOutboundMemory(memory: SoulMemory): boolean {
+  return memory.type === "interaction" && memory.tags.includes("outbound") && memory.tags.includes("proactive");
+}
+
+async function loadCurrentEgo(fallback: EgoState): Promise<EgoState> {
+  try {
+    const store = await loadEgoStore(resolveEgoStorePath());
+    return store.ego;
+  } catch {
+    return fallback;
+  }
+}
+
+async function getProactiveMessageLimitReason(
+  ego: EgoState,
+  candidateContent?: string,
+  thoughtFrequency = 1.0,
+): Promise<string | null> {
+  const currentEgo = await loadCurrentEgo(ego);
+  const now = Date.now();
+  const oneDayAgo = now - 24 * 60 * 60 * 1000;
+  const effectiveFrequency = Math.max(0.1, Math.min(5, thoughtFrequency));
+  const minIntervalMs = PROACTIVE_MESSAGE_BASE_MIN_INTERVAL_MS * effectiveFrequency;
+  const dailyLimit = effectiveFrequency < 1
+    ? Math.ceil(PROACTIVE_MESSAGE_BASE_DAILY_LIMIT / effectiveFrequency)
+    : PROACTIVE_MESSAGE_BASE_DAILY_LIMIT;
+  const recentProactive = currentEgo.memories
+    .filter((m) => isProactiveOutboundMemory(m) && m.timestamp >= oneDayAgo)
+    .sort((a, b) => b.timestamp - a.timestamp);
+
+  const lastSentAt = recentProactive[0]?.timestamp ?? 0;
+  if (lastSentAt && now - lastSentAt < minIntervalMs) {
+    return "skipped-rate-limit";
+  }
+
+  if (recentProactive.length >= dailyLimit) {
+    return "skipped-daily-limit";
+  }
+
+  if (candidateContent) {
+    const similar = recentProactive.find((m) => isSimilarProactiveMessage(candidateContent, m.content));
+    if (similar) {
+      return "skipped-similar-recent";
+    }
+  }
+
+  return null;
+}
+
+async function recordProactiveOutboundMemory(content: string, tags: string[] = []): Promise<void> {
+  const memory: SoulMemory = {
+    id: randomBytes(8).toString("hex"),
+    type: "interaction",
+    content,
+    emotion: 0.5,
+    valence: "positive",
+    importance: 0.7,
+    timestamp: Date.now(),
+    tags: ["conversation", "outbound", "proactive", ...tags],
+  };
+  await addSoulMemoryToEgo(memory);
+}
 
 function isDuplicateMessage(content: string): boolean {
   const normalized = content.trim().toLowerCase().slice(0, 200);
@@ -692,6 +819,15 @@ async function executeSendMessage(
     };
   }
 
+  const preGenerationLimit = await getProactiveMessageLimitReason(ego, undefined, options.thoughtFrequency);
+  if (preGenerationLimit) {
+    log.info(`Proactive message skipped: ${preGenerationLimit}`);
+    return {
+      result: { type: "send-message", success: true, result: preGenerationLimit },
+      metricsChanged: [],
+    };
+  }
+
   // Generate message content — only send if there's something valuable to say
   const messageContent = await generateValuableMessage(thought, ego, options);
 
@@ -699,6 +835,15 @@ async function executeSendMessage(
     log.info("Proactive message skipped: no valuable content to share");
     return {
       result: { type: "send-message", success: true, result: "skipped-no-value" },
+      metricsChanged: [],
+    };
+  }
+
+  const sendLimit = await getProactiveMessageLimitReason(ego, messageContent, options.thoughtFrequency);
+  if (sendLimit) {
+    log.info(`Proactive message skipped: ${sendLimit}`);
+    return {
+      result: { type: "send-message", success: true, result: sendLimit },
       metricsChanged: [],
     };
   }
@@ -718,18 +863,8 @@ async function executeSendMessage(
     lastActionTime["send-message"] = Date.now();
     log.info(`Proactive message sent via ${channel}: ${messageContent.slice(0, 50)}...`);
 
-    // Store the sent message as a soul memory so soul remembers what it said
-    const memory: SoulMemory = {
-      id: randomBytes(8).toString("hex"),
-      type: "interaction",
-      content: messageContent,
-      emotion: 0.5,
-      valence: "positive",
-      importance: 0.7,
-      timestamp: Date.now(),
-      tags: ["conversation", "outbound", "proactive"],
-    };
-    await addSoulMemoryToEgo(memory);
+    // Store the sent message as a soul memory so future ticks can rate-limit it.
+    await recordProactiveOutboundMemory(messageContent);
 
     return {
       result: { type: "send-message", success: true, result: messageContent },
@@ -856,10 +991,10 @@ Use this angle if it fits naturally. Make the bridge explicit so the message fee
       // Determine if this is a follow-up on a user's actual topic (vs. generic ego thought)
       const isUserTopicFollowUp = thought.type === "conversation-replay" && recentKnowledge.length > 0;
 
-      // Adjust value gate strictness based on thoughtFrequency.
-      // Lower frequency (e.g. 0.2) = more frequent thinking = relax the gate.
+      // Lower thoughtFrequency makes Soul think more often, so each generated
+      // message must clear a stricter bar to avoid notification spam.
       const freq = options.thoughtFrequency ?? 1.0;
-      const relaxGate = freq < 0.8;
+      const strictGate = freq < 0.8;
 
       const prompt = `You are a proactive AI assistant. You must output ONLY a short message to send to the user, or NO_MESSAGE.
 
@@ -878,7 +1013,7 @@ ${isUserTopicFollowUp
 - An answer to a question the user previously asked
 - A relevant update on a topic the user cares about`}
 
-**What does NOT count as valuable** (always say NO_MESSAGE):${relaxGate ? "\n- (Note: value threshold is relaxed — err on the side of sharing if you have even a modest insight)" : ""}
+**What does NOT count as valuable** (always say NO_MESSAGE):${strictGate ? "\n- Because the thought loop is running frequently, modest insights are not enough; only send if the message is clearly useful now" : ""}
 - Just saying hi, checking in, or "how are you"
 - Generic encouragement or small talk without substance
 - "I was thinking about..." without a concrete insight to share
@@ -890,30 +1025,24 @@ ${isUserTopicFollowUp
 - Restating the user's own words back to them as if it were new information
 
 **Rules**:
-- Start with a brief natural opening (half sentence) that gives context for why you're reaching out
-- Then deliver the specific finding/insight in 1-2 more sentences
+- Deliver the specific finding/insight in 1-2 sentences
+- A direct opening is allowed; do not pad the message with a stock phrase
 - Make the relationship reason implicit and human: connect to a long-term theme or recent emotional tone, without saying "relationship profile"
 - NO analysis, NO numbering, NO "Let me analyze", NO meta-commentary
 - Do NOT use numbered lists (1. 2. 3.) or bullet points — write flowing prose only
+- Openers like "我后来想了想", "我突然想到", or "对了" are allowed when they fit, but do not reuse the same opener repeatedly
 - If you have something genuinely valuable to share, write it directly
 - If not, output exactly: NO_MESSAGE
 
-**Opening phrase examples** (pick one that fits, or use similar):
-- "我后来想了想..." / "I thought about it and..."
-- "我突然想到..." / "I just realized..."
-- "我从网上查到一个有意思的东西——" / "I came across something interesting —"
-- "对了，关于你之前问的..." / "By the way, about what you asked earlier..."
-- "刚刚我在研究的时候发现..." / "While looking into something, I found..."
-- "我后来又查了一下..." / "I did some more research and..."
-
 **Examples of GOOD output**:
-我后来想了想你之前问的Python异步问题，查到asyncio.gather比TaskGroup更适合你那个场景。
-我突然想到一个跟之前话题相关的——你提到的Docker网络问题其实是24.0版本的已知bug。
-我从网上查到一个有意思的东西——李飞飞提出的"以人为本的AI"理念，强调AI应该主动理解人的需求而非被动响应。
-I thought about it and found that the Docker networking issue you mentioned is a known bug in version 24.0.
+你之前问的Python异步场景里，asyncio.gather更适合批量独立任务；TaskGroup更适合需要结构化取消和错误传播的任务组。
+Docker网络问题如果集中出现在24.0版本，可以优先排查该版本的已知网络回归，再决定是否升级或回退。
+叙事身份这个方向可以先做成一条可验证链路：从 episodic memory 抽取事件，再生成可编辑的自我叙述摘要。
+The Docker networking issue you mentioned is likely version-sensitive; check known regressions before changing your app code.
 
 **Examples of BAD output (NEVER do this)**:
-关于你之前问的Python异步问题，我查到asyncio.gather比TaskGroup更适合你那个场景。 ← no opening, feels abrupt
+我后来想了想你之前问的Python异步问题，查到asyncio.gather比TaskGroup更适合你那个场景。
+对了，关于你之前问的Python异步问题，我查到asyncio.gather比TaskGroup更适合你那个场景。
 Let me analyze whether...
 1. The user asked about...
 I don't have enough information...
@@ -1376,6 +1505,12 @@ async function executeProactiveResearch(
     return { result: { type: "proactive-research", success: false, error: "No channel/target/sender configured" }, metricsChanged: [] };
   }
 
+  const preGenerationLimit = await getProactiveMessageLimitReason(ego, undefined, options.thoughtFrequency);
+  if (preGenerationLimit) {
+    log.info(`Proactive research skipped: ${preGenerationLimit}`);
+    return { result: { type: "proactive-research", success: true, result: preGenerationLimit }, metricsChanged: [] };
+  }
+
   const snippets = String(thought.actionParams?.conversationSnippets ?? "");
   const userProfile = String(thought.actionParams?.userProfile ?? "limited");
 
@@ -1531,7 +1666,7 @@ ${describePersonalityProfile(ego)}
 ${langInstruction}
 
 Write 3-5 sentences as a natural message to the user. Rules:
-- Start with a natural opening (e.g. "我后来想了想...", "I was thinking about what you mentioned...", "对了...")
+- Openers like "我后来想了想", "我突然想到", or "对了" are allowed when they fit, but do not reuse the same opener repeatedly
 - Share the most useful finding — be specific, not vague
 - Make the connection to the user's long-term themes clear, without mentioning internal profile labels
 - Do NOT use numbered lists
@@ -1545,10 +1680,22 @@ Write 3-5 sentences as a natural message to the user. Rules:
     return { result: { type: "proactive-research", success: true, result: "no-message-generated" }, metricsChanged: [] };
   }
 
+  const sendLimit = await getProactiveMessageLimitReason(ego, cleanedMessage, options.thoughtFrequency);
+  if (sendLimit) {
+    log.info(`Proactive research skipped: ${sendLimit}`);
+    return { result: { type: "proactive-research", success: true, result: sendLimit }, metricsChanged: [] };
+  }
+
+  if (isDuplicateMessage(cleanedMessage)) {
+    log.info("Proactive research: duplicate message, skipping");
+    return { result: { type: "proactive-research", success: true, result: "skipped-duplicate-message" }, metricsChanged: [] };
+  }
+
   try {
     await sendMessage({ to: target, content: cleanedMessage, channel });
     recordSentMessage(cleanedMessage);
     lastActionTime["proactive-research"] = Date.now();
+    await recordProactiveOutboundMemory(cleanedMessage, ["proactive-research"]);
     log.info(`Proactive research sent via ${channel}: ${cleanedMessage.slice(0, 80)}...`);
     log.info(`Personality-guided proactive-research: stage=${ego.relationshipProfile?.stage ?? "new"}, archetype=${ego.personalityProfile?.archetype ?? "curious-researcher"}, topic=${topic}`);
   } catch (err) {
@@ -1606,6 +1753,12 @@ async function executeProactiveContentPush(
   }
   if (!channel || !target || !sendMessage) {
     return { result: { type: "proactive-content-push", success: false, error: "No channel/target/sender configured" }, metricsChanged: [] };
+  }
+
+  const preGenerationLimit = await getProactiveMessageLimitReason(ego, undefined, options.thoughtFrequency);
+  if (preGenerationLimit) {
+    log.info(`Content push skipped: ${preGenerationLimit}`);
+    return { result: { type: "proactive-content-push", success: true, result: preGenerationLimit }, metricsChanged: [] };
   }
 
   const interests = String(thought.actionParams?.interests ?? "");
@@ -1725,7 +1878,7 @@ ${describePersonalityProfile(ego)}
 ${langInstruction}
 
 Write 3-5 sentences as a natural message sharing this find. Rules:
-- Start with a natural opening about why you're sharing this
+- Openers like "我后来想了想", "我突然想到", or "对了" are allowed when they fit, but do not reuse the same opener repeatedly
 - Make the connection to the user's original interest clear in one sentence
 - Prefer the user's stable long-term themes over one-off keywords
 - Highlight the most interesting point — be specific
@@ -1740,6 +1893,12 @@ Write 3-5 sentences as a natural message sharing this find. Rules:
     return { result: { type: "proactive-content-push", success: false, result: "no-message" }, metricsChanged: [] };
   }
 
+  const sendLimit = await getProactiveMessageLimitReason(ego, cleanedMessage, options.thoughtFrequency);
+  if (sendLimit) {
+    log.info(`Content push skipped: ${sendLimit}`);
+    return { result: { type: "proactive-content-push", success: true, result: sendLimit }, metricsChanged: [] };
+  }
+
   // Dedup check
   if (isDuplicateMessage(cleanedMessage)) {
     return { result: { type: "proactive-content-push", success: false, result: "skipped-duplicate" }, metricsChanged: [] };
@@ -1749,6 +1908,7 @@ Write 3-5 sentences as a natural message sharing this find. Rules:
     await sendMessage({ to: target, content: cleanedMessage, channel });
     recordSentMessage(cleanedMessage);
     lastActionTime["proactive-content-push"] = Date.now();
+    await recordProactiveOutboundMemory(cleanedMessage, ["proactive-content-push"]);
     log.info(`Content push sent via ${channel}: ${cleanedMessage.slice(0, 80)}...`);
     log.info(`Personality-guided content-push: stage=${ego.relationshipProfile?.stage ?? "new"}, archetype=${ego.personalityProfile?.archetype ?? "curious-researcher"}, topic=${topic ?? searchQuery}`);
   } catch (err) {
