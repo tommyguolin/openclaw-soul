@@ -143,6 +143,36 @@ export interface PersonalityTraits {
   neuroticism: number;
 }
 
+export type RelationshipStage = "new" | "familiar" | "trusted" | "companion";
+export type PersonalityArchetype = "curious-researcher" | "pragmatic-partner" | "warm-companion" | "quiet-observer";
+
+export interface PersonalityDriftEntry {
+  timestamp: number;
+  signal: string;
+  change: string;
+}
+
+export interface PersonalityProfile {
+  archetype: PersonalityArchetype;
+  tone: string;
+  values: string[];
+  expressionHabits: string[];
+  avoidBehaviors: string[];
+  driftLog: PersonalityDriftEntry[];
+  lastUpdatedAt: number;
+}
+
+export interface RelationshipProfile {
+  stage: RelationshipStage;
+  trust: number;
+  familiarity: number;
+  initiative: number;
+  communicationStyle: string;
+  longTermThemes: string[];
+  recentEmotionalTone: EmotionValence;
+  lastUpdatedAt: number;
+}
+
 export interface MemoryAssociation {
   targetId: string;
   strength: number;
@@ -258,9 +288,12 @@ export interface EgoState {
   userFacts: UserFact[];
   userPreferences: UserPreference[];
   personality: PersonalityTraits;
+  personalityProfile: PersonalityProfile;
+  relationshipProfile: RelationshipProfile;
   birthTime: number;
   lastThoughtTime: number | null;
   lastInteractionTime: number | null;
+  lastStartupGreetingAt: number | null;
   totalThoughts: number;
   totalInteractions: number;
   totalHelpfulActions: number;

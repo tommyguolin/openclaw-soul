@@ -16,6 +16,7 @@ import type {
 } from "./types.js";
 import { adjustProbability } from "./behavior-log.js";
 import { generateAdjacentContentIdeas, MEANINGLESS_QUERIES } from "./action-executor.js";
+import { describePersonalityProfile, describeRelationshipProfile } from "./relationship-profile.js";
 import { searchExternalMemories, formatMemoryContext } from "./openclaw-memory.js";
 
 const log = createSoulLogger("intelligent-thought");
@@ -950,6 +951,8 @@ export async function llmReRankOpportunities(
     .map((f) => `[${f.category}] ${f.content}`)
     .join("; ");
   const topicFocus = buildTopicFocusProfile(ctx.ego);
+  const relationshipProfile = describeRelationshipProfile(ctx.ego);
+  const personalityProfile = describePersonalityProfile(ctx.ego);
   const recentMessages = ctx.ego.memories
     .filter((m) => m.type === "interaction" && m.tags.includes("inbound"))
     .slice(-3)
@@ -971,6 +974,10 @@ export async function llmReRankOpportunities(
 
 User profile: ${userFacts || "limited"}
 Topic focus: ${topicFocus.summary || "none"}
+Relationship profile:
+${relationshipProfile}
+Personality profile:
+${personalityProfile}
 Recent messages: ${recentMessages || "none"}
 Time: ${ctx.currentHour}:00 ${days[ctx.dayOfWeek]}
 Recent executed actions (avoid repeating): ${historyStr}
@@ -984,6 +991,7 @@ Rules:
 - If long silence (>2h), boost send-message or bond-deepen
 - If user expressed interests recently, boost proactive-content-push
 - Prefer active topic focus and avoid deprioritized topics
+- Prefer actions that fit the personality profile without becoming repetitive
 - Avoid repeating recently executed action types
 - Prefer diverse actions over time
 
@@ -1496,6 +1504,7 @@ async function expandThoughtActionWithAdjacentIdea(
     .slice(0, 6)
     .map((m) => m.content);
   const topicFocus = buildTopicFocusProfile(ctx.ego);
+  const personalityPrefs = `${topicFocus.summary || ""}\n${describePersonalityProfile(ctx.ego)}`.trim();
 
   const isSearchAction = actionType === "search-web";
   const sourceText = isSearchAction
@@ -1515,7 +1524,7 @@ async function expandThoughtActionWithAdjacentIdea(
     actionType,
     sourceLabel: isSearchAction ? "Final thought before search execution" : "Selected thought before action execution",
     sourceText,
-    preferences: topicFocus.summary || undefined,
+    preferences: personalityPrefs || undefined,
     recentUserMessages,
     recentAvoidItems: [...recentAvoidItems, ...topicFocus.deprioritized.map((topic) => `deprioritized topic: ${topic}`)],
     requireSearchQuery: actionType === "search-web" || actionType === "proactive-research" || actionType === "proactive-content-push",

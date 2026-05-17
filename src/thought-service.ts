@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { createSoulLogger } from "./logger.js";
 import { executeThoughtAction, flushPendingShareMessage, isGoodTimeForMessage } from "./action-executor.js";
 import type { ActionExecutorOptions } from "./action-executor.js";
-import { markSuccess, expirePending, pruneEntries, logSuccessRateSummary } from "./behavior-log.js";
+import { expirePending } from "./behavior-log.js";
 import type { MessageSender } from "./soul-actions.js";
 import {
   shouldProgressAwakening,
@@ -35,6 +35,7 @@ import type { SentimentResult } from "./sentiment-analysis.js";
 import { createSoulLLMGenerator, type LLMGenerator, type SoulLLMConfig } from "./soul-llm.js";
 import { shouldGenerateThought, decayMetrics } from "./thought.js";
 import { runExpiryCycle } from "./expiry.js";
+import { updateRelationshipProfile } from "./relationship-profile.js";
 import type {
   EgoState,
   Thought,
@@ -425,14 +426,24 @@ export class ThoughtService {
       return;
     }
 
-    // Only greet on first boot or after a long absence — otherwise frequent
-    // gateway restarts spam "Soul just woke up" at the user.
+    // Only greet on first boot or after a long absence. Track the greeting
+    // itself so repeated gateway restarts do not spam the user before any
+    // interaction has been recorded.
     const STARTUP_GREETING_MIN_ABSENCE_HOURS = 12;
-    const isFirstBoot = !ego.lastInteractionTime;
-    const hours = ego.lastInteractionTime
-      ? Math.floor((Date.now() - ego.lastInteractionTime) / (1000 * 60 * 60))
+    const now = Date.now();
+    const lastContactAt = ego.lastInteractionTime ?? ego.lastStartupGreetingAt;
+    const lastGreetingHours = ego.lastStartupGreetingAt
+      ? Math.floor((now - ego.lastStartupGreetingAt) / (1000 * 60 * 60))
+      : null;
+    if (lastGreetingHours !== null && lastGreetingHours < STARTUP_GREETING_MIN_ABSENCE_HOURS) {
+      return;
+    }
+
+    const hasNoContactHistory = !lastContactAt;
+    const hours = lastContactAt
+      ? Math.floor((now - lastContactAt) / (1000 * 60 * 60))
       : 0;
-    if (!isFirstBoot && hours < STARTUP_GREETING_MIN_ABSENCE_HOURS) {
+    if (!hasNoContactHistory && hours < STARTUP_GREETING_MIN_ABSENCE_HOURS) {
       return;
     }
 
@@ -450,6 +461,10 @@ export class ThoughtService {
         to: this.proactiveTarget,
         content: greeting,
         channel: this.proactiveChannel,
+      });
+      await updateEgoStore(this.storePath, (e) => {
+        e.lastStartupGreetingAt = Date.now();
+        return e;
       });
       log.info(`Startup greeting sent via ${this.proactiveChannel}`);
     } catch (err) {
@@ -992,7 +1007,7 @@ export class ThoughtService {
       const resultStr = typeof actionResult.result.result === "string"
         ? actionResult.result.result.slice(0, 100)
         : JSON.stringify(actionResult.result.result)?.slice(0, 100);
-      log.info(`Thought action executed: ${thought.actionType}`, { result: resultStr });
+      log.info(`Thought action executed: ${thought.actionType} ${resultStr ?? ""}`.trim());
 
       // Track action history for re-ranking diversity
       this.recentActionHistory.push(thought.actionType ?? "none");
@@ -1017,6 +1032,11 @@ export class ThoughtService {
       }
     } else if (actionResult.result.error) {
       log.warn(`Thought action failed: ${thought.actionType}`, actionResult.result.error);
+    } else {
+      const resultStr = typeof actionResult.result.result === "string"
+        ? actionResult.result.result.slice(0, 100)
+        : JSON.stringify(actionResult.result.result)?.slice(0, 100);
+      log.info(`Thought action not completed: ${thought.actionType} ${resultStr ?? ""}`.trim());
     }
   }
 
@@ -1232,6 +1252,11 @@ export class ThoughtService {
         ego.totalSentimentSamples += 1;
       }
 
+      updateRelationshipProfile(ego, {
+        type,
+        valence: sentiment > 0.1 ? "positive" : sentiment < -0.1 ? "negative" : "neutral",
+      });
+
       // --- Behavior log: mark recent pending actions as successful ---
       if (type === "inbound" && ego.behaviorLog) {
         const twoHoursAgo = Date.now() - 2 * 60 * 60 * 1000;
@@ -1304,6 +1329,12 @@ export class ThoughtService {
           );
         }
       }
+
+      updateRelationshipProfile(ego, {
+        type,
+        valence: sentiment.score > 0.1 ? "positive" : sentiment.score < -0.1 ? "negative" : "neutral",
+        message: text,
+      });
 
       // Store the conversation content as an interaction memory
       // Keep only recent interactions to avoid unbounded growth
@@ -1503,6 +1534,7 @@ export class ThoughtService {
 
       await updateEgoStore(this.storePath, (ego) => {
         ego.userFacts = allFacts;
+        updateRelationshipProfile(ego);
 
         // Progress goal "Know the User" based on accumulated user facts
         const understandGoal = ego.goals.find(
@@ -1602,6 +1634,7 @@ export class ThoughtService {
 
       await updateEgoStore(this.storePath, (ego) => {
         ego.userPreferences = allPrefs;
+        updateRelationshipProfile(ego);
         return ego;
       });
 

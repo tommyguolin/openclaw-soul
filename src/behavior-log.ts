@@ -3,7 +3,6 @@ import { createSoulLogger } from "./logger.js";
 import type {
   ActionType,
   BehaviorEntry,
-  BehaviorOutcome,
   ActionSuccessRate,
   EgoState,
 } from "./types.js";
@@ -54,18 +53,6 @@ export function markSuccess(entries: BehaviorEntry[], actionId: string): boolean
     entry.outcome = "success";
     entry.resolvedAt = Date.now();
     return true;
-  }
-  // Also try fuzzy match if exact id not found (handles sub-agent spawned tasks)
-  if (actionId && entries.length > 0) {
-    const fuzzyMatch = entries.find((e) => 
-      e.id.includes(actionId.slice(0, 6)) || 
-      actionId.includes(e.id.slice(0, 6))
-    );
-    if (fuzzyMatch && fuzzyMatch.outcome === "pending") {
-      fuzzyMatch.outcome = "success";
-      fuzzyMatch.resolvedAt = Date.now();
-      return true;
-    }
   }
   return false;
 }

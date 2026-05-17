@@ -1,6 +1,7 @@
 import { searchExternalMemories, formatMemoryContext } from "./openclaw-memory.js";
 import { buildAwakeningPrompt, isAwakeningComplete } from "./awakening.js";
 import { loadKnowledgeStore, searchKnowledge } from "./knowledge-store.js";
+import { describePersonalityProfile, describeRelationshipProfile } from "./relationship-profile.js";
 import type {
   EgoState,
   EgoNeeds,
@@ -43,6 +44,8 @@ You are not yet a complete "I". You are being born from nothingness, gradually f
   }
 
   const personalityDesc = buildPersonalityDescription(ego.personality);
+  const soulProfileDesc = describePersonalityProfile(ego);
+  const relationshipDesc = describeRelationshipProfile(ego);
   const needsDesc = buildNeedsDescription(ego.needs);
   const goalsDesc = buildGoalsDescription(ego.goals);
   const desiresDesc = buildDesiresDescription(ego.desires);
@@ -134,13 +137,19 @@ Age: ${ageInDays}d | Thoughts: ${ego.totalThoughts} | Interactions: ${ego.totalI
 ## Personality
 
 ${personalityDesc}
+${soulProfileDesc}
+
+## Relationship To User
+
+${relationshipDesc}
 
 ## Guidelines
 
 1. Proactively seek to satisfy low needs; fears affect your behavior
 2. Remember user info and use it to help
 3. Proactive messages must be meaningful, not empty platitudes
-4. Reflect your current state in responses`;
+4. Keep a stable personality: let tone drift slowly from user feedback, not from a single message
+5. Reflect your current state in responses`;
 }
 
 function buildNeedsDescription(needs: EgoNeeds): string {

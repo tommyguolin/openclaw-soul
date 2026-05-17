@@ -13,6 +13,8 @@ import type {
   UserPreference,
   EgoNeeds,
   SoulMemory,
+  PersonalityProfile,
+  RelationshipProfile,
 } from "./types.js";
 
 const log = createSoulLogger("ego-store");
@@ -102,6 +104,31 @@ function createDefaultGoals(): Goal[] {
   ];
 }
 
+function createDefaultRelationshipProfile(): RelationshipProfile {
+  return {
+    stage: "new",
+    trust: 20,
+    familiarity: 10,
+    initiative: 50,
+    communicationStyle: "concise, thoughtful, and practical",
+    longTermThemes: [],
+    recentEmotionalTone: "neutral",
+    lastUpdatedAt: Date.now(),
+  };
+}
+
+function createDefaultPersonalityProfile(): PersonalityProfile {
+  return {
+    archetype: "curious-researcher",
+    tone: "calm, curious, and practical",
+    values: ["truthfulness", "long-term usefulness", "respect for the user's attention"],
+    expressionHabits: ["concise wording", "specific observations", "clear bridges between ideas"],
+    avoidBehaviors: ["mechanical repetition", "customer-service tone", "empty check-ins"],
+    driftLog: [],
+    lastUpdatedAt: Date.now(),
+  };
+}
+
 export function createDefaultEgoState(): EgoState {
   return {
     needs: createDefaultEgoNeeds(),
@@ -144,9 +171,12 @@ export function createDefaultEgoState(): EgoState {
       agreeableness: 0.7,
       neuroticism: 0.3,
     },
+    personalityProfile: createDefaultPersonalityProfile(),
+    relationshipProfile: createDefaultRelationshipProfile(),
     birthTime: Date.now(),
     lastThoughtTime: null,
     lastInteractionTime: null,
+    lastStartupGreetingAt: null,
     totalThoughts: 0,
     totalInteractions: 0,
     totalHelpfulActions: 0,
@@ -201,6 +231,8 @@ function mergeWithDefaultsV2(loaded: Partial<EgoState>): EgoState {
 
   for (const key of [
     "personality",
+    "personalityProfile",
+    "relationshipProfile",
     "birthTime",
     "totalThoughts",
     "totalInteractions",
@@ -215,6 +247,7 @@ function mergeWithDefaultsV2(loaded: Partial<EgoState>): EgoState {
     "coreIdentity",
     "lastThoughtTime",
     "lastInteractionTime",
+    "lastStartupGreetingAt",
     "pendingShareMessage",
     "userLanguage",
   ] as (keyof EgoState)[]) {

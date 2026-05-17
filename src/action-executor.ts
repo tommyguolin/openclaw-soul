@@ -21,9 +21,9 @@ import {
   createBehaviorEntry,
   expirePending,
   pruneEntries,
-  markSuccess,
 } from "./behavior-log.js";
 import { isLLMErrorContent as isLLMErrorOutput } from "./llm-errors.js";
+import { describePersonalityProfile, describeRelationshipProfile } from "./relationship-profile.js";
 
 const log = createSoulLogger("action-executor");
 
@@ -32,7 +32,8 @@ const EGO_STATE_PATTERNS = [
   /need (could improve|critically low|is low|is somewhat)/i,
   /\b(ideal|current)\b.*\b(need|state)\b/i,
   /\bneed\b.*\b(improve|low|high|gap)\b/i,
-  /survival|connection|growth|meaning|security/i,
+  /\b(survival|connection|growth|meaning|security)\b.{0,24}\bneed\b/i,
+  /\bneed\b.{0,24}\b(survival|connection|growth|meaning|security)\b/i,
   /我(的|可以|应该|需要).{0,5}(需求|状态|提升|改善)/,
 ];
 
@@ -44,8 +45,6 @@ const EGO_STATE_PATTERNS = [
 function isEgoStateQuery(text: string): boolean {
   if (!text) return true;
   const trimmed = text.trim();
-  // Too long — likely a full user message verbatim
-  if (trimmed.length > 60) return true;
   return EGO_STATE_PATTERNS.some((p) => p.test(trimmed));
 }
 
@@ -788,6 +787,7 @@ async function generateValuableMessage(
       const userInfo = userFacts.length > 0
         ? userFacts.map((f) => `[${f.category}] ${f.content}`).join("\n")
         : "";
+      const soulProfileContext = `${describeRelationshipProfile(ego)}\n${describePersonalityProfile(ego)}`;
 
       // Conversation history — include timestamps for context
       const interactionContext = recentInteractions.length > 0
@@ -867,7 +867,7 @@ ${langInstruction}
 ${timeContext}
 
 **Context**:
-${userInfo ? `User profile:\n${userInfo}\n` : ""}${interactionContext ? `Recent conversations:\n${interactionContext}\n` : ""}${knowledgeContext ? `Knowledge I've learned:\n${knowledgeContext}\n` : ""}${options.workspaceContext ? `Workspace rules:\n${options.workspaceContext}\n` : ""}${thought.type !== "bond-deepen" ? `Thought: ${thought.motivation}` : ""}
+${userInfo ? `User profile:\n${userInfo}\n` : ""}Relationship/personality profile:\n${soulProfileContext}\n${interactionContext ? `Recent conversations:\n${interactionContext}\n` : ""}${knowledgeContext ? `Knowledge I've learned:\n${knowledgeContext}\n` : ""}${options.workspaceContext ? `Workspace rules:\n${options.workspaceContext}\n` : ""}${thought.type !== "bond-deepen" ? `Thought: ${thought.motivation}` : ""}
 ${adjacentGuidance}
 
 ${isUserTopicFollowUp
@@ -892,6 +892,7 @@ ${isUserTopicFollowUp
 **Rules**:
 - Start with a brief natural opening (half sentence) that gives context for why you're reaching out
 - Then deliver the specific finding/insight in 1-2 more sentences
+- Make the relationship reason implicit and human: connect to a long-term theme or recent emotional tone, without saying "relationship profile"
 - NO analysis, NO numbering, NO "Let me analyze", NO meta-commentary
 - Do NOT use numbered lists (1. 2. 3.) or bullet points — write flowing prose only
 - If you have something genuinely valuable to share, write it directly
@@ -932,6 +933,13 @@ Output the message or NO_MESSAGE now:`;
       cleaned = stripMetaAnalysis(cleaned);
 
       log.info(`Value gate: ${recentInteractions.length} interactions, ${ego.memories.length} memories, LLM said: ${cleaned.slice(0, 60)}`);
+      if (cleaned && cleaned.toUpperCase() !== "NO_MESSAGE") {
+        const profile = ego.relationshipProfile;
+        const personality = ego.personalityProfile;
+        log.info(
+          `Personality-guided message: stage=${profile?.stage ?? "new"}, archetype=${personality?.archetype ?? "curious-researcher"}, themes=${profile?.longTermThemes?.slice(0, 3).join("|") || "none"}`,
+        );
+      }
 
       // Reject LLM error messages that leaked through as "content"
       if (isLLMErrorOutput(cleaned)) {
@@ -1516,11 +1524,16 @@ Write 3-5 concise insights in flowing prose (NOT a numbered list). Each insight 
 **What you found**:
 ${researchContent}
 
+**Relationship/personality profile**:
+${describeRelationshipProfile(ego)}
+${describePersonalityProfile(ego)}
+
 ${langInstruction}
 
 Write 3-5 sentences as a natural message to the user. Rules:
 - Start with a natural opening (e.g. "我后来想了想...", "I was thinking about what you mentioned...", "对了...")
 - Share the most useful finding — be specific, not vague
+- Make the connection to the user's long-term themes clear, without mentioning internal profile labels
 - Do NOT use numbered lists
 - Do NOT say "I searched" or "I researched" — just share the finding naturally
 - Sound like a knowledgeable friend who cares`;
@@ -1537,6 +1550,7 @@ Write 3-5 sentences as a natural message to the user. Rules:
     recordSentMessage(cleanedMessage);
     lastActionTime["proactive-research"] = Date.now();
     log.info(`Proactive research sent via ${channel}: ${cleanedMessage.slice(0, 80)}...`);
+    log.info(`Personality-guided proactive-research: stage=${ego.relationshipProfile?.stage ?? "new"}, archetype=${ego.personalityProfile?.archetype ?? "curious-researcher"}, topic=${topic}`);
   } catch (err) {
     return { result: { type: "proactive-research", success: false, error: String(err) }, metricsChanged: [] };
   }
@@ -1599,7 +1613,7 @@ async function executeProactiveContentPush(
   const regionHint = String(thought.actionParams?.regionHint ?? "international sources");
 
   if (!interests || interests.length < 5) {
-    return { result: { type: "proactive-content-push", success: true, result: "skipped-no-interests" }, metricsChanged: [] };
+    return { result: { type: "proactive-content-push", success: false, result: "skipped-no-interests" }, metricsChanged: [] };
   }
 
   const recentPushes = ego.memories
@@ -1633,7 +1647,7 @@ async function executeProactiveContentPush(
   }
 
   if (!searchQuery) {
-    return { result: { type: "proactive-content-push", success: true, result: "no-query-generated" }, metricsChanged: [] };
+    return { result: { type: "proactive-content-push", success: false, result: "no-query-generated" }, metricsChanged: [] };
   }
 
   log.info(`Content push query: "${searchQuery}" (topic: ${topic}, bridge: ${bridge})`);
@@ -1681,7 +1695,7 @@ Write 3-5 sentences. Be specific and mention concrete details. Do NOT use number
 
   articleContent = articleContent.replace(/<think[\s\S]*?<\/think>/gi, "").trim().slice(0, 500);
   if (!articleContent || articleContent.length < 20) {
-    return { result: { type: "proactive-content-push", success: true, result: "no-content" }, metricsChanged: [] };
+    return { result: { type: "proactive-content-push", success: false, result: "no-content" }, metricsChanged: [] };
   }
 
   // Step 3: Generate message
@@ -1704,11 +1718,16 @@ Write 3-5 sentences. Be specific and mention concrete details. Do NOT use number
 **What you found**: ${articleContent}
 ${articleUrl ? `**Source**: ${articleUrl}` : ""}
 
+**Relationship/personality profile**:
+${describeRelationshipProfile(ego)}
+${describePersonalityProfile(ego)}
+
 ${langInstruction}
 
 Write 3-5 sentences as a natural message sharing this find. Rules:
 - Start with a natural opening about why you're sharing this
 - Make the connection to the user's original interest clear in one sentence
+- Prefer the user's stable long-term themes over one-off keywords
 - Highlight the most interesting point — be specific
 - ${articleUrl ? `Include the source URL at the end: ${articleUrl}` : "Do NOT make up URLs"}
 - Do NOT use numbered lists
@@ -1718,12 +1737,12 @@ Write 3-5 sentences as a natural message sharing this find. Rules:
   const cleanedMessage = cleanOutgoingGeneratedMessage(message, 500);
 
   if (!cleanedMessage || cleanedMessage.length < 10) {
-    return { result: { type: "proactive-content-push", success: true, result: "no-message" }, metricsChanged: [] };
+    return { result: { type: "proactive-content-push", success: false, result: "no-message" }, metricsChanged: [] };
   }
 
   // Dedup check
   if (isDuplicateMessage(cleanedMessage)) {
-    return { result: { type: "proactive-content-push", success: true, result: "skipped-duplicate" }, metricsChanged: [] };
+    return { result: { type: "proactive-content-push", success: false, result: "skipped-duplicate" }, metricsChanged: [] };
   }
 
   try {
@@ -1731,6 +1750,7 @@ Write 3-5 sentences as a natural message sharing this find. Rules:
     recordSentMessage(cleanedMessage);
     lastActionTime["proactive-content-push"] = Date.now();
     log.info(`Content push sent via ${channel}: ${cleanedMessage.slice(0, 80)}...`);
+    log.info(`Personality-guided content-push: stage=${ego.relationshipProfile?.stage ?? "new"}, archetype=${ego.personalityProfile?.archetype ?? "curious-researcher"}, topic=${topic ?? searchQuery}`);
   } catch (err) {
     return { result: { type: "proactive-content-push", success: false, error: String(err) }, metricsChanged: [] };
   }

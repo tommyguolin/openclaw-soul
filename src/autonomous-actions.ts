@@ -556,7 +556,20 @@ Output ONLY the message, nothing else.`;
 // executeObserveAndImprove — analyze and fix code in any project
 // ---------------------------------------------------------------------------
 
-const SOUL_SRC_DIR = dirname(fileURLToPath(import.meta.url));
+function resolveSoulSourceDir(): string {
+  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  const repoSrc = resolve(moduleDir, "..", "..", "src");
+  try {
+    if (statSync(repoSrc).isDirectory()) {
+      return repoSrc;
+    }
+  } catch {
+    // Fall back to the runtime module directory in packaged installs.
+  }
+  return moduleDir;
+}
+
+const SOUL_SRC_DIR = resolveSoulSourceDir();
 
 // Files that must NOT be auto-modified (entry points, type definitions)
 const PROTECTED_FILES = new Set(["index.ts", "types.ts", "paths.ts", "logger.ts"]);
@@ -737,7 +750,10 @@ Rules:
         const problem = problemMatch ? problemMatch[1] : "unknown";
         const explanation = explanationMatch ? explanationMatch[1] : "";
 
-        if (readOnlyMode) {
+        if (!allFiles.includes(fixFile)) {
+          fixDescription = `Fix not applied: ${fixFile} is not in available source files`;
+          log.info(`Ignored ungrounded improvement recommendation for ${fixFile}`);
+        } else if (readOnlyMode) {
           fixDescription = `Read-only recommendation for ${fixFile}: ${explanation || problem}`;
         } else if (PROTECTED_FILES.has(fixFile)) {
           fixDescription = `Fix not applied: ${fixFile} is a protected file`;
