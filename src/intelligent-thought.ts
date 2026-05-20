@@ -428,6 +428,44 @@ function isGenuineQuestion(text: string): boolean {
   return (hasQuestionMark || hasQuestionWord) && substance >= 6;
 }
 
+const EXECUTION_DIRECTIVE_RE = new RegExp([
+  "\\b(?:ssh|deploy|run|execute|start|restart|stop|tail|grep|check|inspect|modify|change|edit|fix|debug|optimi[sz]e|improve|refactor|apply|write|patch|set)\\b",
+  "(?:\\u4f18\\u5316|\\u4fee\\u6539|\\u6539\\u8fdb|\\u6539\\u5584|\\u4fee\\u590d|\\u6267\\u884c|\\u90e8\\u7f72|\\u68c0\\u67e5|\\u67e5\\u770b|\\u6392\\u67e5|\\u8c03\\u8bd5|\\u8fd0\\u884c)",
+].join("|"), "i");
+
+const REMOTE_EXECUTION_RE = new RegExp([
+  "\\b(?:ssh|server|remote|deploy|process|service|log|logs|tail|grep|restart|start|stop)\\b",
+  "(?:\\u670d\\u52a1\\u5668|\\u5b9e\\u76d8|\\u8fdb\\u7a0b|\\u65e5\\u5fd7|\\u90e8\\u7f72|\\u542f\\u52a8|\\u91cd\\u542f)",
+].join("|"), "i");
+
+const PROJECT_OPTIMIZATION_RE = new RegExp([
+  "\\b(?:project|repo|repository|codebase|directory|folder|strategy|system)\\b",
+  "(?:\\u9879\\u76ee|\\u76ee\\u5f55|\\u4ee3\\u7801|\\u7b56\\u7565|\\u7cfb\\u7edf|\\u4ed3\\u5e93)",
+].join("|"), "i");
+
+function isExecutionDirective(text: string): boolean {
+  return EXECUTION_DIRECTIVE_RE.test(text);
+}
+
+function shouldUseAgentForDirective(text: string): boolean {
+  return REMOTE_EXECUTION_RE.test(text);
+}
+
+function shouldUseObserveAndImproveForDirective(text: string): boolean {
+  return PROJECT_OPTIMIZATION_RE.test(text) || /(?:^|\s|["'`])(?:[A-Za-z]:[\\/]|\/mnt\/[A-Za-z]\/|\/[A-Za-z]\/|~[\\/])/.test(text);
+}
+
+export function isExecutionFocusedOpportunity(opportunity: DetectedThoughtOpportunity): boolean {
+  const action = opportunity.suggestedAction;
+  if (action === "observe-and-improve" || action === "run-agent-task" || action === "invoke-tool") {
+    return true;
+  }
+  if (action === "analyze-problem") {
+    return isExecutionDirective(`${opportunity.triggerDetail} ${opportunity.motivation}`);
+  }
+  return false;
+}
+
 /**
  * Analyze conversations and user profile to generate opportunities for
  * sharing value. This is Soul's core differentiator:
@@ -463,6 +501,31 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
   // (lowered so proactive messages reach users faster)
   if (recentInteractions.length > 0 && ctx.timeSinceLastInteraction < 5 * 60 * 1000) {
     return opportunities;
+  }
+
+  const directiveMemories = recentInteractions.filter((m) =>
+    m.tags.includes("inbound") &&
+    isExecutionDirective(m.content) &&
+    !matchesAnyTopic(m.content, topicFocus.deprioritized)
+  );
+
+  for (const mem of directiveMemories.slice(0, 2)) {
+    const content = mem.content.slice(0, 160);
+    const useAgent = shouldUseAgentForDirective(mem.content);
+    const useImprove = shouldUseObserveAndImproveForDirective(mem.content);
+    opportunities.push({
+      type: "conversation-replay",
+      trigger: "memory",
+      triggerDetail: `User execution directive: "${content}"`,
+      priority: useAgent || useImprove ? 95 : 88,
+      source: "user-interaction",
+      relatedNeeds: ["growth", "meaning"],
+      motivation: `User gave an execution-oriented directive; act on it instead of researching it: "${content}"`,
+      suggestedAction: useAgent ? "run-agent-task" : useImprove ? "observe-and-improve" : "analyze-problem",
+      actionParams: useAgent || useImprove
+        ? { reason: mem.content.slice(0, 300) }
+        : { reason: mem.content.slice(0, 300), logPaths: extractFilePaths(mem.content), sourcePaths: [] },
+    });
   }
 
   // =====================================================
@@ -988,6 +1051,8 @@ ${candidateLines}
 Rules:
 - If user mentioned plans (travel, events, purchases, learning), boost proactive-research and proactive-content-push
 - If user is actively debugging/troubleshooting, boost observe-and-improve
+- If a candidate has action observe-and-improve, run-agent-task, invoke-tool, or an execution-oriented analyze-problem, keep it above search, memory, learning, and reporting
+- If the user asked to modify, execute, deploy, inspect logs, run scripts, or optimize a project, do not convert that into search-web
 - If long silence (>2h), boost send-message or bond-deepen
 - If user expressed interests recently, boost proactive-content-push
 - Prefer active topic focus and avoid deprioritized topics
@@ -1238,6 +1303,14 @@ function determineActionForOpportunity(
   // from being hijacked by completedUndeliveredTasks/completableFixTasks.
   if (type === "bond-deepen") {
     return { actionType: "send-message" };
+  }
+
+  const pendingFixTask = (ego.activeTasks ?? []).find(
+    (t) => t.status === "completed" && !t.resultDelivered && t.result &&
+      /fix|淇|瑙ｅ喅|suggest|recommend|change|淇敼|浼樺寲|improve/i.test(t.result),
+  );
+  if (pendingFixTask) {
+    return { actionType: "run-agent-task" };
   }
 
   // --- Autonomous action routing (high priority, before learn-topic) ---
@@ -1666,7 +1739,7 @@ export async function generateIntelligentThought(
       // EXCEPTION: don't override explicit suggestedActions that are deliberate
       // proactive actions (observe-and-improve, proactive-research, proactive-content-push).
       const strongProblemIndicators = /排查.*问题|分析.*错误|修复.*bug|debug|fix.*issue|diagnos|investigate.*error|read.*log.*file|检查.*日志|读取.*文件.*错误/i;
-      const protectedActions = new Set(["observe-and-improve", "proactive-research", "proactive-content-push"]);
+      const protectedActions = new Set(["observe-and-improve", "run-agent-task", "invoke-tool", "analyze-problem", "proactive-research", "proactive-content-push"]);
       const isProtectedAction = protectedActions.has(selectedOpportunity.suggestedAction ?? "");
       if (!isProtectedAction &&
           strongProblemIndicators.test(refinedContent) &&

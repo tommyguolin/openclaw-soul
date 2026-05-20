@@ -294,6 +294,7 @@ export interface EgoState {
   lastThoughtTime: number | null;
   lastInteractionTime: number | null;
   lastStartupGreetingAt: number | null;
+  lastAutonomousActionsPromptAt: number | null;
   totalThoughts: number;
   totalInteractions: number;
   totalHelpfulActions: number;

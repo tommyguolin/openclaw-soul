@@ -17,6 +17,7 @@ import {
   detectThoughtOpportunities,
   llmReRankOpportunities,
   buildThoughtFromOpportunity,
+  isExecutionFocusedOpportunity,
 } from "./intelligent-thought.js";
 import { loadWorkspaceContext } from "./paths.js";
 import { pollActiveTasks as pollAutonomousTasks } from "./autonomous-actions.js";
@@ -491,6 +492,7 @@ export class ThoughtService {
       await this.runExpiryIfDue();
       await this.resolveStalePendingEntries();
       await this.syncSelfImprovementGoal();
+      await this.maybePromptForAutonomousActions();
       await this.maybeRefreshWorkspaceContext();
       await this.flushPendingMessage();
       await this.pollActiveTasks();
@@ -553,6 +555,54 @@ export class ThoughtService {
 
     log.info("Created goal-self-improve from userFacts directive");
     this.selfImprovementGoalSynced = true;
+  }
+
+  private async maybePromptForAutonomousActions(): Promise<void> {
+    if (this.autonomousActions) return;
+    if (!this.sendMessage || !this.proactiveChannel || !this.proactiveTarget) return;
+    if (!isGoodTimeForMessage()) return;
+
+    const store = await loadEgoStore(this.storePath);
+    const ego = store.ego;
+    const oneDayMs = 24 * 60 * 60 * 1000;
+    if (ego.lastAutonomousActionsPromptAt && Date.now() - ego.lastAutonomousActionsPromptAt < oneDayMs) {
+      return;
+    }
+
+    if (!this.hasAutonomousWorkDirective(ego)) {
+      return;
+    }
+
+    const wantsChinese = ego.userLanguage === "zh-CN" ||
+      (ego.recentUserMessages ?? []).some((m) => /[\u4e00-\u9fff]/.test(m));
+    const content = wantsChinese
+      ? "我检测到你希望我自动优化或修改项目，但 autonomousActions 还没有开启。要不要开启？开启后我才能自动改文件、运行写入类命令；未开启时只能分析和给建议。"
+      : "I noticed you want me to autonomously optimize or modify a project, but autonomousActions is not enabled. Do you want to enable it? With it on I can edit files and run write-capable commands; with it off I can only analyze and suggest changes.";
+
+    try {
+      await this.sendMessage({
+        to: this.proactiveTarget,
+        content,
+        channel: this.proactiveChannel,
+      });
+      await updateEgoStore(this.storePath, (e) => {
+        e.lastAutonomousActionsPromptAt = Date.now();
+        return e;
+      });
+      log.info("Prompted user to enable autonomousActions");
+    } catch (err) {
+      log.warn(`Failed to prompt for autonomousActions: ${String(err)}`);
+    }
+  }
+
+  private hasAutonomousWorkDirective(ego: EgoState): boolean {
+    const directiveRe = /(?:\b(?:autonomous|optimi[sz]e|improve|modify|edit|write|patch|fix|deploy|execute|run|ssh)\b|\u4f18\u5316|\u4fee\u6539|\u6539\u8fdb|\u6539\u5584|\u4fee\u590d|\u6267\u884c|\u90e8\u7f72|\u81ea\u4e3b|\u9879\u76ee|\u76ee\u5f55|\u4ee3\u7801)/i;
+    const texts = [
+      ...(ego.goals ?? []).filter((g) => g.status === "active").map((g) => `${g.title} ${g.description}`),
+      ...(ego.userFacts ?? []).filter((f) => f.confidence >= 0.6).map((f) => f.content),
+      ...(ego.recentUserMessages ?? []).slice(-10),
+    ];
+    return texts.some((text) => directiveRe.test(text));
   }
 
   /**
@@ -815,7 +865,7 @@ export class ThoughtService {
           }
 
           const nonRepeatingOpportunities = this.recentThoughtTypes.length > 0
-            ? opportunities.filter((o) => !this.recentThoughtTypes.includes(o.type))
+            ? opportunities.filter((o) => isExecutionFocusedOpportunity(o) || !this.recentThoughtTypes.includes(o.type))
             : opportunities;
 
           // Context-aware LLM re-ranking
@@ -827,6 +877,13 @@ export class ThoughtService {
                 topCandidates, ctx, this.recentActionHistory, this.llmGenerator,
               );
               selectedOpportunity = reRanked[0];
+              const executionCandidate = topCandidates.find(isExecutionFocusedOpportunity);
+              if (executionCandidate && selectedOpportunity !== executionCandidate) {
+                const selectedAction = selectedOpportunity?.suggestedAction ?? selectedOpportunity?.type ?? "?";
+                const executionAction = executionCandidate.suggestedAction ?? executionCandidate.type;
+                log.info(`Execution directive protected: selected ${executionAction} over ${selectedAction}`);
+                selectedOpportunity = executionCandidate;
+              }
               const newAction = selectedOpportunity?.suggestedAction ?? selectedOpportunity?.type ?? "?";
               const oldAction = topCandidates[0]?.suggestedAction ?? topCandidates[0]?.type ?? "?";
               if (newAction !== oldAction) {

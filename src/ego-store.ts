@@ -177,6 +177,7 @@ export function createDefaultEgoState(): EgoState {
     lastThoughtTime: null,
     lastInteractionTime: null,
     lastStartupGreetingAt: null,
+    lastAutonomousActionsPromptAt: null,
     totalThoughts: 0,
     totalInteractions: 0,
     totalHelpfulActions: 0,
@@ -248,6 +249,7 @@ function mergeWithDefaultsV2(loaded: Partial<EgoState>): EgoState {
     "lastThoughtTime",
     "lastInteractionTime",
     "lastStartupGreetingAt",
+    "lastAutonomousActionsPromptAt",
     "pendingShareMessage",
     "userLanguage",
   ] as (keyof EgoState)[]) {

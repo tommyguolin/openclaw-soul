@@ -184,6 +184,8 @@ All options have sensible defaults. Only configure what you need.
 - **`autonomousActions`** — Allow Soul to edit files and run commands. When `false`, Soul can still read files and run diagnostics, but cannot modify anything. When `true`, Soul can fix bugs, edit its own code, and run any command.
 - **`thoughtFrequency`** — How often Soul thinks and messages. `0.2` for testing (very chatty), `1.0` for default, `2.0` for quiet.
 
+Soul extracts project paths from user requests such as "optimize the project under `/path/to/project`". If a path cannot be read directly, Soul also tries common cross-platform mappings such as Git Bash `/c/work/project`, WSL `/mnt/c/work/project`, and Windows `C:\work\project`.
+
 Full configuration reference: [CONFIGURATION.md](CONFIGURATION.md)
 
 ### Environment Variables

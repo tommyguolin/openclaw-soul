@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
 import { createSoulLogger } from "./logger.js";
@@ -335,6 +335,17 @@ Keep it to 1-2 sentences: what you found and what you did (if anything).`;
     };
   }
 
+  if (latestAnalysis) {
+    await updateEgoStore(resolveEgoStorePath(), (e) => {
+      const t = (e.activeTasks ?? []).find((at) => at.id === latestAnalysis.id);
+      if (t) {
+        t.resultDelivered = true;
+        t.updatedAt = Date.now();
+      }
+      return e;
+    });
+  }
+
   // Create task record
   const task: AutonomousTask = {
     id: taskId,
@@ -581,25 +592,124 @@ const SOURCE_EXTENSIONS = [".ts", ".js", ".py", ".go", ".rs", ".java", ".c", ".c
  * Looks for goals containing a file path (starts with / or ~/).
  * Falls back to Soul's own src dir for self-improvement.
  */
-function resolveTargetProject(ego: EgoState): { dir: string; name: string; isSelf: boolean } {
-  // Check goals for project paths
-  const pathRe = /(?:^|\s|["'`])(\/[\w/.@-]+(?:\/src|\/lib)?)(?:["'`\s,.]|$)/;
+function sanitizePathCandidate(raw: string): string {
+  return raw.trim().replace(/^[`"'(<\[]+|[`"')>\],.;:!?]+$/g, "");
+}
+
+function expandPathCandidate(raw: string): string[] {
+  const cleaned = sanitizePathCandidate(raw);
+  const candidates = new Set<string>();
+  if (!cleaned) return [];
+
+  candidates.add(cleaned);
+
+  if (/^~[\\/]/.test(cleaned)) {
+    candidates.add(resolve(homedir(), cleaned.slice(2)));
+  }
+
+  const windowsMatch = cleaned.match(/^([A-Za-z]):[\\/](.*)$/);
+  if (windowsMatch) {
+    const drive = windowsMatch[1].toUpperCase();
+    const rest = windowsMatch[2].replace(/\\/g, "/");
+    candidates.add(normalize(cleaned));
+    candidates.add(`/mnt/${drive.toLowerCase()}/${rest}`);
+    candidates.add(`/${drive.toLowerCase()}/${rest}`);
+  }
+
+  const gitBashMatch = cleaned.match(/^\/([A-Za-z])(?:\/(.*))?$/);
+  if (gitBashMatch) {
+    const drive = gitBashMatch[1].toUpperCase();
+    const rest = gitBashMatch[2] ?? "";
+    const winRest = rest.replace(/\//g, "\\");
+    candidates.add(normalize(`${drive}:\\${winRest}`));
+    candidates.add(`/mnt/${drive.toLowerCase()}${rest ? `/${rest}` : ""}`);
+  }
+
+  const wslMatch = cleaned.match(/^\/mnt\/([A-Za-z])(?:\/(.*))?$/);
+  if (wslMatch) {
+    const drive = wslMatch[1].toUpperCase();
+    const rest = wslMatch[2] ?? "";
+    const winRest = rest.replace(/\//g, "\\");
+    candidates.add(normalize(`${drive}:\\${winRest}`));
+    candidates.add(`/${drive.toLowerCase()}${rest ? `/${rest}` : ""}`);
+  }
+
+  return [...candidates];
+}
+
+function pathExists(dir: string): boolean {
+  try {
+    return statSync(dir).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function extractPathCandidates(text: string): string[] {
+  const pathChars = String.raw`[A-Za-z0-9._~@%+=:,(){}\[\]\-\/\\]+`;
+  const patterns = [
+    new RegExp(`([A-Za-z]:[\\\\/]${pathChars})`, "g"),
+    new RegExp(`(/mnt/[A-Za-z](?:/${pathChars})*)`, "g"),
+    new RegExp(`(/[A-Za-z](?:/${pathChars})*)`, "g"),
+    new RegExp(`(~[\\\\/]${pathChars})`, "g"),
+  ];
+
+  const candidates = new Set<string>();
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      if (match[1]) candidates.add(match[1]);
+    }
+  }
+  return [...candidates];
+}
+
+function gatherTargetCandidates(ego: EgoState): Array<{ raw: string; source: "goal" | "userFact" }> {
+  const candidates: Array<{ raw: string; source: "goal" | "userFact" }> = [];
+
   for (const goal of ego.goals ?? []) {
     if (goal.status !== "active") continue;
-    const m = goal.title.match(pathRe) || goal.description?.match(pathRe);
-    if (m) {
-      const dir = m[1].startsWith("~") ? resolve(homedir(), m[1].slice(1)) : m[1];
-      return { dir, name: goal.title.slice(0, 60), isSelf: false };
+    for (const raw of [...extractPathCandidates(goal.title), ...extractPathCandidates(goal.description ?? "")]) {
+      candidates.push({ raw, source: "goal" });
     }
   }
-  // Check userFacts for project paths
+
   for (const fact of ego.userFacts ?? []) {
-    const m = fact.content.match(pathRe);
-    if (m) {
-      const dir = m[1].startsWith("~") ? resolve(homedir(), m[1].slice(1)) : m[1];
-      return { dir, name: `user directive: ${fact.content.slice(0, 60)}`, isSelf: false };
+    for (const raw of extractPathCandidates(fact.content)) {
+      candidates.push({ raw, source: "userFact" });
     }
   }
+
+  return candidates;
+}
+
+function resolveTargetProject(ego: EgoState): { dir: string; name: string; isSelf: boolean } {
+  const candidates = gatherTargetCandidates(ego);
+  const tried: string[] = [];
+
+  for (const candidate of candidates) {
+    for (const dir of expandPathCandidate(candidate.raw)) {
+      tried.push(dir);
+      if (pathExists(dir)) {
+        const name = candidate.source === "goal"
+          ? `goal path: ${candidate.raw}`
+          : `user directive: ${candidate.raw.slice(0, 60)}`;
+        return { dir, name, isSelf: false };
+      }
+    }
+  }
+
+  if (candidates.length > 0) {
+    const fallback = expandPathCandidate(candidates[0].raw)[0] ?? sanitizePathCandidate(candidates[0].raw);
+    log.warn(`Target project path not found; tried: ${tried.join(", ")}`);
+    return {
+      dir: fallback,
+      name: candidates[0].source === "goal"
+          ? `goal path: ${candidates[0].raw}`
+          : `user directive: ${candidates[0].raw.slice(0, 60)}`,
+      isSelf: false,
+    };
+  }
+
   return { dir: SOUL_SRC_DIR, name: "Soul plugin (self-improvement)", isSelf: true };
 }
 
