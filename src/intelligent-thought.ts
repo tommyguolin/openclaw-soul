@@ -429,8 +429,8 @@ function isGenuineQuestion(text: string): boolean {
 }
 
 const EXECUTION_DIRECTIVE_RE = new RegExp([
-  "\\b(?:ssh|deploy|run|execute|start|restart|stop|tail|grep|check|inspect|modify|change|edit|fix|debug|optimi[sz]e|improve|refactor|apply|write|patch|set)\\b",
-  "(?:\\u4f18\\u5316|\\u4fee\\u6539|\\u6539\\u8fdb|\\u6539\\u5584|\\u4fee\\u590d|\\u6267\\u884c|\\u90e8\\u7f72|\\u68c0\\u67e5|\\u67e5\\u770b|\\u6392\\u67e5|\\u8c03\\u8bd5|\\u8fd0\\u884c)",
+  "\\b(?:ssh|deploy|run|execute|start|restart|stop|tail|grep|check|inspect|modify|change|edit|fix|debug|optimi[sz]e|improve|refactor|apply|write|patch|set|test|verify|backtest|benchmark)\\b",
+  "(?:\\u4f18\\u5316|\\u4fee\\u6539|\\u6539\\u8fdb|\\u6539\\u5584|\\u4fee\\u590d|\\u6267\\u884c|\\u90e8\\u7f72|\\u68c0\\u67e5|\\u67e5\\u770b|\\u6392\\u67e5|\\u8c03\\u8bd5|\\u8fd0\\u884c|\\u56de\\u6d4b|\\u6d4b\\u8bd5|\\u9a8c\\u8bc1|\\u590d\\u6838)",
 ].join("|"), "i");
 
 const REMOTE_EXECUTION_RE = new RegExp([
@@ -439,9 +439,24 @@ const REMOTE_EXECUTION_RE = new RegExp([
 ].join("|"), "i");
 
 const PROJECT_OPTIMIZATION_RE = new RegExp([
-  "\\b(?:project|repo|repository|codebase|directory|folder|strategy|system)\\b",
-  "(?:\\u9879\\u76ee|\\u76ee\\u5f55|\\u4ee3\\u7801|\\u7b56\\u7565|\\u7cfb\\u7edf|\\u4ed3\\u5e93)",
+  "\\b(?:project|repo|repository|codebase|directory|folder|strategy|system|backtest|benchmark|optimi[sz]ation|experiment)\\b",
+  "(?:\\u9879\\u76ee|\\u76ee\\u5f55|\\u4ee3\\u7801|\\u7b56\\u7565|\\u7cfb\\u7edf|\\u4ed3\\u5e93|\\u56de\\u6d4b|\\u4f18\\u5316|\\u8dd1\\u4e00\\u8f6e|\\u5b9e\\u9a8c|\\u6307\\u6807)",
 ].join("|"), "i");
+
+const META_WORK_PROMISE_RE = [
+  /(?:\u8001\u677f).{0,16}\d+.{0,8}\u5c0f\u65f6.{0,12}\u6ca1\u6765/i,
+  /\u6211\u5e94\u8be5/i,
+  /\u6211\u4e00\u76f4\u5728/i,
+  /\u7ee7\u7eed.{0,16}\u95f7\u5934/i,
+  /\u95f7\u5934\u5e72\u6d3b/i,
+  /\u7b49.{0,40}\u518d\u6c47\u62a5/i,
+  /\u6ca1\u5b9e\u8d28(?:\u6027)?\u8fdb\u5c55/i,
+  /\u4e0d\u6253\u6270/i,
+  /\u522b\u7a7a\u804a/i,
+  /\u7a7a\u8f6c/i,
+  /\bI should\b/i,
+  /\b(?:keep working quietly|will report when|no substantive progress|don't disturb|not disturb)\b/i,
+];
 
 function isExecutionDirective(text: string): boolean {
   return EXECUTION_DIRECTIVE_RE.test(text);
@@ -455,15 +470,89 @@ function shouldUseObserveAndImproveForDirective(text: string): boolean {
   return PROJECT_OPTIMIZATION_RE.test(text) || /(?:^|\s|["'`])(?:[A-Za-z]:[\\/]|\/mnt\/[A-Za-z]\/|\/[A-Za-z]\/|~[\\/])/.test(text);
 }
 
+function isMetaWorkPromiseText(text: string): boolean {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  return META_WORK_PROMISE_RE.some((pattern) => pattern.test(normalized));
+}
+
+function hasAutonomousExecutionContext(text: string, ego: EgoState): boolean {
+  const contextText = [
+    text,
+    ...(ego.recentUserMessages ?? []).slice(-8),
+    ...(ego.goals ?? []).filter((g) => g.status === "active").map((g) => `${g.title} ${g.description}`),
+    ...(ego.userFacts ?? []).filter((f) => f.confidence >= 0.6).map((f) => f.content),
+    ...(ego.userPreferences ?? []).filter((p) => p.confidence >= 0.5).map((p) => p.preference),
+  ].join(" ");
+
+  return isExecutionDirective(contextText) ||
+    shouldUseObserveAndImproveForDirective(contextText) ||
+    /\b(?:V\d+|ETH|BTC|OOS|CAGR|MaxDD|drawdown|sharpe|walk-forward|parameter|strategy|metric)\b/i.test(contextText) ||
+    /\u56de\u6d4b|\u4f18\u5316|\u7b56\u7565|\u53c2\u6570|\u6307\u6807|\u6536\u76ca|\u56de\u64a4|\u6cdb\u5316|\u9ad8\u9891/i.test(contextText);
+}
+
+function suppressOrRerouteLowValueMessageThought(
+  thought: Thought,
+  opportunity: DetectedThoughtOpportunity,
+  ctx: ThoughtGenerationContext,
+): void {
+  if (thought.actionType !== "send-message") return;
+
+  const combined = [
+    thought.content,
+    thought.triggerDetail,
+    thought.motivation,
+    opportunity.triggerDetail,
+    opportunity.motivation,
+  ].join(" ");
+
+  if (!isMetaWorkPromiseText(combined)) return;
+
+  if (hasAutonomousExecutionContext(combined, ctx.ego)) {
+    thought.actionType = "observe-and-improve";
+    thought.actionParams = {
+      reason: combined.slice(0, 500),
+      suppressedLowValueMessage: true,
+    };
+    thought.content = "Suppressed a meta status message; continue concrete autonomous optimization work and report only measured results.";
+    thought.expectedOutcome = "Run concrete autonomous optimization work instead of sending a promise/status message.";
+    log.info("Rerouted low-value proactive message thought to observe-and-improve");
+    return;
+  }
+
+  thought.actionType = "none";
+  thought.actionParams = {
+    suppressedLowValueMessage: true,
+    reason: combined.slice(0, 500),
+  };
+  thought.content = "Suppressed a meta status message with no concrete result.";
+  thought.expectedOutcome = "Avoid sending empty meta status updates.";
+  log.info("Suppressed low-value proactive message thought");
+}
+
 export function isExecutionFocusedOpportunity(opportunity: DetectedThoughtOpportunity): boolean {
   const action = opportunity.suggestedAction;
-  if (action === "observe-and-improve" || action === "run-agent-task" || action === "invoke-tool") {
+  if (action === "observe-and-improve" || action === "run-agent-task" || action === "invoke-tool" || action === "report-findings") {
     return true;
   }
   if (action === "analyze-problem") {
     return isExecutionDirective(`${opportunity.triggerDetail} ${opportunity.motivation}`);
   }
   return false;
+}
+
+function hasHandledDirectiveAfter(ego: EgoState, timestamp: number): boolean {
+  const executionActions = new Set<ActionType>([
+    "analyze-problem",
+    "run-agent-task",
+    "observe-and-improve",
+    "report-findings",
+  ]);
+
+  return (ego.behaviorLog ?? []).some((entry) =>
+    executionActions.has(entry.actionType) &&
+    entry.timestamp >= timestamp &&
+    entry.outcome !== "expired",
+  );
 }
 
 /**
@@ -503,9 +592,12 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
     return opportunities;
   }
 
+  const executionReplayCutoff = now - 12 * 60 * 60 * 1000;
   const directiveMemories = recentInteractions.filter((m) =>
     m.tags.includes("inbound") &&
+    m.timestamp >= executionReplayCutoff &&
     isExecutionDirective(m.content) &&
+    !hasHandledDirectiveAfter(ego, m.timestamp) &&
     !matchesAnyTopic(m.content, topicFocus.deprioritized)
   );
 
@@ -513,11 +605,13 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
     const content = mem.content.slice(0, 160);
     const useAgent = shouldUseAgentForDirective(mem.content);
     const useImprove = shouldUseObserveAndImproveForDirective(mem.content);
+    const hoursSince = (now - mem.timestamp) / (1000 * 60 * 60);
+    const priority = Math.max(72, (useAgent || useImprove ? 94 : 86) - hoursSince * 3);
     opportunities.push({
       type: "conversation-replay",
       trigger: "memory",
       triggerDetail: `User execution directive: "${content}"`,
-      priority: useAgent || useImprove ? 95 : 88,
+      priority,
       source: "user-interaction",
       relatedNeeds: ["growth", "meaning"],
       motivation: `User gave an execution-oriented directive; act on it instead of researching it: "${content}"`,
@@ -961,20 +1055,29 @@ function analyzeContextualTriggers(ctx: ThoughtGenerationContext): DetectedThoug
   );
 
   if (improvementGoals.length > 0 || hasImproveFact || hasImprovePref) {
-    // Priority must beat memory-resurface (65) to make top 8 candidates.
-    // The 4-hour cooldown in action-executor prevents runaway.
-    const basePriority = 75;
-    const goalTitle = improvementGoals[0]?.title ?? "self-improvement directive from user";
-    opportunities.push({
-      type: "self-improvement-monitor",
-      trigger: "opportunity",
-      triggerDetail: `Active self-improvement goal: ${goalTitle}`,
-      priority: basePriority,
-      source: "system-monitor",
-      relatedNeeds: ["growth", "meaning"],
-      motivation: `I have an active goal to improve myself: ${goalTitle}`,
-      suggestedAction: "observe-and-improve",
-    });
+    const recentImprove = [...(ego.behaviorLog ?? [])]
+      .reverse()
+      .find((entry) => entry.actionType === "observe-and-improve");
+    const hoursSinceImprove = recentImprove
+      ? (Date.now() - recentImprove.timestamp) / (1000 * 60 * 60)
+      : Infinity;
+    const recentFailedImprove = recentImprove?.outcome === "failed" && hoursSinceImprove < 3;
+    const recentSuccessfulImprove = recentImprove?.outcome === "success" && hoursSinceImprove < 2;
+
+    if (!recentFailedImprove && !recentSuccessfulImprove) {
+      const basePriority = hoursSinceImprove === Infinity ? 65 : Math.min(65, 35 + hoursSinceImprove * 4);
+      const goalTitle = improvementGoals[0]?.title ?? "self-improvement directive from user";
+      opportunities.push({
+        type: "self-improvement-monitor",
+        trigger: "opportunity",
+        triggerDetail: `Periodic self-improvement goal: ${goalTitle}`,
+        priority: basePriority,
+        source: "system-monitor",
+        relatedNeeds: ["growth", "meaning"],
+        motivation: `I have a periodic goal to improve myself: ${goalTitle}`,
+        suggestedAction: "observe-and-improve",
+      });
+    }
   }
 
   return opportunities;
@@ -1231,13 +1334,20 @@ function calculateMetricDeltas(opportunity: DetectedThoughtOpportunity): MetricD
   return deltas;
 }
 
+export function getActionForOpportunity(
+  opportunity: DetectedThoughtOpportunity,
+  ego: EgoState,
+): { actionType: ActionType; actionParams?: Record<string, unknown> } {
+  return determineActionForOpportunity(opportunity, ego);
+}
+
 export function buildThoughtFromOpportunity(
   opportunity: DetectedThoughtOpportunity,
   ego: EgoState,
 ): Thought {
   const { content, expectedOutcome } = getThoughtContentForOpportunity(opportunity, ego);
   const deltas = calculateMetricDeltas(opportunity);
-  const { actionType, actionParams } = determineActionForOpportunity(opportunity, ego);
+  const { actionType, actionParams } = getActionForOpportunity(opportunity, ego);
 
   return {
     id: randomBytes(8).toString("hex"),
@@ -1259,10 +1369,27 @@ export function buildThoughtFromOpportunity(
   };
 }
 
+function isActionableCompletedTaskResult(result: string): boolean {
+  return !/Status:\s*(?:failed|blocked|partial)\b|did not finish with a complete report|No confirmed final change set|failed before verification|No reliable before\/after metrics|stopped before producing a final result file|Required final result file was not produced|Task timed out|request timed out|embedded run timeout/i.test(result);
+}
+
+function isInternalNeedGapOpportunity(opportunity: DetectedThoughtOpportunity): boolean {
+  return opportunity.source === "system-monitor"
+    && opportunity.trigger === "opportunity"
+    && /need (could improve|critically low|is low)|\d+\/\d+/.test(opportunity.triggerDetail);
+}
+
 function determineActionForOpportunity(
   opportunity: DetectedThoughtOpportunity,
   ego: EgoState,
 ): { actionType: ActionType; actionParams?: Record<string, unknown> } {
+  const completedUndeliveredTasks = (ego.activeTasks ?? []).filter(
+    (t) => (t.status === "completed" || t.status === "failed") && !t.resultDelivered && t.result,
+  );
+  if (completedUndeliveredTasks.length > 0) {
+    return { actionType: "report-findings" };
+  }
+
   if (opportunity.suggestedAction) {
     return { actionType: opportunity.suggestedAction, actionParams: opportunity.actionParams };
   }
@@ -1274,7 +1401,8 @@ function determineActionForOpportunity(
   if (type === "conversation-replay") {
     const problemKeywords = /error|bug|issue|problem|stuck|failed|broken|crash|timeout|optimize|improve|enhance|refactor|fix|debug|analyze/i;
     const combinedText = opportunity.triggerDetail + " " + opportunity.motivation;
-    if (problemKeywords.test(combinedText)) {
+    const isEgoInternal = /need (could improve|critically low|is low)|\d+\/\d+$/.test(opportunity.triggerDetail);
+    if (!isEgoInternal && problemKeywords.test(combinedText)) {
       const filePaths = extractFilePaths(combinedText);
       return {
         actionType: "analyze-problem",
@@ -1298,32 +1426,23 @@ function determineActionForOpportunity(
     return { actionType: "self-reflect" };
   }
 
-  // bond-deepen: reach out to the user to deepen the relationship.
-  // Must be checked BEFORE global task routing to prevent bond-deepen
-  // from being hijacked by completedUndeliveredTasks/completableFixTasks.
+  // bond-deepen stays internal. Silence should not produce a message without
+  // a concrete result.
   if (type === "bond-deepen") {
-    return { actionType: "send-message" };
+    return { actionType: "none" };
   }
 
   const pendingFixTask = (ego.activeTasks ?? []).find(
     (t) => t.status === "completed" && !t.resultDelivered && t.result &&
+      isActionableCompletedTaskResult(t.result) &&
       /fix|淇|瑙ｅ喅|suggest|recommend|change|淇敼|浼樺寲|improve/i.test(t.result),
   );
-  if (pendingFixTask) {
+  if (false && pendingFixTask) {
     return { actionType: "run-agent-task" };
   }
 
   // --- Autonomous action routing (high priority, before learn-topic) ---
   // NOTE: These run AFTER type-specific routing so bond-deepen → none is honored.
-
-  // Report completed tasks to user FIRST — this delivers value and marks tasks
-  // as delivered, clearing the way for new actions (run-agent-task, etc.)
-  const completedUndeliveredTasks = (ego.activeTasks ?? []).filter(
-    (t) => t.status === "completed" && !t.resultDelivered && t.result,
-  );
-  if (completedUndeliveredTasks.length > 0) {
-    return { actionType: "report-findings" };
-  }
 
   // After results are delivered, route completed analysis with fix suggestions
   // to agent execution. The agent has write access and can implement the fix.
@@ -1341,7 +1460,7 @@ function determineActionForOpportunity(
   if (type === "opportunity-detected") {
     const problemKeywords = /error|bug|issue|problem|stuck|failed|broken|crash|timeout|optimize|improve|enhance|refactor|fix|debug|analyze|观察|检查|排查|报错|错误|失败|崩溃|超时|挂了|异常|不能|无法|不行|优化|改进|改善|提升|修复|调试|分析/i;
     const combinedText = opportunity.triggerDetail + " " + opportunity.motivation;
-    if (problemKeywords.test(combinedText)) {
+    if (!isInternalNeedGapOpportunity(opportunity) && problemKeywords.test(combinedText)) {
       const filePaths = extractFilePaths(combinedText);
       return {
         actionType: "analyze-problem",
@@ -1365,8 +1484,12 @@ function determineActionForOpportunity(
     type === "skill-gap" ||
     (type === "opportunity-detected" && relatedNeeds.includes("growth"))
   ) {
-    const learnProbability = adjustProbability(0.4, "learn-topic", ego.behaviorLog ?? []);
-    if (growthNeed.current < growthNeed.ideal * 0.7 && Math.random() < learnProbability) {
+    const learnProbability = adjustProbability(0.12, "learn-topic", ego.behaviorLog ?? []);
+    if (
+      growthNeed.current < growthNeed.ideal * 0.45
+      && opportunity.priority >= 75
+      && Math.random() < learnProbability
+    ) {
       const isEgoInternal = /need (could improve|critically low|is low)|\d+\/\d+$/.test(opportunity.triggerDetail);
       if (!isEgoInternal) {
         const topics = extractLearningTopics(
@@ -1399,7 +1522,7 @@ function determineActionForOpportunity(
   }
 
   // memory-resurface: recall and reflect on memories
-  if (type === "memory-resurface") {
+  if (type === "memory-resurface" && opportunity.priority >= 80) {
     return { actionType: "recall-memory" };
   }
 
@@ -1559,7 +1682,6 @@ async function expandThoughtActionWithAdjacentIdea(
   if (!actionType || actionType === "none") return;
 
   const expandableActions: ActionType[] = [
-    "send-message",
     "learn-topic",
     "search-web",
     "proactive-research",
@@ -1765,6 +1887,7 @@ export async function generateIntelligentThought(
         }
       }
 
+      suppressOrRerouteLowValueMessageThought(thought, selectedOpportunity, ctx);
       await expandThoughtActionWithAdjacentIdea(thought, selectedOpportunity, ctx, llmGenerator);
       return thought;
     } catch (err) {
@@ -1773,6 +1896,7 @@ export async function generateIntelligentThought(
   }
 
   const thought = buildThoughtFromOpportunity(selectedOpportunity, ctx.ego);
+  suppressOrRerouteLowValueMessageThought(thought, selectedOpportunity, ctx);
   if (llmGenerator) {
     await expandThoughtActionWithAdjacentIdea(thought, selectedOpportunity, ctx, llmGenerator);
   }
@@ -1946,11 +2070,12 @@ ${ego.goals
 **${userInfo}**
 
 ${memorySection ? `\n${memorySection}\n` : ""}
-Reach out to the user in 1-2 sentences. Requirements:
+Reach out to the user with enough detail to be useful. Requirements:
 1. Have specific content — ask, share, or offer help
 2. Based on your current inner state and user information
 3. Natural and friendly, not too eager
 4. Don't make empty remarks like "I miss you"
+5. Use 2-5 sentences for substantive updates; keep only trivial social messages shorter
 
 Output what you want to say directly, no explanation.`;
 }

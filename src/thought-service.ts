@@ -1,6 +1,11 @@
 import { randomBytes } from "node:crypto";
 import { createSoulLogger } from "./logger.js";
-import { executeThoughtAction, flushPendingShareMessage, isGoodTimeForMessage } from "./action-executor.js";
+import {
+  executeThoughtAction,
+  flushPendingShareMessage,
+  getActionCooldownState,
+  isGoodTimeForMessage,
+} from "./action-executor.js";
 import type { ActionExecutorOptions } from "./action-executor.js";
 import { expirePending } from "./behavior-log.js";
 import type { MessageSender } from "./soul-actions.js";
@@ -15,9 +20,10 @@ import { loadEgoStore, updateEgoStore, resolveEgoStorePath } from "./ego-store.j
 import {
   generateIntelligentThought,
   detectThoughtOpportunities,
-  llmReRankOpportunities,
   buildThoughtFromOpportunity,
+  getActionForOpportunity,
   isExecutionFocusedOpportunity,
+  type DetectedThoughtOpportunity,
 } from "./intelligent-thought.js";
 import { loadWorkspaceContext } from "./paths.js";
 import { pollActiveTasks as pollAutonomousTasks } from "./autonomous-actions.js";
@@ -46,6 +52,7 @@ import type {
   UserFact,
   UserPreference,
   SoulMemory,
+  ActionType,
 } from "./types.js";
 import type { OpenClawSearchCompat } from "./soul-search.js";
 import { isLLMErrorContent } from "./llm-errors.js";
@@ -274,10 +281,17 @@ export class ThoughtService {
   private recentThoughtTypes: string[] = [];
   private recentThoughtTopics: string[] = [];
   private recentActionHistory: string[] = [];
+  private noProgressActionBackoff: Record<string, { count: number; until: number }> = {};
   private consecutiveSkipCount = 0;
   private backoffTimeoutId: ReturnType<typeof setTimeout> | null = null;
   private lastLLMCallTime = 0;
+  private llmBackoffUntil = 0;
+  private llmConsecutiveFailures = 0;
+  private lastLLMBackoffLog = 0;
+  private llmCallTimestamps: number[] = [];
   private static readonly MIN_LLM_INTERVAL_MS = 10_000; // 10s between Soul LLM calls
+  private static readonly LLM_BUDGET_WINDOW_MS = 15 * 60 * 1000;
+  private static readonly LLM_BUDGET_MAX_CALLS = 4;
   private thoughtAbortController: AbortController | null = null;
   private thoughtInProgress = false;
   private selfImprovementGoalSynced = false;
@@ -307,7 +321,7 @@ export class ThoughtService {
       createSoulLLMGenerator(options.llmConfig, options.openclawConfig as Parameters<typeof createSoulLLMGenerator>[1])
         .then((gen) => {
           if (gen) {
-            this.llmGenerator = gen;
+            this.llmGenerator = this.wrapLLMGenerator(gen);
             log.info("Soul LLM generator initialized");
           } else {
             log.debug("No LLM generator — will use rule-based thought generation");
@@ -330,6 +344,13 @@ export class ThoughtService {
       this.proactiveTarget = target;
       log.info(`ThoughtService: proactive target updated to ${target}`);
     }
+  }
+
+  getProactiveEndpoint(): { channel?: string; target?: string } {
+    return {
+      channel: this.proactiveChannel,
+      target: this.proactiveTarget,
+    };
   }
 
   async start(): Promise<void> {
@@ -484,6 +505,162 @@ export class ThoughtService {
       this.thoughtAbortController = null;
       this.thoughtInProgress = false;
     }
+  }
+
+  private wrapLLMGenerator(generator: LLMGenerator): LLMGenerator {
+    return async (prompt: string) => {
+      if (this.isLLMBackoffActive("LLM call")) {
+        throw new Error(`Soul LLM backoff active until ${new Date(this.llmBackoffUntil).toISOString()}`);
+      }
+      if (!this.reserveLLMCallBudget()) {
+        throw new Error(`Soul LLM call budget exhausted until ${new Date(this.llmBackoffUntil).toISOString()}`);
+      }
+
+      try {
+        const result = await generator(prompt);
+        this.noteLLMSuccess();
+        return result;
+      } catch (err) {
+        this.noteLLMFailure(err);
+        throw err;
+      }
+    };
+  }
+
+  private reserveLLMCallBudget(): boolean {
+    const now = Date.now();
+    const cutoff = now - ThoughtService.LLM_BUDGET_WINDOW_MS;
+    this.llmCallTimestamps = this.llmCallTimestamps.filter((ts) => ts >= cutoff);
+
+    const effectiveFrequency = Math.min(2, Math.max(0.25, this.thoughtFrequency));
+    const maxCalls = Math.max(
+      2,
+      Math.floor(ThoughtService.LLM_BUDGET_MAX_CALLS * Math.min(1, effectiveFrequency)),
+    );
+    if (this.llmCallTimestamps.length >= maxCalls) {
+      const oldest = this.llmCallTimestamps[0] ?? now;
+      this.llmBackoffUntil = Math.max(
+        this.llmBackoffUntil,
+        oldest + ThoughtService.LLM_BUDGET_WINDOW_MS + 60_000,
+      );
+      log.info(`Soul LLM budget exhausted: ${this.llmCallTimestamps.length}/${maxCalls} calls in 15m`);
+      return false;
+    }
+
+    this.llmCallTimestamps.push(now);
+    return true;
+  }
+
+  private noteLLMSuccess(): void {
+    this.llmConsecutiveFailures = 0;
+    this.llmBackoffUntil = 0;
+  }
+
+  private noteLLMFailure(err: unknown): void {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!this.isProviderPressureError(msg)) return;
+
+    this.llmConsecutiveFailures += 1;
+    const baseMs = /timeout|ECONNRESET|fetch failed/i.test(msg)
+      ? 5 * 60 * 1000
+      : 15 * 60 * 1000;
+    const multiplier = Math.min(4, 2 ** Math.max(0, this.llmConsecutiveFailures - 1));
+    const backoffMs = Math.min(60 * 60 * 1000, baseMs * multiplier);
+    this.llmBackoffUntil = Math.max(this.llmBackoffUntil, Date.now() + backoffMs);
+    log.warn(`Soul LLM backoff ${Math.round(backoffMs / 60000)}m after provider pressure: ${msg.slice(0, 160)}`);
+  }
+
+  private isProviderPressureError(text: string): boolean {
+    return /rate limit|cooldown|No available auth profile|too many requests|429|suspending lanes|embedded run timeout|Request timed out|ECONNRESET|fetch failed/i.test(text);
+  }
+
+  private isLLMBackoffActive(reason: string): boolean {
+    const remaining = this.llmBackoffUntil - Date.now();
+    if (remaining <= 0) return false;
+
+    const now = Date.now();
+    if (now - this.lastLLMBackoffLog > 60_000) {
+      log.info(`Skipping ${reason}: provider backoff active for ${Math.ceil(remaining / 60000)}m`);
+      this.lastLLMBackoffLog = now;
+    }
+    return true;
+  }
+
+  private hasActiveAutonomousTask(ego: EgoState): boolean {
+    return (ego.activeTasks ?? []).some((t) => t.status === "in-progress");
+  }
+
+  private hasUndeliveredAutonomousTaskResult(ego: EgoState): boolean {
+    return (ego.activeTasks ?? []).some((t) =>
+      (t.status === "completed" || t.status === "failed")
+      && !t.resultDelivered
+      && Boolean(t.result),
+    );
+  }
+
+  private isExecutionThought(thought: Thought, opportunity?: { suggestedAction?: string }): boolean {
+    const action = thought.actionType ?? opportunity?.suggestedAction;
+    return action === "analyze-problem"
+      || action === "invoke-tool"
+      || action === "run-agent-task"
+      || action === "observe-and-improve"
+      || action === "report-findings";
+  }
+
+  private getOpportunityAction(opportunity: DetectedThoughtOpportunity, ego: EgoState): ActionType | undefined {
+    return getActionForOpportunity(opportunity, ego).actionType ?? opportunity.suggestedAction;
+  }
+
+  private isOpportunityActionReady(opportunity: DetectedThoughtOpportunity, ego: EgoState): boolean {
+    const action = this.getOpportunityAction(opportunity, ego);
+    if (!action || action === "none") return true;
+    const noProgressBackoff = this.noProgressActionBackoff[action];
+    if (noProgressBackoff && noProgressBackoff.until > Date.now()) return false;
+    return getActionCooldownState(action, this.thoughtFrequency).ready;
+  }
+
+  private updateNoProgressBackoff(actionType: string | undefined, result: string | undefined): void {
+    if (!actionType) return;
+    const noProgress = Boolean(result && /^(skipped-|no-)|^cooldown$/.test(result));
+    if (!noProgress) {
+      delete this.noProgressActionBackoff[actionType];
+      return;
+    }
+
+    const current = this.noProgressActionBackoff[actionType] ?? { count: 0, until: 0 };
+    const count = current.count + 1;
+    if (count < 2) {
+      this.noProgressActionBackoff[actionType] = { count, until: 0 };
+      return;
+    }
+
+    const backoffMinutes = Math.min(60, 5 * 2 ** Math.min(4, count - 2));
+    this.noProgressActionBackoff[actionType] = {
+      count,
+      until: Date.now() + backoffMinutes * 60_000,
+    };
+    log.info(`No-progress backoff for ${actionType}: ${backoffMinutes}m after ${count} no-op result(s)`);
+  }
+
+  private shouldProtectExecutionOpportunity(opportunity: DetectedThoughtOpportunity, ego: EgoState): boolean {
+    if (!isExecutionFocusedOpportunity(opportunity)) return false;
+    if (!this.isOpportunityActionReady(opportunity, ego)) return false;
+    if (opportunity.suggestedAction === "report-findings") return true;
+    if (opportunity.type === "conversation-replay" && opportunity.priority >= 70) return true;
+    return opportunity.priority >= 80;
+  }
+
+  private selectBestOpportunity<T extends DetectedThoughtOpportunity>(
+    opportunities: T[],
+    ego: EgoState,
+  ): T | undefined {
+    if (opportunities.length === 0) return undefined;
+
+    const readyOpportunities = opportunities.filter((o) => this.isOpportunityActionReady(o, ego));
+    const candidates = readyOpportunities.length > 0 ? readyOpportunities : opportunities;
+    const executionCandidate = candidates.slice(0, 8).find((o) => this.shouldProtectExecutionOpportunity(o, ego));
+
+    return executionCandidate ?? candidates[0];
   }
 
   private async tick(): Promise<void> {
@@ -754,6 +931,46 @@ export class ThoughtService {
     const store = await loadEgoStore(this.storePath);
     let ego = store.ego;
 
+    if (this.hasUndeliveredAutonomousTaskResult(ego)) {
+      const thought: Thought = {
+        id: "report-findings-" + Date.now(),
+        type: "opportunity-detected",
+        content: "Autonomous task results are ready; report the concrete outcome before starting more work.",
+        trigger: "opportunity",
+        source: "system-monitor",
+        triggerDetail: "completed autonomous task awaiting report",
+        motivation: "A background task finished or failed and the user expects detailed proactive results.",
+        targetMetrics: [
+          { need: "connection", delta: 5, reason: "share autonomous work results promptly" },
+          { need: "meaning", delta: 5, reason: "deliver concrete value from autonomous work" },
+        ],
+        priority: 100,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + 10 * 60 * 1000,
+        executed: false,
+        relatedNeeds: ["connection", "meaning"],
+        expectedOutcome: "Send detailed task results to the user.",
+        actionType: "report-findings",
+      };
+      log.info("Autonomous task result pending: forcing report-findings");
+      if (this.onThought) {
+        const updatedEgo = await updateEgoStore(this.storePath, (e) => {
+          e.lastThoughtTime = Date.now();
+          e.totalThoughts += 1;
+          return e;
+        });
+        const result = await this.onThought(thought, updatedEgo);
+        await this.applyThoughtResult(result);
+        await this.executeThoughtAction(thought, updatedEgo);
+      }
+      return;
+    }
+
+    if (this.hasActiveAutonomousTask(ego)) {
+      log.info("Skipping thought cycle: autonomous task already in progress");
+      return;
+    }
+
     if (!isAwakeningComplete(ego)) {
       // Safety net: if stuck in awakening for >30 min, skip to awakened
       const birthTime = ego.birthTime ?? 0;
@@ -843,6 +1060,9 @@ export class ThoughtService {
       return;
     }
 
+    const availableLLMGenerator = this.llmGenerator && !this.isLLMBackoffActive("LLM-assisted thought generation")
+      ? this.llmGenerator
+      : undefined;
     let thought: Thought | null = null;
 
     // Set up abort controller for this thought cycle
@@ -851,7 +1071,7 @@ export class ThoughtService {
     const signal = this.thoughtAbortController.signal;
 
     try {
-      if (this.llmGenerator) {
+      if (availableLLMGenerator) {
         try {
           if (signal.aborted) { return; }
           await this.waitForLLMRateLimit(signal);
@@ -868,35 +1088,27 @@ export class ThoughtService {
             ? opportunities.filter((o) => isExecutionFocusedOpportunity(o) || !this.recentThoughtTypes.includes(o.type))
             : opportunities;
 
-          // Context-aware LLM re-ranking
+          // Static routing only. LLM re-ranking was accurate but expensive:
+          // every thought cycle could spend one model call before any real work
+          // started. Keep the background worker cheap and reserve model calls
+          // for execution/reporting.
           let selectedOpportunity: typeof nonRepeatingOpportunities[0] | undefined;
-          if (this.llmGenerator && nonRepeatingOpportunities.length > 1) {
-            try {
-              const topCandidates = nonRepeatingOpportunities.slice(0, 8);
-              const reRanked = await llmReRankOpportunities(
-                topCandidates, ctx, this.recentActionHistory, this.llmGenerator,
-              );
-              selectedOpportunity = reRanked[0];
-              const executionCandidate = topCandidates.find(isExecutionFocusedOpportunity);
-              if (executionCandidate && selectedOpportunity !== executionCandidate) {
-                const selectedAction = selectedOpportunity?.suggestedAction ?? selectedOpportunity?.type ?? "?";
-                const executionAction = executionCandidate.suggestedAction ?? executionCandidate.type;
-                log.info(`Execution directive protected: selected ${executionAction} over ${selectedAction}`);
-                selectedOpportunity = executionCandidate;
-              }
-              const newAction = selectedOpportunity?.suggestedAction ?? selectedOpportunity?.type ?? "?";
-              const oldAction = topCandidates[0]?.suggestedAction ?? topCandidates[0]?.type ?? "?";
-              if (newAction !== oldAction) {
-                log.info(`LLM re-ranked: selected ${newAction} (static winner was ${oldAction})`);
-              }
-            } catch {
-              selectedOpportunity = nonRepeatingOpportunities[0] ?? opportunities[0];
-            }
-          } else {
-            selectedOpportunity = nonRepeatingOpportunities[0] ?? opportunities[0];
+          selectedOpportunity = this.selectBestOpportunity(nonRepeatingOpportunities, ego) ?? opportunities[0];
+          if (
+            selectedOpportunity &&
+            selectedOpportunity !== nonRepeatingOpportunities[0] &&
+            this.shouldProtectExecutionOpportunity(selectedOpportunity, ego)
+          ) {
+            const executionAction = selectedOpportunity.suggestedAction ?? selectedOpportunity.type;
+            const staticAction = nonRepeatingOpportunities[0]?.suggestedAction ?? nonRepeatingOpportunities[0]?.type ?? "?";
+            log.info(`Execution directive protected: selected ${executionAction} over ${staticAction}`);
           }
+
+          const generatorForThought = selectedOpportunity && isExecutionFocusedOpportunity(selectedOpportunity)
+            ? undefined
+            : availableLLMGenerator;
           thought = await generateIntelligentThought(ctx, {
-            llmGenerator: this.llmGenerator,
+            llmGenerator: generatorForThought,
             preferOpportunity: selectedOpportunity,
           });
           if (signal.aborted) { return; }
@@ -907,7 +1119,7 @@ export class ThoughtService {
           // Skip if this thought overlaps significantly with a recent one.
           // Give one retry with a different opportunity type. If that also
           // repeats, apply backoff to prevent infinite same-topic loops.
-          if (this.isRepeatTopic(thought.content)) {
+          if (!this.isExecutionThought(thought, selectedOpportunity) && this.isRepeatTopic(thought.content)) {
             thought = null;
             log.info("Skipping thought — topic too similar (will retry with different opportunity)");
             // Try again with a different opportunity type
@@ -915,14 +1127,21 @@ export class ThoughtService {
               (o) => o.type !== selectedOpportunity?.type,
             );
             if (remainingOpportunities.length > 0) {
-              selectedOpportunity = remainingOpportunities[0];
+              selectedOpportunity = this.selectBestOpportunity(remainingOpportunities, ego);
               try {
+                const retryLLMGenerator = selectedOpportunity && isExecutionFocusedOpportunity(selectedOpportunity)
+                  ? undefined
+                  : availableLLMGenerator;
                 thought = await generateIntelligentThought(ctx, {
-                  llmGenerator: this.llmGenerator,
+                  llmGenerator: retryLLMGenerator,
                   preferOpportunity: selectedOpportunity,
                 });
                 if (signal.aborted) { return; }
-                if (thought && this.isRepeatTopic(thought.content)) {
+                if (
+                  thought
+                  && !this.isExecutionThought(thought, selectedOpportunity)
+                  && this.isRepeatTopic(thought.content)
+                ) {
                   log.info("Retry also repeated — backing off this tick");
                   thought = null;
                 }
@@ -956,16 +1175,16 @@ export class ThoughtService {
           return;
         }
         const nonRepeatingOpportunities = this.recentThoughtTypes.length > 0
-          ? opportunities.filter((o) => !this.recentThoughtTypes.includes(o.type))
+          ? opportunities.filter((o) => isExecutionFocusedOpportunity(o) || !this.recentThoughtTypes.includes(o.type))
           : opportunities;
         // Also filter out opportunities whose topic overlaps recent thoughts
         const novelOpportunities = nonRepeatingOpportunities.filter(
-          (o) => !this.isRepeatTopic(o.motivation || o.triggerDetail),
+          (o) => isExecutionFocusedOpportunity(o) || !this.isRepeatTopic(o.motivation || o.triggerDetail),
         );
-        if (novelOpportunities.length > 0) {
-          thought = buildThoughtFromOpportunity(novelOpportunities[0], ego);
-        } else if (nonRepeatingOpportunities.length > 0) {
-          thought = buildThoughtFromOpportunity(nonRepeatingOpportunities[0], ego);
+        const selectedOpportunity = this.selectBestOpportunity(novelOpportunities, ego)
+          ?? this.selectBestOpportunity(nonRepeatingOpportunities, ego);
+        if (selectedOpportunity) {
+          thought = buildThoughtFromOpportunity(selectedOpportunity, ego);
         } else {
           // All opportunities exhausted — back off instead of generating random thoughts
           this.applySkipBackoff("no novel opportunities");
@@ -1003,7 +1222,7 @@ export class ThoughtService {
       // Track recent thought topics to prevent revisiting the same subject.
       // Store topic terms plus angle markers so broad topics can continue
       // through new angles without being treated as duplicate thoughts.
-      const signature = topicSignature(thought.content);
+      const signature = this.isExecutionThought(thought) ? "" : topicSignature(thought.content);
       if (signature) {
         this.recentThoughtTopics.push(signature);
         if (this.recentThoughtTopics.length > 10) {
@@ -1065,6 +1284,10 @@ export class ThoughtService {
         ? actionResult.result.result.slice(0, 100)
         : JSON.stringify(actionResult.result.result)?.slice(0, 100);
       log.info(`Thought action executed: ${thought.actionType} ${resultStr ?? ""}`.trim());
+      this.updateNoProgressBackoff(
+        thought.actionType,
+        typeof actionResult.result.result === "string" ? actionResult.result.result : undefined,
+      );
 
       // Track action history for re-ranking diversity
       this.recentActionHistory.push(thought.actionType ?? "none");
@@ -1088,11 +1311,16 @@ export class ThoughtService {
         log.error(`updateEgoStore after action failed: ${String(err)}`);
       }
     } else if (actionResult.result.error) {
+      this.updateNoProgressBackoff(thought.actionType, undefined);
       log.warn(`Thought action failed: ${thought.actionType}`, actionResult.result.error);
     } else {
       const resultStr = typeof actionResult.result.result === "string"
         ? actionResult.result.result.slice(0, 100)
         : JSON.stringify(actionResult.result.result)?.slice(0, 100);
+      this.updateNoProgressBackoff(
+        thought.actionType,
+        typeof actionResult.result.result === "string" ? actionResult.result.result : undefined,
+      );
       log.info(`Thought action not completed: ${thought.actionType} ${resultStr ?? ""}`.trim());
     }
   }
@@ -1239,6 +1467,15 @@ export class ThoughtService {
     if (!result.success || result.metricsChanged.length === 0) {
       return;
     }
+    const actionType = result.actionResult?.type ?? result.thought.actionType;
+    const countsAsHelpful =
+      actionType === "report-findings" ||
+      actionType === "run-agent-task" ||
+      actionType === "invoke-tool" ||
+      actionType === "proactive-research" ||
+      actionType === "proactive-content-push" ||
+      (actionType === "send-message" && typeof result.actionResult?.result === "string" && !result.actionResult.result.startsWith("skipped-")) ||
+      (actionType === "observe-and-improve" && result.actionResult?.data?.fixApplied === true);
 
     const updatedEgo = await updateEgoStore(this.storePath, (ego) => {
       for (const delta of result.metricsChanged) {
@@ -1248,11 +1485,7 @@ export class ThoughtService {
         }
       }
 
-      if (
-        result.thought.type === "opportunity-detected" ||
-        result.thought.type === "help-offer" ||
-        result.thought.type === "self-improvement-monitor"
-      ) {
+      if (countsAsHelpful) {
         ego.totalHelpfulActions += 1;
       }
 
@@ -1541,6 +1774,9 @@ export class ThoughtService {
       log.info("extractUserFacts: No LLM generator available");
       return { factsAdded: 0, facts: [] };
     }
+    if (this.isLLMBackoffActive("user fact extraction")) {
+      return { factsAdded: 0, facts: [] };
+    }
 
     const prompt = this.buildUserFactExtractionPrompt(userMessage, existingFacts);
 
@@ -1635,6 +1871,9 @@ export class ThoughtService {
     const existingPrefs = store.ego.userPreferences;
 
     if (!this.llmGenerator) {
+      return { preferencesAdded: 0, preferences: [] };
+    }
+    if (this.isLLMBackoffActive("user preference extraction")) {
       return { preferencesAdded: 0, preferences: [] };
     }
 

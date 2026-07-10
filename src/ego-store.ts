@@ -193,6 +193,8 @@ export function createDefaultEgoState(): EgoState {
     establishedRoutines: [],
     behaviorLog: [],
     pendingShareMessage: null,
+    proactiveChannel: null,
+    proactiveTarget: null,
     userLanguage: null,
     recentUserMessages: [],
     activeTasks: [],
@@ -251,6 +253,8 @@ function mergeWithDefaultsV2(loaded: Partial<EgoState>): EgoState {
     "lastStartupGreetingAt",
     "lastAutonomousActionsPromptAt",
     "pendingShareMessage",
+    "proactiveChannel",
+    "proactiveTarget",
     "userLanguage",
   ] as (keyof EgoState)[]) {
     if (loaded[key] !== undefined) {

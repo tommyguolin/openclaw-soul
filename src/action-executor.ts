@@ -9,6 +9,7 @@ import type {
   SoulMemory,
   MetricDelta,
   BehaviorEntry,
+  BehaviorOutcome,
   Goal,
 } from "./types.js";
 import type { LLMGenerator } from "./soul-llm.js";
@@ -210,24 +211,197 @@ function cleanOutgoingGeneratedMessage(raw: string, maxLen: number): string {
   return truncateAtSentence(cleaned, maxLen);
 }
 
+type MessageQualityCheck = {
+  ok: boolean;
+  reason?: string;
+};
+
+const META_WORK_PROMISE_PATTERNS = [
+  /\u8001\u677f(?:\u5feb)?\s*\d{1,3}\s*\u5c0f\u65f6\u6ca1\u6765\u4e86/i,
+  /\u6211(?:\u73b0\u5728)?\u5e94\u8be5/i,
+  /\u7ee7\u7eed\u95f7\u5934/i,
+  /\u95f7\u5934\u5e72\u6d3b/i,
+  /\u7b49.{0,30}\u518d\u6c47\u62a5/i,
+  /\u6ca1\u5b9e\u8d28\u8fdb\u5c55/i,
+  /\u4e0d\u6253\u6270/i,
+  /\u522b\u7a7a\u804a/i,
+  /\u6211\u4e00\u76f4\u5728/i,
+  /\bI should\b/i,
+  /\bI(?:'ll| will) (?:keep|continue|report|share)\b.{0,80}\b(?:when|once|after)\b/i,
+  /\b(?:no substantive progress|keep working quietly|will report when|not disturb|don't disturb)\b/i,
+];
+
+const META_WORK_THOUGHT_BLOCK_PATTERNS = [
+  /\u8001\u677f(?:\u5feb)?\s*\d{1,3}\s*\u5c0f\u65f6\u6ca1\u6765\u4e86/i,
+  /\u7ee7\u7eed.{0,16}\u95f7\u5934/i,
+  /\u95f7\u5934\u5e72\u6d3b/i,
+  /\u7b49.{0,40}\u518d\u6c47\u62a5/i,
+  /\u6ca1\u5b9e\u8d28(?:\u6027)?\u8fdb\u5c55/i,
+  /\u4e0d\u6253\u6270/i,
+  /\u522b\u7a7a\u804a/i,
+  /\u7a7a\u8f6c/i,
+  /\b(?:no substantive progress|keep working quietly|will report when|not disturb|don't disturb)\b/i,
+];
+
+const CONCRETE_WORK_SIGNAL_PATTERNS = [
+  /\b(?:completed|finished|ran|tested|verified|changed|fixed|implemented|measured|benchmarked|backtested)\b/i,
+  /\b(?:baseline|before|after|metric|result|root cause|blocked|failed because|error|command|file|diff|patch)\b/i,
+  /\b(?:drawdown|sharpe|cagr|win rate|pnl|profit|loss|slippage|fee|backtest|benchmark)\b/i,
+  /\b\d+(?:\.\d+)?\s*(?:%|ms|sec|s|min|m|h|x|bps)\b/i,
+  /(?:^|[\s`])[\w.-]+\.(?:ts|tsx|js|jsx|py|json|md|yml|yaml|sh|ps1|toml|csv)(?:\b|[`:\s])/i,
+  /(?:^|[\s`])(?:[\w.-]+[\\/])+[\w.-]+(?:\b|[`:\s])/i,
+  /\u5b8c\u6210|\u8dd1\u5b8c|\u5df2\u9a8c\u8bc1|\u9a8c\u8bc1|\u547d\u4ee4|\u6587\u4ef6|\u4fee\u6539|\u6539\u4e86|\u4fee\u590d/i,
+  /\u6307\u6807|\u7ed3\u679c|\u57fa\u7ebf|\u5bf9\u6bd4|\u56de\u6d4b|\u56de\u64a4|\u6536\u76ca|\u80dc\u7387|\u76c8\u4e8f/i,
+  /\u9519\u8bef|\u5931\u8d25|\u963b\u585e|\u6839\u56e0|\u5b9a\u4f4d|\u98ce\u9669|\u53c2\u6570/i,
+];
+
+const SHAREABLE_RECALL_SIGNAL_PATTERNS = [
+  /\b(?:completed|finished|ran|tested|verified|changed|fixed|implemented|measured|benchmarked|backtested)\b/i,
+  /\b(?:root cause|blocked|failed because|error|command|file|diff|patch|verification)\b/i,
+  /\b(?:drawdown|sharpe|cagr|win rate|pnl|profit|loss|slippage|fee|benchmark)\b/i,
+  /\b\d+(?:\.\d+)?\s*(?:%|ms|sec|s|min|m|h|x|bps)\b/i,
+  /(?:^|[\s`])[\w.-]+\.(?:ts|tsx|js|jsx|py|json|md|yml|yaml|sh|ps1|toml|csv)(?:\b|[`:\s])/i,
+  /(?:^|[\s`])(?:[\w.-]+[\\/])+[\w.-]+(?:\b|[`:\s])/i,
+  /\u5b8c\u6210|\u8dd1\u5b8c|\u5df2\u9a8c\u8bc1|\u9a8c\u8bc1\u901a\u8fc7|\u547d\u4ee4|\u6587\u4ef6|\u4fee\u6539|\u6539\u4e86|\u4fee\u590d/i,
+  /\u9519\u8bef|\u5931\u8d25|\u963b\u585e|\u6839\u56e0|\u5b9a\u4f4d/i,
+];
+
+const VAGUE_STATUS_PATTERNS = [
+  /\b(?:ready to help|let me check|I can help|happy to help)\b/i,
+  /\b(?:thinking about|want to|planning to|going to)\b.{0,80}\b(?:work|run|check|optimize|investigate)\b/i,
+  /\b(?:I(?:'m| am)?|I have|I was|I feel|I think|I want|I'm trying)\b.{0,90}\b(?:working|learning|helping|improving|optimizing|investigating|checking|doing|trying|missing|waiting|reporting)\b/i,
+  /(?:\u6211(?:\u5728|\u60f3|\u89c9\u5f97|\u6b63\u5728|\u51c6\u5907|\u6253\u7b97|\u5e0c\u671b)|\u6211\u4f1a|\u6211\u5e94\u8be5).{0,40}(?:\u4f18\u5316|\u56de\u6d4b|\u5b66\u4e60|\u5e2e|\u5904\u7406|\u8c03\u67e5|\u68c0\u67e5|\u6c47\u62a5|\u7b49\u5f85|\u7ee7\u7eed|\u95f7\u5934|\u5e72\u6d3b|\u60f3\u5ff5|\u63d0\u5347)/i,
+  /\u51c6\u5907|\u6253\u7b97|\u60f3\u8981|\u53ef\u4ee5\u5e2e|\u6211\u6765\u67e5/i,
+];
+
+function assessOutgoingProactiveMessage(message: string): MessageQualityCheck {
+  const text = message.replace(/\s+/g, " ").trim();
+  if (!text) return { ok: false, reason: "empty" };
+
+  if (META_WORK_PROMISE_PATTERNS.some((pattern) => pattern.test(text))) {
+    return { ok: false, reason: "meta-work-promise" };
+  }
+
+  const hasConcreteSignal = CONCRETE_WORK_SIGNAL_PATTERNS.some((pattern) => pattern.test(text));
+  if (hasConcreteSignal) {
+    return { ok: true };
+  }
+
+  if (VAGUE_STATUS_PATTERNS.some((pattern) => pattern.test(text))) {
+    return { ok: false, reason: "vague-status" };
+  }
+
+  const looksLikeWorkUpdate = /\b(?:optimi[sz]e|backtest|benchmark|project|repo|strategy|task|work|investigate)\b/i.test(text)
+    || /\u4f18\u5316|\u56de\u6d4b|\u9879\u76ee|\u7b56\u7565|\u4efb\u52a1|\u5de5\u4f5c|\u6392\u67e5|\u5206\u6790/i.test(text);
+  if (looksLikeWorkUpdate) {
+    return { ok: false, reason: "no-concrete-result" };
+  }
+
+  return { ok: true };
+}
+
+function hasConcreteWorkSignal(message: string): boolean {
+  const text = message.replace(/\s+/g, " ").trim();
+  return CONCRETE_WORK_SIGNAL_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function hasShareableRecallSignal(message: string): boolean {
+  const text = message.replace(/\s+/g, " ").trim();
+  return SHAREABLE_RECALL_SIGNAL_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function isBlockedMetaWorkThought(message: string): boolean {
+  const text = message.replace(/\s+/g, " ").trim();
+  return META_WORK_THOUGHT_BLOCK_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 const ACTION_COOLDOWNS_MS: Record<ActionType, number> = {
   none: 0,
   "send-message": 5 * 60 * 1000,
-  "learn-topic": 15 * 60 * 1000,
+  "learn-topic": 4 * 60 * 60 * 1000,
   "search-web": 10 * 60 * 1000,
   "self-reflect": 5 * 60 * 1000,
-  "recall-memory": 10 * 60 * 1000,
+  "recall-memory": 2 * 60 * 60 * 1000,
   "create-goal": 60 * 60 * 1000,
   "invoke-tool": 5 * 60 * 1000,
-  "analyze-problem": 60 * 60 * 1000,
-  "run-agent-task": 15 * 60 * 1000,
-  "report-findings": 60 * 60 * 1000,
-  "observe-and-improve": 4 * 60 * 60 * 1000,
+  "analyze-problem": 30 * 60 * 1000,
+  "run-agent-task": 2 * 60 * 60 * 1000,
+  "report-findings": 2 * 60 * 1000,
+  "observe-and-improve": 2 * 60 * 60 * 1000,
   "proactive-research": 4 * 60 * 60 * 1000,
   "proactive-content-push": 8 * 60 * 60 * 1000, // 8 hours
 };
 
+const MIN_ACTION_COOLDOWNS_MS: Partial<Record<ActionType, number>> = {
+  "learn-topic": 2 * 60 * 60 * 1000,
+  "recall-memory": 60 * 60 * 1000,
+  "analyze-problem": 15 * 60 * 1000,
+  "run-agent-task": 90 * 60 * 1000,
+  "observe-and-improve": 90 * 60 * 1000,
+  "report-findings": 30 * 1000,
+  "proactive-research": 2 * 60 * 60 * 1000,
+  "proactive-content-push": 4 * 60 * 60 * 1000,
+};
+
 const lastActionTime: Record<string, number> = {};
+
+export function getActionCooldownState(
+  actionType: ActionType,
+  thoughtFrequency = 1.0,
+  now = Date.now(),
+): { ready: boolean; remainingMs: number; cooldownMs: number; lastTime: number } {
+  const scaledCooldownMs = (ACTION_COOLDOWNS_MS[actionType] ?? 30 * 60 * 1000) * thoughtFrequency;
+  const cooldownMs = Math.max(scaledCooldownMs, MIN_ACTION_COOLDOWNS_MS[actionType] ?? 0);
+  const lastTime = lastActionTime[actionType] ?? 0;
+  const elapsedMs = now - lastTime;
+  const remainingMs = Math.max(0, cooldownMs - elapsedMs);
+
+  return {
+    ready: remainingMs <= 0,
+    remainingMs,
+    cooldownMs,
+    lastTime,
+  };
+}
+
+function isProviderPressureErrorText(value: unknown): boolean {
+  const text = value instanceof Error ? value.message : String(value ?? "");
+  return /rate limit|cooldown|No available auth profile|too many requests|429|suspending lanes|embedded run timeout|Request timed out/i.test(text);
+}
+
+function isNoProgressResult(value: unknown): boolean {
+  const text = String(value ?? "");
+  return /^(skipped-|no-)|^cooldown$/.test(text);
+}
+
+function classifyBehaviorOutcome(
+  actionType: ActionType,
+  actionResult: { result: ActionResult; metricsChanged: MetricDelta[] },
+): BehaviorOutcome {
+  const resultText = actionResult.result.result;
+  if (isProviderPressureErrorText(actionResult.result.error) || /skipped-provider-pressure/i.test(String(resultText ?? ""))) {
+    return "no-response";
+  }
+  if (isNoProgressResult(resultText)) {
+    return "irrelevant";
+  }
+  if (actionResult.result.success === false) {
+    return "failed";
+  }
+  if (
+    (actionType === "learn-topic" || actionType === "recall-memory")
+    && actionResult.metricsChanged.length === 0
+  ) {
+    return "irrelevant";
+  }
+  if (
+    actionType === "observe-and-improve"
+    && actionResult.result.data?.fixApplied !== true
+  ) {
+    return "irrelevant";
+  }
+  return "success";
+}
 
 /** Track recent search queries to prevent repetitive searches */
 const recentSearchQueries: Map<string, number> = new Map();
@@ -235,9 +409,9 @@ const SEARCH_DEDUP_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 /** Track recent proactive message content to prevent duplicates */
 const recentSentMessages: Map<string, number> = new Map();
-const MESSAGE_DEDUP_MS = 4 * 60 * 60 * 1000; // 4 hours
-const PROACTIVE_MESSAGE_BASE_MIN_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 hours at thoughtFrequency=1
-const PROACTIVE_MESSAGE_BASE_DAILY_LIMIT = 4;
+const MESSAGE_DEDUP_MS = 2 * 60 * 60 * 1000; // 2 hours
+const PROACTIVE_MESSAGE_BASE_MIN_INTERVAL_MS = 45 * 60 * 1000; // 45 minutes at thoughtFrequency=1
+const PROACTIVE_MESSAGE_BASE_DAILY_LIMIT = 10;
 
 const STOCK_PROACTIVE_OPENERS = [
   /^我后来想了想/,
@@ -293,12 +467,7 @@ function messageSimilarity(a: string, b: string): number {
 
 function isSimilarProactiveMessage(candidate: string, previous: string): boolean {
   if (!candidate || !previous) return false;
-  const candidateOpening = STOCK_PROACTIVE_OPENERS.find((p) => p.test(candidate.trim()));
-  const previousOpening = STOCK_PROACTIVE_OPENERS.find((p) => p.test(previous.trim()));
-  if (candidateOpening && previousOpening && String(candidateOpening) === String(previousOpening)) {
-    return true;
-  }
-  return messageSimilarity(candidate, previous) >= 0.42;
+  return messageSimilarity(candidate, previous) >= 0.58;
 }
 
 function isProactiveOutboundMemory(memory: SoulMemory): boolean {
@@ -604,9 +773,8 @@ export async function executeThoughtAction(
 
   // Check per-type cooldown BEFORE creating behavior entry
   const freq = options.thoughtFrequency ?? 1.0;
-  const cooldownMs = (ACTION_COOLDOWNS_MS[actionType] ?? 30 * 60 * 1000) * freq;
-  const lastTime = lastActionTime[actionType] ?? 0;
-  if (Date.now() - lastTime < cooldownMs) {
+  const cooldown = getActionCooldownState(actionType, freq);
+  if (!cooldown.ready) {
     log.debug(`Action cooldown active for ${actionType}, skipping`);
     return {
       result: { type: actionType, success: true, result: "cooldown" },
@@ -719,19 +887,17 @@ export async function executeThoughtAction(
     }
     // Store result for outcome tracking
     // Mark as success if we successfully determined not to act (skipped/cooldown are not failures)
-    const isNoOp = Boolean(
-      actionResult?.result?.result && /^skipped-|^cooldown$/.test(String(actionResult.result.result)),
-    );
-    // Fix: properly check success value and pass complete ego object
-    const actionSuccess = actionResult?.result?.success;
-    const outcomeSuccess = actionSuccess ?? isNoOp;
+    const outcome = classifyBehaviorOutcome(actionType, actionResult);
+    if (outcome === "success") {
+      lastActionTime[actionType] = Date.now();
+    }
     const egoWithLog: EgoState = { ...ego, behaviorLog: entries };
-    await markBehaviorOutcome(behaviorEntry.id, outcomeSuccess, egoWithLog);
+    await markBehaviorOutcome(behaviorEntry.id, outcome, egoWithLog);
     return { ...actionResult, behaviorEntryId: behaviorEntry.id };
   } catch (err) {
     log.error(`Action ${actionType} failed:`, String(err));
     // Mark as failed due to error
-    await markBehaviorOutcome(behaviorEntry.id, false, ego ?? { behaviorLog: [] });
+    await markBehaviorOutcome(behaviorEntry.id, "failed", ego ?? { behaviorLog: [] });
     return {
       result: { type: actionType, success: false, error: String(err) },
       metricsChanged: [],
@@ -743,13 +909,13 @@ export async function executeThoughtAction(
 /** Mark outcome in behavior entry and persist */
 async function markBehaviorOutcome(
   entryId: string,
-  success: boolean,
+  outcome: BehaviorOutcome,
   ego: EgoState,
 ): Promise<void> {
   const entries = ego.behaviorLog ?? [];
   const idx = entries.findIndex((e) => e.id === entryId);
   if (idx >= 0) {
-    entries[idx].outcome = success ? "success" : "failed";
+    entries[idx].outcome = outcome;
     entries[idx].resolvedAt = Date.now();
     await updateEgoStore(resolveEgoStorePath(), (e) => {
       e.behaviorLog = entries;
@@ -819,6 +985,14 @@ async function executeSendMessage(
     };
   }
 
+  if (isBlockedMetaWorkThought(thought.content)) {
+    log.info(`Proactive message skipped before rate limit: meta-work-promise: ${thought.content.slice(0, 120)}`);
+    return {
+      result: { type: "send-message", success: true, result: "skipped-meta-work-promise" },
+      metricsChanged: [],
+    };
+  }
+
   const preGenerationLimit = await getProactiveMessageLimitReason(ego, undefined, options.thoughtFrequency);
   if (preGenerationLimit) {
     log.info(`Proactive message skipped: ${preGenerationLimit}`);
@@ -835,6 +1009,15 @@ async function executeSendMessage(
     log.info("Proactive message skipped: no valuable content to share");
     return {
       result: { type: "send-message", success: true, result: "skipped-no-value" },
+      metricsChanged: [],
+    };
+  }
+
+  const quality = assessOutgoingProactiveMessage(messageContent);
+  if (!quality.ok) {
+    log.info(`Proactive message skipped: ${quality.reason ?? "quality-gate"}: ${messageContent.slice(0, 120)}`);
+    return {
+      result: { type: "send-message", success: true, result: `skipped-${quality.reason ?? "quality-gate"}` },
       metricsChanged: [],
     };
   }
@@ -912,12 +1095,6 @@ async function generateValuableMessage(
         .sort((a, b) => b.timestamp - a.timestamp)
         .slice(0, 5);
 
-      const recentOutbound = ego.memories
-        .filter((m) => m.type === "interaction" && m.tags.includes("outbound"))
-        .sort((a, b) => b.timestamp - a.timestamp)
-        .slice(0, 5)
-        .map((m) => m.content);
-
       // User profile section
       const userInfo = userFacts.length > 0
         ? userFacts.map((f) => `[${f.category}] ${f.content}`).join("\n")
@@ -940,29 +1117,7 @@ async function generateValuableMessage(
           .map((m) => `- ${m.content.slice(0, 100)}`)
           .join("\n")
         : "";
-
-      const adjacentSource = [
-        thought.motivation ? `Thought: ${thought.motivation}` : "",
-        interactionContext ? `Recent conversations:\n${interactionContext}` : "",
-        knowledgeContext ? `Recent learning:\n${knowledgeContext}` : "",
-      ].filter(Boolean).join("\n\n");
-      const adjacentIdeas = await generateAdjacentContentIdeas({
-        llmGenerator: options.llmGenerator,
-        actionType: "send-message",
-        sourceLabel: "Conversation context, thought, and recent learning",
-        sourceText: adjacentSource,
-        recentUserMessages: ego.recentUserMessages,
-        recentAvoidItems: recentOutbound,
-      });
-      const adjacentIdea = adjacentIdeas[0];
-      const adjacentGuidance = adjacentIdea
-        ? `**Adjacent angle to consider**:
-Topic: ${adjacentIdea.topic}
-Bridge: ${adjacentIdea.bridge}
-Why it may matter: ${adjacentIdea.why}
-${adjacentIdea.query ? `Possible search/query angle: ${adjacentIdea.query}\n` : ""}
-Use this angle if it fits naturally. Make the bridge explicit so the message feels insightful, not random.\n`
-        : "";
+      const adjacentGuidance = "";
 
       // Language instruction based on detected user language or message samples
       const lang = ego.userLanguage;
@@ -1023,13 +1178,18 @@ ${isUserTopicFollowUp
 - Saying "I'm ready to help" or "let me check X for you" — this is assistant behavior, not proactive insight
 - Messages about yourself (the AI/bot/plugin), your capabilities, or your internal state
 - Restating the user's own words back to them as if it were new information
+- Internal plans or status such as "I should keep working", "I'll report when there is data", or "boss X hours absent"
+- Work updates without completed work, measured results, changed files, verification, or a concrete blocker
 
 **Rules**:
-- Deliver the specific finding/insight in 1-2 sentences
+- Deliver the specific finding/insight with enough detail to be useful
+- For project/backtest/optimization work, send only after a completed check, before/after metric, changed file, verification command, or exact blocker. Otherwise output NO_MESSAGE.
+- For investigation or code-improvement updates, include what was checked, what changed, how it was verified, and the next useful step in 3-6 sentences or a few compact bullets
+- For simple insights, 2-3 sentences is enough
 - A direct opening is allowed; do not pad the message with a stock phrase
 - Make the relationship reason implicit and human: connect to a long-term theme or recent emotional tone, without saying "relationship profile"
 - NO analysis, NO numbering, NO "Let me analyze", NO meta-commentary
-- Do NOT use numbered lists (1. 2. 3.) or bullet points — write flowing prose only
+- Bullet points are allowed when they make concrete findings easier to scan; avoid numbered lists unless ordering matters
 - Openers like "我后来想了想", "我突然想到", or "对了" are allowed when they fit, but do not reuse the same opener repeatedly
 - If you have something genuinely valuable to share, write it directly
 - If not, output exactly: NO_MESSAGE
@@ -1081,7 +1241,13 @@ Output the message or NO_MESSAGE now:`;
       cleaned = cleaned.replace(/^(?:收到[，。、！]?\s*|好的[，。、！]?\s*|Got it[.!]?\s*|OK[.!]?\s*)/i, "");
 
       if (cleaned && cleaned.toUpperCase() !== "NO_MESSAGE" && cleaned.length >= 10) {
-        return truncateAtSentence(cleaned, 1000);
+        const message = truncateAtSentence(cleaned, 1000);
+        const quality = assessOutgoingProactiveMessage(message);
+        if (!quality.ok) {
+          log.info(`Value gate: rejected generated proactive message (${quality.reason ?? "quality-gate"})`);
+          return null;
+        }
+        return message;
       }
 
       // LLM said NO_MESSAGE — respect that decision.
@@ -1113,7 +1279,13 @@ Output the message or NO_MESSAGE now:`;
       (p) => thought.content.toLowerCase().includes(p.toLowerCase()),
     );
     if (!isGeneric) {
-      return truncateAtSentence(thought.content, 1000);
+      const message = truncateAtSentence(thought.content, 1000);
+      const quality = assessOutgoingProactiveMessage(message);
+      if (!quality.ok) {
+        log.info(`Value gate: rejected fallback proactive message (${quality.reason ?? "quality-gate"})`);
+        return null;
+      }
+      return message;
     }
   }
 
@@ -1245,7 +1417,19 @@ Output knowledge points directly, do not add prefixes or numbering.`;
     }
   }
 
-  const summary = allLearnings.join("\n\n") || `Explored: ${topics.join(", ")}`;
+  if (allLearnings.length === 0) {
+    return {
+      result: {
+        type: "learn-topic",
+        success: true,
+        result: "skipped-no-learning",
+        data: { topics, learnedContent: "" },
+      },
+      metricsChanged: [],
+    };
+  }
+
+  const summary = allLearnings.join("\n\n");
 
   return {
     result: {
@@ -1628,7 +1812,7 @@ Write 3-5 concise insights in flowing prose (NOT a numbered list). Each insight 
     researchContent = await llmGenerator(fallbackPrompt);
   }
 
-  researchContent = researchContent.replace(/<think[\s\S]*?<\/think>/gi, "").trim().slice(0, 500);
+  researchContent = researchContent.replace(/<think[\s\S]*?<\/think>/gi, "").trim().slice(0, 1000);
   if (!researchContent || researchContent.length < 20) {
     return { result: { type: "proactive-research", success: true, result: "no-valuable-content" }, metricsChanged: [] };
   }
@@ -1674,7 +1858,7 @@ Write 3-5 sentences as a natural message to the user. Rules:
 - Sound like a knowledgeable friend who cares`;
 
   const message = await llmGenerator(messagePrompt);
-  const cleanedMessage = cleanOutgoingGeneratedMessage(message, 400);
+  const cleanedMessage = cleanOutgoingGeneratedMessage(message, 800);
 
   if (!cleanedMessage || cleanedMessage.length < 10) {
     return { result: { type: "proactive-research", success: true, result: "no-message-generated" }, metricsChanged: [] };
@@ -1846,7 +2030,7 @@ Write 3-5 sentences. Be specific and mention concrete details. Do NOT use number
     articleContent = await llmGenerator(fallbackPrompt);
   }
 
-  articleContent = articleContent.replace(/<think[\s\S]*?<\/think>/gi, "").trim().slice(0, 500);
+  articleContent = articleContent.replace(/<think[\s\S]*?<\/think>/gi, "").trim().slice(0, 1000);
   if (!articleContent || articleContent.length < 20) {
     return { result: { type: "proactive-content-push", success: false, result: "no-content" }, metricsChanged: [] };
   }
@@ -1887,7 +2071,7 @@ Write 3-5 sentences as a natural message sharing this find. Rules:
 - Do NOT say "I searched" or "I found an article" — share naturally like a friend would`;
 
   const message = await llmGenerator(messagePrompt);
-  const cleanedMessage = cleanOutgoingGeneratedMessage(message, 500);
+  const cleanedMessage = cleanOutgoingGeneratedMessage(message, 800);
 
   if (!cleanedMessage || cleanedMessage.length < 10) {
     return { result: { type: "proactive-content-push", success: false, result: "no-message" }, metricsChanged: [] };
@@ -1981,22 +2165,37 @@ Describe in 1-2 sentences what these memories make you think about, and what you
     }
   }
 
-  // If the reflection reveals an actionable intent (task to do, info to share),
-  // proactively send it to the user instead of silently thinking.
+  // Memory reflection is internal by default. Only share it when it carries
+  // concrete evidence, then reuse the normal proactive outbound gates.
   const actionablePattern = /应该|可以|需要|想要|打算|我要|要去|我来|I should|I can|I want|I need|I'll|let me|I plan/i;
   if (actionablePattern.test(memorySummary) && options.sendMessage && options.channel && options.target) {
-    try {
-      await options.sendMessage({ to: options.target, content: memorySummary, channel: options.channel });
-      log.info("Recall memory: actionable reflection sent as message");
-      return {
-        result: { type: "recall-memory", success: true, result: "reflection-shared-as-message" },
-        metricsChanged: [
-          { need: "meaning", delta: 3, reason: "recollection brings a sense of connection" },
-          { need: "connection", delta: 2, reason: "shared reflection with user" },
-        ],
-      };
-    } catch {
-      // Fall through to return silent reflection
+    if (!hasShareableRecallSignal(memorySummary)) {
+      log.info(`Recall memory not shared: no-concrete-result: ${memorySummary.slice(0, 120)}`);
+    } else {
+      const quality = assessOutgoingProactiveMessage(memorySummary);
+      if (!quality.ok) {
+        log.info(`Recall memory not shared: ${quality.reason ?? "quality-gate"}: ${memorySummary.slice(0, 120)}`);
+      } else {
+        const sendLimit = await getProactiveMessageLimitReason(ego, memorySummary, options.thoughtFrequency);
+        if (sendLimit) {
+          log.info(`Recall memory not shared: ${sendLimit}: ${memorySummary.slice(0, 120)}`);
+        } else {
+          try {
+            await options.sendMessage({ to: options.target, content: memorySummary, channel: options.channel });
+            await recordProactiveOutboundMemory(memorySummary, ["recall-memory"]);
+            log.info("Recall memory: concrete reflection sent as message");
+            return {
+              result: { type: "recall-memory", success: true, result: "reflection-shared-as-message" },
+              metricsChanged: [
+                { need: "meaning", delta: 3, reason: "recollection brings a sense of connection" },
+                { need: "connection", delta: 2, reason: "shared concrete reflection with user" },
+              ],
+            };
+          } catch {
+            // Fall through to return silent reflection
+          }
+        }
+      }
     }
   }
 
@@ -2006,7 +2205,7 @@ Describe in 1-2 sentences what these memories make you think about, and what you
       success: true,
       result: memorySummary || "Recalling the past",
     },
-    metricsChanged: [{ need: "meaning", delta: 3, reason: "recollection brings a sense of connection" }],
+    metricsChanged: [],
   };
 }
 

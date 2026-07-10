@@ -310,6 +310,8 @@ export interface EgoState {
   establishedRoutines: string[];
   behaviorLog: BehaviorEntry[];
   pendingShareMessage: string | null;
+  proactiveChannel: string | null;
+  proactiveTarget: string | null;
   userLanguage: string | null;
   recentUserMessages: string[];
   activeTasks: AutonomousTask[];

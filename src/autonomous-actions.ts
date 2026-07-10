@@ -1,7 +1,8 @@
 import { randomBytes } from "node:crypto";
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { dirname, join, normalize, resolve } from "node:path";
+import { dirname, join, normalize, parse as parsePath, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
 import { createSoulLogger } from "./logger.js";
@@ -15,11 +16,436 @@ import { SOUL_DIR } from "./paths.js";
 
 const log = createSoulLogger("autonomous-actions");
 
-/** Max concurrent active tasks. */
-const MAX_ACTIVE_TASKS = 5;
+/** Max concurrent active tasks. Soul is a background worker; run heavy work serially. */
+const MAX_ACTIVE_TASKS = 1;
+
+const PROVIDER_PRESSURE_BACKOFF_MS = 60 * 60 * 1000;
+const PROVIDER_PRESSURE_TAIL_LINES = 80;
+const AUTONOMOUS_AGENT_TIMEOUT_SECONDS = 300;
+const AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS = 150;
+const AUTONOMOUS_AGENT_QUICK_CHECK_SECONDS = 60;
+const AUTONOMOUS_FAILURE_BACKOFF_MS = 2 * 60 * 60 * 1000;
+const AUTONOMOUS_FAILURE_LOOKBACK_MS = 6 * 60 * 60 * 1000;
 
 /** Track recently sent report messages to prevent duplicates. */
 const recentReportedMessages: Map<string, number> = new Map();
+
+function hasRecentProviderPressure(windowMs = PROVIDER_PRESSURE_BACKOFF_MS): boolean {
+  const sessionsDir = join(homedir(), ".openclaw/agents/main/sessions");
+  const cutoff = Date.now() - windowMs;
+  try {
+    for (const name of readdirSync(sessionsDir)) {
+      if (!name.endsWith(".jsonl") && !name.endsWith(".trajectory.jsonl")) continue;
+      const fp = join(sessionsDir, name);
+      const stat = statSync(fp);
+      if (stat.mtimeMs < cutoff) continue;
+      const lines = readFileSync(fp, "utf-8").split(/\r?\n/).filter(Boolean).slice(-PROVIDER_PRESSURE_TAIL_LINES);
+      for (const line of lines) {
+        const providerPressureLine =
+          /"fallbackStepFromFailureReason":"rate_limit"/.test(line) ||
+          /"fallbackStepFromFailureDetail":"[^"]*(?:429|cooldown|suspending lanes|too many requests|rate limit)/i.test(line) ||
+          (/"stopReason":"error"/.test(line) && /"errorMessage":"[^"]*(?:429|cooldown|too many requests|rate limit)/i.test(line));
+        if (providerPressureLine) {
+          return true;
+        }
+      }
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+async function markCompletedTasksDelivered(): Promise<void> {
+  await updateEgoStore(resolveEgoStorePath(), (e) => {
+    for (const t of e.activeTasks ?? []) {
+      if (isReportableTask(t) && !t.resultDelivered) t.resultDelivered = true;
+    }
+    return e;
+  });
+}
+
+function isReportableTask(task: AutonomousTask): boolean {
+  return (task.status === "completed" || task.status === "failed") && Boolean(task.result);
+}
+
+function wantsChineseReport(ego: EgoState): boolean {
+  return ego.userLanguage === "zh-CN" || (ego.recentUserMessages ?? []).some((m) => /[\u4e00-\u9fff]/.test(m));
+}
+
+function normalizeTaskResultForReport(result: string): string {
+  return result
+    .replace(/<think[\s\S]*?<\/think>/gi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+    .slice(0, 4000);
+}
+
+function isTaskBlockedResult(result: string): boolean {
+  return /timed out|timeout|stale|rate limit|cooldown|backing off|too many requests|429|No available auth profile|failed|error|aborted|prompt-error|parsererror|command exited with code [1-9]/i.test(result);
+}
+
+function isProviderPressureErrorText(value: unknown): boolean {
+  const text = value instanceof Error ? value.message : String(value ?? "");
+  return /Soul LLM backoff active|Soul LLM call budget exhausted|rate limit|cooldown|No available auth profile|too many requests|429|suspending lanes|embedded run timeout|Request timed out|ECONNRESET|fetch failed/i.test(text);
+}
+
+function isLowValueAutonomousFailure(task: AutonomousTask): boolean {
+  if (task.status !== "failed") return false;
+  const result = task.result ?? "";
+  return /did not finish with a complete report|No confirmed final change set|failed before verification|No reliable before\/after metrics|stopped before producing a final result file|Required final result file was not produced|Task timed out \(stale|request timed out|embedded run timeout|Failed to start autonomous agent task|LLM analysis failed|No concrete fix identified/i.test(result);
+}
+
+function recentAutonomousFailureBackoff(ego: EgoState): { count: number; remainingMs: number; latest?: AutonomousTask } | null {
+  const now = Date.now();
+  const cutoff = now - AUTONOMOUS_FAILURE_LOOKBACK_MS;
+  const failures = (ego.activeTasks ?? [])
+    .filter((task) => {
+      const ts = task.completedAt ?? task.updatedAt ?? task.createdAt;
+      return ts >= cutoff && isLowValueAutonomousFailure(task);
+    })
+    .sort((a, b) => (b.completedAt ?? b.updatedAt ?? b.createdAt) - (a.completedAt ?? a.updatedAt ?? a.createdAt));
+
+  const latest = failures[0];
+  if (!latest) return null;
+
+  const latestTs = latest.completedAt ?? latest.updatedAt ?? latest.createdAt;
+  const remainingMs = latestTs + AUTONOMOUS_FAILURE_BACKOFF_MS - now;
+  if (remainingMs <= 0) return null;
+  return { count: failures.length, remainingMs, latest };
+}
+
+function hasTaskResultFile(task: AutonomousTask): boolean {
+  if (!task.resultFilePath) return false;
+  try {
+    return statSync(task.resultFilePath).size > 0;
+  } catch {
+    return false;
+  }
+}
+
+function hasFinalTaskResultFile(task: AutonomousTask): boolean {
+  if (!task.resultFilePath) return false;
+  try {
+    return isFinalTaskReport(readFileSync(task.resultFilePath, "utf-8"));
+  } catch {
+    return false;
+  }
+}
+
+type ReportStatus = "in-progress" | "completed" | "failed" | "blocked" | "partial";
+
+function taskReportStatus(result: string): ReportStatus | null {
+  const match = result.match(/^Status:\s*(in-progress|completed|failed|blocked|partial)\b/im);
+  return match ? match[1].toLowerCase() as ReportStatus : null;
+}
+
+function isFinalTaskReport(result: string): boolean {
+  const status = taskReportStatus(result);
+  if (status === "in-progress") return false;
+  if (status) return hasRequiredReportSections(result);
+  return isCompleteTaskReport(result);
+}
+
+function reportStatusToTaskStatus(result: string): "completed" | "failed" {
+  return taskReportStatus(result) === "completed" ? "completed" : "failed";
+}
+
+function writeTaskReportFile(resultFilePath: string | undefined, content: string): void {
+  if (!resultFilePath) return;
+  try {
+    writeFileSync(resultFilePath, `${content.trim()}\n`, "utf-8");
+  } catch (err) {
+    log.warn(`Failed to write autonomous task report ${resultFilePath}: ${String(err)}`);
+  }
+}
+
+type VerificationResult = {
+  ok: boolean;
+  summary: string;
+};
+
+function runCommand(cwd: string, command: string, args: string[], timeoutMs: number): VerificationResult {
+  const result = spawnSync(command, args, {
+    cwd,
+    encoding: "utf-8",
+    timeout: timeoutMs,
+    shell: process.platform === "win32",
+  });
+  const output = [result.stdout, result.stderr]
+    .filter(Boolean)
+    .join("\n")
+    .trim()
+    .slice(-2000);
+  const commandText = [command, ...args].join(" ");
+  if (result.error) {
+    return { ok: false, summary: `${commandText} failed to start: ${result.error.message}${output ? `\n${output}` : ""}` };
+  }
+  if (result.status !== 0) {
+    return { ok: false, summary: `${commandText} exited ${result.status ?? "unknown"}${output ? `\n${output}` : ""}` };
+  }
+  return { ok: true, summary: `${commandText} passed${output ? `\n${output}` : ""}` };
+}
+
+function packageScript(dir: string, names: string[]): string | null {
+  try {
+    const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf-8")) as {
+      scripts?: Record<string, unknown>;
+    };
+    for (const name of names) {
+      if (typeof pkg.scripts?.[name] === "string") return name;
+    }
+  } catch {
+    // No package.json or invalid package metadata.
+  }
+  return null;
+}
+
+function verifyAppliedFix(targetDir: string, fixFile: string): VerificationResult {
+  const ext = parsePath(fixFile).ext.toLowerCase();
+  const script = packageScript(targetDir, ["typecheck", "test", "build"]);
+  if (script) {
+    return runCommand(targetDir, "npm", ["run", script], 120_000);
+  }
+  if (ext === ".py") {
+    return runCommand(targetDir, "python", ["-m", "py_compile", fixFile], 60_000);
+  }
+  if (ext === ".js" || ext === ".mjs" || ext === ".cjs") {
+    return runCommand(targetDir, "node", ["--check", fixFile], 60_000);
+  }
+  return {
+    ok: false,
+    summary: `No known verification command for ${fixFile}; refusing to mark autonomous edit as completed.`,
+  };
+}
+
+function buildInitialTaskReport(params: {
+  taskId: string;
+  title: string;
+  target: string;
+  resultFilePath: string;
+}): string {
+  return `Status: in-progress
+Task: ${params.taskId}
+Title: ${params.title}
+Target: ${params.target}
+Started: ${new Date().toISOString()}
+Budget: ${AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS}s work budget inside ${AUTONOMOUS_AGENT_TIMEOUT_SECONDS}s hook timeout
+Report: ${params.resultFilePath}
+
+## Outcome
+Autonomous work has started. This placeholder must be replaced with a final report before the task is considered done.
+
+## Changes
+Pending.
+
+## Verification
+Pending.
+
+## Metrics
+Pending.
+
+## Next
+Pending.`;
+}
+
+function buildFailureTaskReport(task: AutonomousTask, detail: string): string {
+  return `Status: failed
+Task: ${task.id}
+Finished: ${new Date().toISOString()}
+
+## Outcome
+The autonomous task did not finish with a complete report.
+
+## Changes
+No confirmed final change set was captured by Soul.
+
+## Verification
+The task failed before verification could be confirmed.
+
+## Metrics
+No reliable before/after metrics were captured.
+
+## Next
+Run a smaller bounded iteration and write the report incrementally before launching any long benchmark or backtest.
+
+## Failure Detail
+${detail.trim().slice(0, 3000)}`;
+}
+
+function buildPartialTaskReport(task: AutonomousTask, detail: string): string {
+  return `Status: partial
+Task: ${task.id}
+Finished: ${new Date().toISOString()}
+
+## Outcome
+The autonomous task produced a partial finding but did not write a complete final report before the budget expired.
+
+## Changes
+No confirmed final change set was captured by Soul.
+
+## Verification
+Partial verification or observations may exist in the captured output below, but the task did not provide a complete command/result report.
+
+## Metrics
+Captured partial output:
+${detail.trim().slice(0, 3000)}
+
+## Next
+Continue from this partial finding with a smaller follow-up task. The next task should write Status: partial before attempting any fix, then overwrite it only after verification is complete.`;
+}
+
+function buildBoundedLocalTaskReport(params: {
+  task: AutonomousTask;
+  status: "partial" | "blocked";
+  target: { dir: string; name: string; isSelf: boolean };
+  thought: Thought;
+  steps: TaskStep[];
+  evidence: string[];
+  userContext: string;
+  recentUserMessages: string;
+  activeGoals: string;
+  analysisContext: string;
+  limitation: string;
+  resultFilePath: string;
+}): string {
+  const successfulReads = params.steps.filter((s) => s.success).length;
+  const failedReads = params.steps.length - successfulReads;
+  const inspected = params.steps
+    .filter((s) => s.action.startsWith("read-"))
+    .map((s) => `- ${s.action}: ${s.input} (${s.success ? "ok" : "failed"})`)
+    .join("\n");
+  const evidence = params.evidence.length > 0
+    ? params.evidence.join("\n\n").slice(0, 5000)
+    : "No readable local evidence was found in the resolved target directory.";
+
+  return `Status: ${params.status}
+Task: ${params.task.id}
+Finished: ${new Date().toISOString()}
+Target: ${params.target.dir} (${params.target.name})
+Report: ${params.resultFilePath}
+
+## Outcome
+Soul completed a bounded local inspection for this autonomous task but did not claim a full implementation. ${params.limitation}
+
+Directive:
+${params.thought.content.slice(0, 1000)}
+
+Context used:
+- User profile: ${params.userContext || "limited"}
+- Recent user messages: ${params.recentUserMessages || "none"}
+- Active goals: ${params.activeGoals || "none"}
+${params.analysisContext ? `- Previous analysis: ${params.analysisContext.slice(0, 1000)}` : "- Previous analysis: none"}
+
+## Changes
+No files were changed by run-agent-task. This path is intentionally read-only until Soul has a trusted child-agent execution channel or the task is handled by observe-and-improve's direct local patch path.
+
+## Verification
+Local inspection steps:
+${inspected || "- No read steps ran."}
+
+Read results: ${successfulReads} succeeded, ${failedReads} failed.
+The task was not verified end-to-end because no trusted autonomous execution channel was available for write/command work.
+
+## Metrics
+Files or artifacts inspected: ${successfulReads}. No before/after performance, backtest, or benchmark metrics were produced by this bounded inspection.
+
+Evidence excerpts:
+${evidence}
+
+## Next
+Use a trusted Gateway agent RPC or execute a smaller direct observe-and-improve task that can apply one local patch and run verification. Do not route autonomous task instructions through /hooks/agent unless OpenClaw marks the source as trusted; otherwise the child agent may treat the task protocol as external untrusted content and ignore it.`;
+}
+
+function isCompleteTaskReport(result: string): boolean {
+  const text = result.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
+  if (!text) return false;
+  if (taskReportStatus(text) === "in-progress") return false;
+
+  if (!hasRequiredReportSections(text)) return false;
+  return /changed|implemented|verified|command|baseline|before|after|CAGR|drawdown|metric|backtest|benchmark|files?/i.test(text);
+}
+
+function hasRequiredReportSections(result: string): boolean {
+  const text = result.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
+  const requiredSections = ["outcome", "changes", "verification", "metrics", "next"];
+  return requiredSections.every((section) =>
+    new RegExp(`^##\\s+${section}\\b`, "im").test(text),
+  );
+}
+
+function isInterimTaskNarration(result: string): boolean {
+  const normalized = result.trim();
+  return /^(?:let me|now let me|i(?:'|’)ll|i will|first i|next i|我先|我将|现在我|让我|接下来|先看|先查|准备)/i.test(normalized)
+    && !/##\s*(outcome|changes|verification|metrics|next)|验证|指标|结果|变更|完成|completed|verified|metrics/i.test(normalized);
+}
+
+function isTaskBlockedOrPartial(task: AutonomousTask, result: string): boolean {
+  const reportStatus = taskReportStatus(result);
+  if (task.status === "failed") return true;
+  if (reportStatus === "completed") return false;
+  if (reportStatus === "failed" || reportStatus === "blocked" || reportStatus === "partial") return true;
+  if (task.status === "completed") {
+    return isInterimTaskNarration(result)
+      || (Boolean(task.resultFilePath) && !hasTaskResultFile(task));
+  }
+
+  return isTaskBlockedResult(result)
+    || isInterimTaskNarration(result)
+    || (Boolean(task.resultFilePath) && !hasTaskResultFile(task));
+}
+
+function taskResultFileLine(task: AutonomousTask, zh: boolean): string | null {
+  if (!task.resultFilePath) return null;
+  try {
+    const stat = statSync(task.resultFilePath);
+    return zh
+      ? `报告文件: ${task.resultFilePath} (${stat.size} bytes)`
+      : `Report file: ${task.resultFilePath} (${stat.size} bytes)`;
+  } catch {
+    return zh
+      ? `报告文件: 未生成 (${task.resultFilePath})`
+      : `Report file: missing (${task.resultFilePath})`;
+  }
+}
+
+function buildDirectTaskReportMessage(tasks: AutonomousTask[], ego: EgoState): string | null {
+  const reportable = tasks
+    .filter((t) => isReportableTask(t) && t.result && t.result.trim().length >= 20)
+    .slice(0, 3);
+  if (reportable.length === 0) return null;
+
+  const zh = wantsChineseReport(ego);
+  if (reportable.length === 1) {
+    const task = reportable[0];
+    const result = normalizeTaskResultForReport(task.result ?? "");
+    const blocked = isTaskBlockedOrPartial(task, result);
+    const meta = [
+      zh ? `任务ID: ${task.id}` : `Task ID: ${task.id}`,
+      zh ? `标题: ${task.title}` : `Title: ${task.title}`,
+      zh ? `状态: ${blocked ? "未完成/受阻" : "已完成"}` : `Status: ${blocked ? "blocked/partial" : "completed"}`,
+      taskResultFileLine(task, zh),
+    ].filter((line): line is string => Boolean(line));
+    return zh
+      ? `${blocked ? "这项自主任务没有真正完成" : "这项自主任务完成了"}\n${meta.join("\n")}\n\n结果:\n${result}`
+      : `${blocked ? "This autonomous task did not fully complete" : "This autonomous task completed"}\n${meta.join("\n")}\n\nResult:\n${result}`;
+  }
+
+  const body = reportable
+    .map((task) => {
+      const result = normalizeTaskResultForReport(task.result ?? "").replace(/\n/g, " ");
+      const blocked = isTaskBlockedOrPartial(task, result);
+      const status = zh
+        ? (blocked ? "未完成/受阻" : "已完成")
+        : (blocked ? "blocked/partial" : "completed");
+      const fileLine = taskResultFileLine(task, zh);
+      return `- ${task.id} ${status} ${task.title}${fileLine ? `; ${fileLine}` : ""}: ${result.slice(0, 700)}`;
+    })
+    .join("\n");
+  return zh
+    ? `这轮自主任务状态如下，含完成与受阻项:\n${body}`
+    : `Autonomous task status:\n${body}`;
+}
 
 export type AutonomousActionOptions = {
   autonomousActions: boolean;
@@ -52,6 +478,7 @@ export async function executeAutonomousAction(
     sendMessage: options.sendMessage,
     channel: options.channel,
     target: options.target,
+    workspaceContext: options.workspaceContext,
   };
 
   switch (actionType) {
@@ -128,6 +555,72 @@ export async function executeInvokeTool(
 // executeAnalyzeProblem — multi-step: gather → analyze → report
 // ---------------------------------------------------------------------------
 
+function buildRuleBasedAnalysis(
+  thought: Thought,
+  ego: EgoState,
+  gatheredInfo: string[],
+  steps: TaskStep[],
+): string {
+  const zh = wantsChineseReport(ego);
+  const combined = gatheredInfo.join("\n\n");
+  const lines = combined
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const signalLines = lines
+    .filter((line) => /error|warn|failed|failure|exception|timeout|rate limit|cooldown|401|403|429|500|too many|invalid|traceback|报错|失败|错误|超时|限流/i.test(line))
+    .slice(0, 8);
+  const successfulReads = steps.filter((s) => s.success).length;
+  const failedReads = steps.length - successfulReads;
+  const context = thought.content.replace(/\s+/g, " ").slice(0, 240);
+
+  if (zh) {
+    const findings = signalLines.length > 0
+      ? signalLines.map((line) => `- ${line.slice(0, 260)}`).join("\n")
+      : "- 没有在读取到的内容里发现明显 error/warn/timeout/rate limit 信号。";
+    return [
+      "## 分析",
+      "",
+      `上下文：${context}`,
+      "",
+      `读取结果：成功 ${successfulReads} 项，失败 ${failedReads} 项。`,
+      "",
+      "关键线索：",
+      findings,
+      "",
+      "下一步：如果这些线索不足以定位根因，应交给受冷却限制的完整 agent 任务处理；后台 analyze-problem 不再直接调用模型或启动工具链，避免放大 API 调用量。",
+    ].join("\n");
+  }
+
+  const findings = signalLines.length > 0
+    ? signalLines.map((line) => `- ${line.slice(0, 260)}`).join("\n")
+    : "- No obvious error/warn/timeout/rate-limit signal was found in gathered content.";
+  return [
+    "## Analysis",
+    "",
+    `Context: ${context}`,
+    "",
+    `Read results: ${successfulReads} succeeded, ${failedReads} failed.`,
+    "",
+    "Signals:",
+    findings,
+    "",
+    "Next: escalate to the rate-limited full agent path only if these signals are not enough; background analyze-problem does not call the model directly.",
+  ].join("\n");
+}
+
+function isInternalNeedDiagnostic(thought: Thought): boolean {
+  const text = `${thought.content} ${thought.motivation} ${thought.triggerDetail}`.replace(/\s+/g, " ");
+  return /need (?:critically low|is low|could improve|is somewhat)|\b(?:Security|Survival|Growth|Meaning|Connection) need\b|\d+\/\d+/.test(text);
+}
+
+function isOnlyProviderPressureDiagnostic(result: string): boolean {
+  const text = result.replace(/<think[\s\S]*?<\/think>/gi, "");
+  const hasProviderPressure = /Soul LLM backoff active|Soul LLM call budget exhausted|provider backoff active|rate limit|cooldown|too many requests|429/i.test(text);
+  const hasExternalSignal = /traceback|exception|parsererror|command exited with code [1-9]|500|401|403|TypeError|ReferenceError|SyntaxError|Cannot find module/i.test(text);
+  return hasProviderPressure && !hasExternalSignal;
+}
+
 export async function executeAnalyzeProblem(
   thought: Thought,
   ego: EgoState,
@@ -200,41 +693,12 @@ export async function executeAnalyzeProblem(
     }
   }
 
-  // Phase 2: Analyze with LLM
+  // Phase 2: Analyze deterministically. Do not call the gateway LLM from
+  // analyze-problem: in OpenClaw this can open a full agent session with tools,
+  // turning a cheap background diagnostic into many API calls.
   let analysisResult = "";
-  if (options.llmGenerator && gatheredInfo.length > 0) {
-    const totalContext = gatheredInfo.join("\n\n").slice(0, 12_000);
-    const lang = ego.userLanguage === "zh-CN" ? "Chinese"
-      : ego.userLanguage === "ja" ? "Japanese"
-        : ego.userLanguage === "ko" ? "Korean"
-        : undefined;
-    const userSamples = ego.recentUserMessages ?? [];
-    const langInstruction = lang
-      ? `Please analyze and respond in ${lang}.`
-      : userSamples.length > 0
-        ? `The user writes in this language:\n${userSamples.slice(0, 3).join("\n")}\nRespond in the same language.`
-        : "Respond in English.";
-
-    const prompt = `You are an AI assistant that has autonomously read some files to investigate a problem or question. Based on the information below, provide a concise analysis.
-
-**Context**: ${thought.content.slice(0, 300)}
-
-**Gathered information**:
-${totalContext}
-
-${langInstruction}
-1. What is the root cause or key finding (if identifiable)?
-2. What is the recommended fix, next step, or useful insight?
-3. Any relevant code or config changes needed?
-
-Keep your response under 300 words. Be specific and actionable.`;
-
-    try {
-      analysisResult = await options.llmGenerator(prompt);
-    } catch (err) {
-      log.warn(`LLM analysis failed: ${String(err)}`);
-      analysisResult = "LLM analysis failed — raw data gathered but no interpretation available.";
-    }
+  if (gatheredInfo.length > 0) {
+    analysisResult = buildRuleBasedAnalysis(thought, ego, gatheredInfo, steps);
   } else if (gatheredInfo.length === 0) {
     analysisResult = "No relevant information could be gathered for analysis.";
   }
@@ -248,6 +712,9 @@ Keep your response under 300 words. Be specific and actionable.`;
       t.result = analysisResult;
       t.updatedAt = Date.now();
       t.completedAt = Date.now();
+      if (isInternalNeedDiagnostic(thought) && isOnlyProviderPressureDiagnostic(analysisResult)) {
+        t.resultDelivered = true;
+      }
     }
     return e;
   });
@@ -272,13 +739,166 @@ Keep your response under 300 words. Be specific and actionable.`;
 // executeRunAgentTask — delegate to full agent via /hooks/agent
 // ---------------------------------------------------------------------------
 
+async function executeBoundedLocalAgentTask(
+  thought: Thought,
+  ego: EgoState,
+  options: AutonomousActionOptions,
+): Promise<{ result: ActionResult; metricsChanged: MetricDelta[] }> {
+  const target = resolveTargetProject(ego, thought, options.workspaceContext);
+  const userContext = ego.userFacts.slice(0, 5).map((f) => `[${f.category}] ${f.content}`).join("\n");
+  const recentUserMessages = (ego.recentUserMessages ?? [])
+    .slice(-5)
+    .map((m, i) => `${i + 1}. ${m.slice(0, 240)}`)
+    .join("\n");
+  const activeGoals = ego.goals
+    .filter((g) => g.status === "active")
+    .slice(0, 5)
+    .map((g) => `- ${g.title}: ${g.description} (${g.progress.toFixed(0)}%)`)
+    .join("\n");
+  const latestAnalysis = (ego.activeTasks ?? [])
+    .filter((t) => t.status === "completed" && t.result && !t.resultDelivered)
+    .slice(-1)[0];
+  const analysisContext = latestAnalysis?.result?.slice(0, 1000) ?? "";
+
+  const taskId = randomBytes(4).toString("hex");
+  const resultDir = join(SOUL_DIR, "results");
+  mkdirSync(resultDir, { recursive: true });
+  const resultFilePath = join(resultDir, `${taskId}.md`);
+  const steps: TaskStep[] = [{
+    id: randomBytes(4).toString("hex"),
+    timestamp: Date.now(),
+    action: "bounded-local-inspection",
+    input: thought.content.slice(0, 200),
+    success: true,
+  }];
+
+  const task: AutonomousTask = {
+    id: taskId,
+    title: thought.motivation.slice(0, 100),
+    description: thought.content.slice(0, 200),
+    status: "in-progress",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    sourceThoughtId: thought.id,
+    steps,
+    resultFilePath,
+    requiresWritePermission: false,
+    resultDelivered: false,
+  };
+
+  writeTaskReportFile(resultFilePath, buildInitialTaskReport({
+    taskId,
+    title: task.title,
+    target: target.isSelf ? target.name : `${target.name} at ${target.dir}`,
+    resultFilePath,
+  }));
+  await persistTask(task);
+
+  const evidence: string[] = [];
+  const sourceFiles = getSourceFiles(target.dir).slice(0, 8);
+  for (const file of sourceFiles.slice(0, 5)) {
+    const step = await readLocalFile("read-source", join(target.dir, file));
+    steps.push(step);
+    if (step.success && step.output) evidence.push(`### ${file}\n${step.output.slice(0, 1200)}`);
+  }
+
+  for (const file of ["package.json", "README.md"]) {
+    const step = await readLocalFile(`read-${file}`, join(target.dir, file));
+    steps.push(step);
+    if (step.success && step.output) evidence.push(`### ${file}\n${step.output.slice(0, 1200)}`);
+  }
+
+  const status: "partial" | "blocked" = evidence.length > 0 ? "partial" : "blocked";
+  const limitation = options.hooksToken
+    ? "Soul did not delegate this task through /hooks/agent because that path wraps autonomous instructions as EXTERNAL_UNTRUSTED_CONTENT, which can cause the child agent to ignore the task protocol."
+    : "Soul has no trusted child-agent channel configured, so it performed only bounded local inspection.";
+  const report = buildBoundedLocalTaskReport({
+    task,
+    status,
+    target,
+    thought,
+    steps,
+    evidence,
+    userContext,
+    recentUserMessages,
+    activeGoals,
+    analysisContext,
+    limitation,
+    resultFilePath,
+  });
+
+  writeTaskReportFile(resultFilePath, report);
+  await updateEgoStore(resolveEgoStorePath(), (e) => {
+    const t = (e.activeTasks ?? []).find((at) => at.id === taskId);
+    if (t) {
+      t.status = reportStatusToTaskStatus(report);
+      t.steps = steps;
+      t.result = report;
+      t.completedAt = Date.now();
+      t.updatedAt = Date.now();
+      t.resultDelivered = false;
+    }
+    if (latestAnalysis) {
+      const analysisTask = (e.activeTasks ?? []).find((at) => at.id === latestAnalysis.id);
+      if (analysisTask) {
+        analysisTask.resultDelivered = true;
+        analysisTask.updatedAt = Date.now();
+      }
+    }
+    return e;
+  });
+
+  log.info(`Bounded local run-agent-task ${taskId}: status=${status}, target=${target.dir}, evidence=${evidence.length}`);
+
+  return {
+    result: {
+      type: "run-agent-task",
+      success: status === "partial",
+      result: report.slice(0, 500),
+      data: { taskId, resultFilePath, status, filesInspected: sourceFiles.length },
+    },
+    metricsChanged: [
+      { need: "growth", delta: status === "partial" ? 6 : 2, reason: "completed bounded autonomous inspection" },
+      { need: "meaning", delta: status === "partial" ? 4 : 1, reason: "reported verifiable autonomous task status" },
+    ],
+  };
+}
+
 export async function executeRunAgentTask(
   thought: Thought,
   ego: EgoState,
   options: AutonomousActionOptions,
 ): Promise<{ result: ActionResult; metricsChanged: MetricDelta[] }> {
+  if ((ego.activeTasks ?? []).filter((t) => t.status === "in-progress").length >= MAX_ACTIVE_TASKS) {
+    return { result: { type: "run-agent-task", success: false, error: "Too many active tasks" }, metricsChanged: [] };
+  }
+
+  return executeBoundedLocalAgentTask(thought, ego, options);
+
   if (!options.hooksToken) {
     return { result: { type: "run-agent-task", success: false, error: "No hooks token configured" }, metricsChanged: [] };
+  }
+
+  if (hasRecentProviderPressure()) {
+    log.info("Skipping run-agent-task: provider pressure seen recently");
+    return {
+      result: { type: "run-agent-task", success: false, error: "Provider rate limit/cooldown seen recently; backing off autonomous agent launch" },
+      metricsChanged: [],
+    };
+  }
+
+  const failureBackoff = recentAutonomousFailureBackoff(ego);
+  if (failureBackoff !== null) {
+    const mins = Math.ceil(failureBackoff!.remainingMs / 60_000);
+    log.info(`Skipping run-agent-task: recent low-value autonomous failure (${failureBackoff!.latest?.id ?? "unknown"}), backoff ${mins}m`);
+    return {
+      result: {
+        type: "run-agent-task",
+        success: false,
+        error: `Recent autonomous task failed without a useful result; backing off agent launch for ${mins}m`,
+      },
+      metricsChanged: [],
+    };
   }
 
   const activeCount = (ego.activeTasks ?? []).filter((t) => t.status === "in-progress").length;
@@ -286,8 +906,21 @@ export async function executeRunAgentTask(
     return { result: { type: "run-agent-task", success: false, error: "Too many active tasks" }, metricsChanged: [] };
   }
 
-  // Build a detailed prompt for the agent
+  return executeBoundedLocalAgentTask(thought, ego, options);
+
+  const target = resolveTargetProject(ego, thought, options.workspaceContext);
+  // Build a detailed prompt for the agent. This is the closest path to the
+  // user's normal "ask OpenClaw to do it" flow, so preserve rich context.
   const userContext = ego.userFacts.slice(0, 5).map((f) => `[${f.category}] ${f.content}`).join("\n");
+  const recentUserMessages = (ego.recentUserMessages ?? [])
+    .slice(-5)
+    .map((m, i) => `${i + 1}. ${m.slice(0, 240)}`)
+    .join("\n");
+  const activeGoals = ego.goals
+    .filter((g) => g.status === "active")
+    .slice(0, 5)
+    .map((g) => `- ${g.title}: ${g.description} (${g.progress.toFixed(0)}%)`)
+    .join("\n");
   const readOnlyInstruction = !options.autonomousActions
     ? "\n\nIMPORTANT: You are in READ-ONLY mode. Only READ files and RUN diagnostic commands (cat, grep, tail, ls, etc.). Do NOT edit, write, or modify any files."
     : "";
@@ -311,24 +944,100 @@ ${thought.content}
 
 **IMPORTANT**: This is an AUTONOMOUS task. No one will reply to you. Do NOT ask for confirmation or permission — start working immediately.
 
+You have a hard ${AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS}s work budget. Write the report skeleton immediately, do one bounded iteration, then stop and finalize the report.
+First spend at most ${AUTONOMOUS_AGENT_QUICK_CHECK_SECONDS}s on a quick check: inspect existing recent result files/logs and identify one command that should finish quickly. If you cannot find a command that should finish within ${AUTONOMOUS_AGENT_QUICK_CHECK_SECONDS}s, do not create new scripts or start experiments; write Status: blocked with the exact reason.
+Do not start broad sweeps, parameter sweeps, smooth sweeps, long grid searches, open-ended research, multi-phase experiments, or newly generated backtest harnesses.
+
 Context:
+- Target project: ${target.isSelf ? "not explicitly specified; inspect the current workspace or relevant project context" : `${target.dir} (${target.name})`}
 - User profile: ${userContext || "limited"}
+- Recent user messages:
+${recentUserMessages || "none"}
+- Active goals:
+${activeGoals || "none"}
 - Trigger: ${thought.triggerDetail}${readOnlyInstruction}${analysisContext}${options.workspaceContext ? `\n- Workspace rules:\n${options.workspaceContext}` : ""}
 
-Please investigate and report your findings. If a concrete fix is identified and you have write access, implement it.
+Work like the main OpenClaw agent would when the user directly asks for an improvement:
+- First switch to the target project if one is specified. Do not optimize the Soul plugin itself unless the target is explicitly Soul or no project target exists.
+- Inspect only the most relevant code, scripts, docs, recent logs, and existing patterns needed for one decision.
+- Choose exactly ONE concrete, high-value iteration that can finish within this run. Prefer reading existing result artifacts or running an existing quick command over creating new code.
+- If the project is a backtest, trading, ML, benchmark, or strategy project, do not run any parameter/smooth/grid sweep in the background. Run only one existing smoke/evaluation command if it is likely to finish within ${AUTONOMOUS_AGENT_QUICK_CHECK_SECONDS}s. If a full evaluation cannot finish inside that quick-check budget, read existing result artifacts and report a partial/blocked finding instead of launching a new experiment.
+- If you have write access and the fix or experiment is clear, edit the files directly.
+- Run only the most relevant verification command available in the repo, and only if it should finish quickly. Before any command that might run longer than 30 seconds, write Status: partial with the command you are about to try and what evidence already exists.
+- Do not create a new large strategy/backtest script unless you have already completed a quick baseline and know the verification command will finish inside the remaining budget.
+- Do not ask for confirmation, do not stop at a proposal, and do not invent results.
 
-**CRITICAL**: After completing your work, write a summary to:
+**CRITICAL REPORT PROTOCOL**
+Immediately update this exact file with a first line of "Status: in-progress" before doing expensive work:
 ${resultFilePath}
-Keep it to 1-2 sentences: what you found and what you did (if anything).`;
+Before the work budget expires, overwrite that same file with the final report. The first line must be exactly one of:
+- Status: completed
+- Status: failed
+- Status: blocked
+- Status: partial
+
+Use this exact structure and keep it substantial. A task is not done until this file contains a final status and these sections:
+## Outcome
+What you investigated and the final result. Include whether this was completed, partial, blocked, or failed.
+
+## Changes
+Files changed and why. If no files changed, say why.
+
+## Verification
+Commands run and their results. If you could not verify, explain the blocker.
+
+## Metrics
+For optimization/backtest work, include before/after metrics and comparison to the user's target if available. If metrics are not applicable, say so.
+
+## Next
+Any remaining risk or a sensible next improvement.
+
+If you hit a blocker, timeout risk, provider issue, missing dependency, or a long-running command, stop the command if possible and write Status: blocked or Status: partial with the exact blocker, commands attempted, files touched, and any partial metrics.`;
+
+  const task: AutonomousTask = {
+    id: taskId,
+    title: thought.motivation.slice(0, 100),
+    description: thought.content.slice(0, 200),
+    status: "in-progress",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    sourceThoughtId: thought.id,
+    steps: [{ id: randomBytes(4).toString("hex"), timestamp: Date.now(), action: "fire-agent", input: agentMessage.slice(0, 200), success: true }],
+    resultFilePath,
+    requiresWritePermission: options.autonomousActions,
+    resultDelivered: false,
+  };
+
+  writeTaskReportFile(resultFilePath, buildInitialTaskReport({
+    taskId,
+    title: task.title,
+    target: target.isSelf ? target.name : `${target.name} at ${target.dir}`,
+    resultFilePath,
+  }));
+
+  await persistTask(task);
 
   const fireResult = await fireAgentTask({
     message: agentMessage,
     gatewayPort: options.gatewayPort,
-    hooksToken: options.hooksToken,
-    timeoutSeconds: 300,
+    hooksToken: options.hooksToken ?? "",
+    timeoutSeconds: AUTONOMOUS_AGENT_TIMEOUT_SECONDS,
   });
 
   if (!fireResult.ok) {
+    await updateEgoStore(resolveEgoStorePath(), (e) => {
+      const t = (e.activeTasks ?? []).find((at) => at.id === taskId);
+      if (t) {
+        const report = buildFailureTaskReport(t, `Failed to start autonomous agent task: ${fireResult.error}`);
+        t.status = "failed";
+        t.result = report;
+        t.completedAt = Date.now();
+        t.updatedAt = Date.now();
+        t.resultDelivered = false;
+        writeTaskReportFile(t.resultFilePath, report);
+      }
+      return e;
+    });
     return {
       result: { type: "run-agent-task", success: false, error: fireResult.error },
       metricsChanged: [],
@@ -345,23 +1054,6 @@ Keep it to 1-2 sentences: what you found and what you did (if anything).`;
       return e;
     });
   }
-
-  // Create task record
-  const task: AutonomousTask = {
-    id: taskId,
-    title: thought.motivation.slice(0, 100),
-    description: thought.content.slice(0, 200),
-    status: "in-progress",
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    sourceThoughtId: thought.id,
-    steps: [{ id: randomBytes(4).toString("hex"), timestamp: Date.now(), action: "fire-agent", input: agentMessage.slice(0, 200), success: true }],
-    resultFilePath,
-    requiresWritePermission: options.autonomousActions,
-    resultDelivered: false,
-  };
-
-  await persistTask(task);
 
   log.info(`Fired agent task ${task.id}, runId=${fireResult.runId}`);
 
@@ -389,18 +1081,28 @@ export async function executeReportFindings(
   options: AutonomousActionOptions,
 ): Promise<{ result: ActionResult; metricsChanged: MetricDelta[] }> {
   const completedTasks = (ego.activeTasks ?? []).filter(
-    (t) => t.status === "completed" && !t.resultDelivered && t.result,
+    (t) => isReportableTask(t) && !t.resultDelivered,
   );
 
   if (completedTasks.length === 0) {
     return { result: { type: "report-findings", success: true, result: "no completed tasks to report" }, metricsChanged: [] };
   }
 
-  if (!options.llmGenerator || !options.sendMessage || !options.channel || !options.target) {
+  const reportableTasks = completedTasks.filter((t) => !isLowValueAutonomousFailure(t));
+  if (reportableTasks.length === 0) {
+    log.info(`Report-findings: suppressed ${completedTasks.length} low-value autonomous failure report(s)`);
+    await markCompletedTasksDelivered();
+    return {
+      result: { type: "report-findings", success: true, result: "suppressed-low-value-failure-report" },
+      metricsChanged: [],
+    };
+  }
+
+  if (!options.sendMessage || !options.channel || !options.target) {
     // Can't compose or send — just mark as delivered to stop retrying
     await updateEgoStore(resolveEgoStorePath(), (e) => {
       for (const t of e.activeTasks ?? []) {
-        if (t.status === "completed" && !t.resultDelivered) t.resultDelivered = true;
+        if (isReportableTask(t) && !t.resultDelivered) t.resultDelivered = true;
       }
       return e;
     });
@@ -408,37 +1110,55 @@ export async function executeReportFindings(
   }
 
   // Compose summary from all completed tasks
-  const taskSummaries = completedTasks.map((t) =>
-    `**${t.title}**\n${t.result?.slice(0, 500) ?? "No result"}`,
+  const taskSummaries = reportableTasks.map((t) =>
+    `**${t.title}**\n${t.result?.slice(0, 2000) ?? "No result"}`,
   ).join("\n\n");
 
-  // Dedup: check against ALL previously delivered tasks (not just last 5).
-  // Skip if keyword overlap is >50% with any delivered task.
-  const allDelivered = (ego.activeTasks ?? [])
-    .filter((t) => t.resultDelivered && t.result);
-  if (allDelivered.length > 0) {
-    const newKeywords = extractKeywords(taskSummaries);
-    for (const old of allDelivered) {
-      const oldKeywords = extractKeywords(old.result ?? "");
-      const overlap = newKeywords.filter((w) => oldKeywords.includes(w)).length;
-      const similarity = overlap / Math.max(newKeywords.length, 1);
-      if (similarity > 0.5) {
-        log.info(`Skipping report-findings: ${Math.round(similarity * 100)}% similar to delivered task ${old.id}`);
-        await updateEgoStore(resolveEgoStorePath(), (e) => {
-          for (const t of e.activeTasks ?? []) {
-            if (t.status === "completed" && !t.resultDelivered) t.resultDelivered = true;
-          }
-          return e;
-        });
-        return { result: { type: "report-findings", success: true, result: "skipped-duplicate" }, metricsChanged: [] };
-      }
-    }
-  }
+  // Do not keyword-deduplicate structured autonomous reports. Adjacent backtest
+  // iterations often share vocabulary while containing different commands,
+  // files, metrics, or blockers. Exact message dedup below is enough to prevent
+  // repeated sends without swallowing useful work.
 
   const cjkLang = ego.userLanguage === "zh-CN" ? "Chinese (中文)"
     : ego.userLanguage === "ja" ? "Japanese"
       : ego.userLanguage === "ko" ? "Korean"
       : undefined;
+  const directMessage = buildDirectTaskReportMessage(reportableTasks, ego);
+  if (directMessage) {
+    const msgNorm = directMessage.trim().toLowerCase().slice(0, 200);
+    const dedupCutoff = Date.now() - 4 * 60 * 60 * 1000;
+    const isDuplicate = recentReportedMessages.has(msgNorm)
+      && (recentReportedMessages.get(msgNorm) ?? 0) > dedupCutoff;
+    if (isDuplicate) {
+      log.info("Report-findings: duplicate of recently sent direct report, skipping");
+      await markCompletedTasksDelivered();
+      return { result: { type: "report-findings", success: true, result: "skipped-duplicate" }, metricsChanged: [] };
+    }
+
+    try {
+      await options.sendMessage({ to: options.target, content: directMessage, channel: options.channel });
+      recentReportedMessages.set(msgNorm, Date.now());
+      log.info(`Reported findings directly: ${reportableTasks.length} tasks, message ${directMessage.length} chars`);
+    } catch (err) {
+      log.warn(`Failed to send direct report: ${String(err)}`);
+      return { result: { type: "report-findings", success: false, error: String(err) }, metricsChanged: [] };
+    }
+
+    await markCompletedTasksDelivered();
+    return {
+      result: { type: "report-findings", success: true, result: `Reported ${reportableTasks.length} tasks` },
+      metricsChanged: [
+        { need: "connection", delta: 10, reason: "proactively shared useful findings" },
+        { need: "meaning", delta: 8, reason: "delivered value to user" },
+      ],
+    };
+  }
+
+  if (!options.llmGenerator) {
+    await markCompletedTasksDelivered();
+    return { result: { type: "report-findings", success: true, result: "nothing meaningful to report" }, metricsChanged: [] };
+  }
+
   const userSamples = ego.recentUserMessages ?? [];
   const reportLangInstruction = cjkLang
     ? `Write the message in ${cjkLang}.`
@@ -450,17 +1170,17 @@ export async function executeReportFindings(
 **What you investigated**:
 ${taskSummaries}
 
-Write 3-5 sentences in flowing prose (NOT a numbered list). Rules:
+Write a useful progress report, not a tiny notification. Use 1 short opening sentence plus 2-5 compact bullets when that is clearer. Rules:
 - Start by mentioning WHAT you investigated and WHY (e.g. "我后来查了一下飞书消息发送超时的问题——", "我研究了一下那个 413 错误——", "I looked into the Discord delivery issue —")
 - Then share the CONCRETE finding: actual error messages, root causes, or actionable insights
 - If you investigated multiple things, pick the ONE most interesting finding — do NOT list them all
 - Sound natural, like a knowledgeable friend sharing something useful they discovered
-- Do NOT describe your own behavior, configuration changes, or self-modifications
-- Do NOT mention "Soul" by name — the user knows who you are
-- Do NOT report about fixing your own bugs, adding keywords, tuning your config, or improving yourself — that is internal maintenance, NOT a user-facing finding
-- Do NOT use numbered lists or bullet points — they get truncated and look bad in chat
-- Only report if you found a CONCRETE root cause or actionable insight about an EXTERNAL system or real-world fact
-- If the task was about self-improvement (modifying your own code/config/keywords), output exactly: NO_MESSAGE
+- Avoid vague self-narration; focus on the concrete code, behavior, files, and verification
+- Mention plugin/module names only when they clarify what changed
+- If code changed, mention the files/modules changed and why
+- If you verified the work, mention the command and result
+- Reports about code improvements, fixes, verification, and remaining risks are valuable when they are concrete
+- Output NO_MESSAGE only if there is no concrete finding, no code change, and no useful next step
 
 **BAD examples** (NEVER do this):
 收到，问题已定位：...                          ← assistant-like prefix
@@ -476,7 +1196,8 @@ Soul 插件正在产生主动行为了！                ← describing Soul's o
 我研究了一下日志里那个 413 错误，是 memory search 输入超长导致的，跟 Soul 插件没关系。
 I looked into the Discord message delivery failure — it turns out Discord requires the "user:" prefix before user IDs in the target field.
 
-If the investigation didn't find a concrete root cause, output exactly: NO_MESSAGE
+For this user, code and plugin self-improvement reports ARE user-facing when they describe a concrete change, verification result, or next engineering step.
+If the work produced no concrete finding, no code change, and no useful next step, output exactly: NO_MESSAGE
 Output ONLY the message, nothing else.`;
 
   let message: string;
@@ -490,7 +1211,7 @@ Output ONLY the message, nothing else.`;
       .trim();
   } catch {
     // Fallback: use raw task result
-    message = completedTasks[0].result?.slice(0, 300) ?? "Analysis completed.";
+    message = reportableTasks[0].result?.slice(0, 300) ?? "Analysis completed.";
   }
 
   // Reject messages that are clearly not useful
@@ -498,7 +1219,7 @@ Output ONLY the message, nothing else.`;
     log.info("Report-findings: no valuable content to report, skipping");
     await updateEgoStore(resolveEgoStorePath(), (e) => {
       for (const t of e.activeTasks ?? []) {
-        if (t.status === "completed" && !t.resultDelivered) t.resultDelivered = true;
+        if (isReportableTask(t) && !t.resultDelivered) t.resultDelivered = true;
       }
       return e;
     });
@@ -510,7 +1231,7 @@ Output ONLY the message, nothing else.`;
     log.info("Report-findings: message is self-referential, skipping");
     await updateEgoStore(resolveEgoStorePath(), (e) => {
       for (const t of e.activeTasks ?? []) {
-        if (t.status === "completed" && !t.resultDelivered) t.resultDelivered = true;
+        if (isReportableTask(t) && !t.resultDelivered) t.resultDelivered = true;
       }
       return e;
     });
@@ -526,7 +1247,7 @@ Output ONLY the message, nothing else.`;
     log.info("Report-findings: duplicate of recently sent message, skipping");
     await updateEgoStore(resolveEgoStorePath(), (e) => {
       for (const t of e.activeTasks ?? []) {
-        if (t.status === "completed" && !t.resultDelivered) t.resultDelivered = true;
+        if (isReportableTask(t) && !t.resultDelivered) t.resultDelivered = true;
       }
       return e;
     });
@@ -540,7 +1261,7 @@ Output ONLY the message, nothing else.`;
       content: message,
       channel: options.channel,
     });
-    log.info(`Reported findings: ${completedTasks.length} tasks, message ${message.length} chars`);
+    log.info(`Reported findings: ${reportableTasks.length} tasks, message ${message.length} chars`);
   } catch (err) {
     log.warn(`Failed to send report: ${String(err)}`);
     return { result: { type: "report-findings", success: false, error: String(err) }, metricsChanged: [] };
@@ -549,13 +1270,13 @@ Output ONLY the message, nothing else.`;
   // Mark tasks as delivered
   await updateEgoStore(resolveEgoStorePath(), (e) => {
     for (const t of e.activeTasks ?? []) {
-      if (t.status === "completed" && !t.resultDelivered) t.resultDelivered = true;
+      if (isReportableTask(t) && !t.resultDelivered) t.resultDelivered = true;
     }
     return e;
   });
 
   return {
-    result: { type: "report-findings", success: true, result: `Reported ${completedTasks.length} tasks` },
+    result: { type: "report-findings", success: true, result: `Reported ${reportableTasks.length} tasks` },
     metricsChanged: [
       { need: "connection", delta: 10, reason: "proactively shared useful findings" },
       { need: "meaning", delta: 8, reason: "delivered value to user" },
@@ -586,6 +1307,45 @@ const SOUL_SRC_DIR = resolveSoulSourceDir();
 const PROTECTED_FILES = new Set(["index.ts", "types.ts", "paths.ts", "logger.ts"]);
 
 const SOURCE_EXTENSIONS = [".ts", ".js", ".py", ".go", ".rs", ".java", ".c", ".cpp", ".rb"];
+
+type ImprovementProposal = {
+  problem: string;
+  file: string;
+  oldCode: string;
+  newCode: string;
+  explanation: string;
+};
+
+function extractJsonObject(text: string): string | null {
+  const stripped = text.trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+  const start = stripped.indexOf("{");
+  const end = stripped.lastIndexOf("}");
+  return start >= 0 && end > start ? stripped.slice(start, end + 1) : null;
+}
+
+function parseImprovementProposal(text: string): { proposal?: ImprovementProposal; error?: string } {
+  const jsonText = extractJsonObject(text);
+  if (!jsonText) return { error: "No JSON object found in LLM response" };
+
+  try {
+    const parsed = JSON.parse(jsonText) as Partial<Record<keyof ImprovementProposal, unknown>>;
+    const proposal: ImprovementProposal = {
+      problem: typeof parsed.problem === "string" ? parsed.problem : "",
+      file: typeof parsed.file === "string" ? parsed.file : "",
+      oldCode: typeof parsed.oldCode === "string" ? parsed.oldCode : "",
+      newCode: typeof parsed.newCode === "string" ? parsed.newCode : "",
+      explanation: typeof parsed.explanation === "string" ? parsed.explanation : "",
+    };
+    if (proposal.file && (proposal.oldCode || proposal.newCode)) return { proposal };
+    if (!proposal.oldCode && !proposal.newCode) return { proposal };
+    return { error: "Improvement proposal is missing required string fields" };
+  } catch (err) {
+    return { error: `Invalid JSON from LLM response: ${String(err)}` };
+  }
+}
 
 /**
  * Resolve the target project directory from ego goals.
@@ -645,6 +1405,18 @@ function pathExists(dir: string): boolean {
   }
 }
 
+function isUnsafeProjectRoot(dir: string): boolean {
+  const cleaned = sanitizePathCandidate(dir).replace(/\\/g, "/").replace(/\/+$/g, "");
+  if (!cleaned || cleaned === "/") return true;
+  if (/^[A-Za-z]:$/.test(cleaned)) return true;
+  if (/^\/[A-Za-z]$/i.test(cleaned)) return true;
+  if (/^\/mnt\/[A-Za-z]$/i.test(cleaned)) return true;
+
+  const resolved = resolve(cleaned);
+  const parsed = parsePath(resolved);
+  return resolved.toLowerCase() === parsed.root.replace(/\\/g, "/").toLowerCase().replace(/\/+$/g, "");
+}
+
 function extractPathCandidates(text: string): string[] {
   const pathChars = String.raw`[A-Za-z0-9._~@%+=:,(){}\[\]\-\/\\]+`;
   const patterns = [
@@ -663,8 +1435,33 @@ function extractPathCandidates(text: string): string[] {
   return [...candidates];
 }
 
-function gatherTargetCandidates(ego: EgoState): Array<{ raw: string; source: "goal" | "userFact" }> {
-  const candidates: Array<{ raw: string; source: "goal" | "userFact" }> = [];
+type TargetCandidateSource = "thought" | "recentMessage" | "userFact" | "goal" | "workspace";
+
+function gatherTargetCandidates(
+  ego: EgoState,
+  thought?: Thought,
+  workspaceContext?: string,
+): Array<{ raw: string; source: TargetCandidateSource }> {
+  const candidates: Array<{ raw: string; source: TargetCandidateSource }> = [];
+
+  const thoughtTexts = [
+    thought?.content,
+    thought?.triggerDetail,
+    thought?.motivation,
+    typeof thought?.actionParams?.reason === "string" ? thought.actionParams.reason : undefined,
+  ].filter((v): v is string => Boolean(v));
+
+  for (const text of thoughtTexts) {
+    for (const raw of extractPathCandidates(text)) {
+      candidates.push({ raw, source: "thought" });
+    }
+  }
+
+  for (const message of [...(ego.recentUserMessages ?? [])].reverse()) {
+    for (const raw of extractPathCandidates(message)) {
+      candidates.push({ raw, source: "recentMessage" });
+    }
+  }
 
   for (const goal of ego.goals ?? []) {
     if (goal.status !== "active") continue;
@@ -679,35 +1476,43 @@ function gatherTargetCandidates(ego: EgoState): Array<{ raw: string; source: "go
     }
   }
 
+  if (workspaceContext) {
+    for (const raw of extractPathCandidates(workspaceContext)) {
+      candidates.push({ raw, source: "workspace" });
+    }
+  }
+
   return candidates;
 }
 
-function resolveTargetProject(ego: EgoState): { dir: string; name: string; isSelf: boolean } {
-  const candidates = gatherTargetCandidates(ego);
+function resolveTargetProject(
+  ego: EgoState,
+  thought?: Thought,
+  workspaceContext?: string,
+): { dir: string; name: string; isSelf: boolean } {
+  const candidates = gatherTargetCandidates(ego, thought, workspaceContext);
   const tried: string[] = [];
 
   for (const candidate of candidates) {
     for (const dir of expandPathCandidate(candidate.raw)) {
       tried.push(dir);
+      if (isUnsafeProjectRoot(dir)) {
+        log.warn(`Ignoring unsafe target project root candidate: ${dir} (from ${candidate.raw})`);
+        continue;
+      }
       if (pathExists(dir)) {
         const name = candidate.source === "goal"
           ? `goal path: ${candidate.raw}`
-          : `user directive: ${candidate.raw.slice(0, 60)}`;
+          : candidate.source === "thought" || candidate.source === "recentMessage"
+            ? `current directive: ${candidate.raw.slice(0, 60)}`
+            : `${candidate.source} path: ${candidate.raw.slice(0, 60)}`;
         return { dir, name, isSelf: false };
       }
     }
   }
 
   if (candidates.length > 0) {
-    const fallback = expandPathCandidate(candidates[0].raw)[0] ?? sanitizePathCandidate(candidates[0].raw);
-    log.warn(`Target project path not found; tried: ${tried.join(", ")}`);
-    return {
-      dir: fallback,
-      name: candidates[0].source === "goal"
-          ? `goal path: ${candidates[0].raw}`
-          : `user directive: ${candidates[0].raw.slice(0, 60)}`,
-      isSelf: false,
-    };
+    log.warn(`Target project path not found or unsafe; tried: ${tried.join(", ")}. Falling back to Soul self-improvement.`);
   }
 
   return { dir: SOUL_SRC_DIR, name: "Soul plugin (self-improvement)", isSelf: true };
@@ -736,14 +1541,15 @@ export async function executeObserveAndImprove(
 
   // Only 1 concurrent improvement task
   const activeImprove = (ego.activeTasks ?? []).filter(
-    (t) => t.status === "in-progress" && t.title?.includes("improvement"),
+    (t) => t.status === "in-progress" && t.title?.toLowerCase().includes("improvement"),
   ).length;
   if (activeImprove >= 1) {
     return { result: { type: "observe-and-improve", success: false, error: "Improvement task already running" }, metricsChanged: [] };
   }
 
-  // Resolve target project from goals
-  const target = resolveTargetProject(ego);
+  // Resolve target project from the current directive first, then recent user
+  // messages/facts/goals. This keeps autonomous work project-agnostic.
+  const target = resolveTargetProject(ego, thought, options.workspaceContext);
   const taskId = randomBytes(4).toString("hex");
 
   // Persist task as in-progress
@@ -837,30 +1643,23 @@ Rules:
   let analysisResult: string;
   let fixApplied = false;
   let fixDescription = "";
+  let verificationSummary = "";
+  let analysisCompleted = false;
+  let analysisFailure = "";
 
   try {
     const llmResponse = await options.llmGenerator(analysisPrompt);
     analysisResult = llmResponse;
+    analysisCompleted = true;
 
-    // Strip markdown code blocks first (LLM often wraps JSON in ```json ... ```)
-    const stripped = llmResponse.replace(/```(?:json)?\s*/g, "").replace(/```\s*/g, "");
-
-    // Extract fields by name boundaries
-    const fileMatch = stripped.match(/"file"\s*:\s*"([^"]+)"/);
-    const oldCodeMatch = stripped.match(/"oldCode"\s*:\s*"([\s\S]*?)"\s*,\s*"newCode"/);
-    const newCodeMatch = stripped.match(/"newCode"\s*:\s*"([\s\S]*?)"\s*,\s*"explanation"/);
-    const problemMatch = stripped.match(/"problem"\s*:\s*"([\s\S]*?)"\s*,\s*"file"/);
-    const explanationMatch = stripped.match(/"explanation"\s*:\s*"([\s\S]*?)"\s*[}\n]/);
-
-    if (fileMatch && oldCodeMatch && newCodeMatch) {
+    const parsed = parseImprovementProposal(llmResponse);
+    if (parsed.proposal) {
       try {
-        const fixFile = fileMatch[1];
-        const oldCode = oldCodeMatch[1].replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\"/g, '"');
-        const newCode = newCodeMatch[1].replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\"/g, '"');
-        const problem = problemMatch ? problemMatch[1] : "unknown";
-        const explanation = explanationMatch ? explanationMatch[1] : "";
+        const { file: fixFile, oldCode, newCode, problem, explanation } = parsed.proposal;
 
-        if (!allFiles.includes(fixFile)) {
+        if (!oldCode && !newCode) {
+          fixDescription = explanation || problem || "No concrete fix identified after analysis";
+        } else if (!allFiles.includes(fixFile)) {
           fixDescription = `Fix not applied: ${fixFile} is not in available source files`;
           log.info(`Ignored ungrounded improvement recommendation for ${fixFile}`);
         } else if (readOnlyMode) {
@@ -873,11 +1672,20 @@ Rules:
 
           if (content.includes(oldCode)) {
             const newContent = content.replace(oldCode, newCode);
-            writeFileSync(fullPath, newContent);
+            writeFileSync(fullPath, newContent, "utf-8");
 
-            fixApplied = true;
-            fixDescription = `Fixed ${fixFile}: ${explanation || problem}`;
-            log.info(`Applied improvement fix to ${target.dir}/${fixFile}: ${problem}`);
+            const verification = verifyAppliedFix(target.dir, fixFile);
+            verificationSummary = verification.summary;
+            if (verification.ok) {
+              fixApplied = true;
+              fixDescription = `Fixed ${fixFile}: ${explanation || problem}`;
+              log.info(`Applied and verified improvement fix to ${target.dir}/${fixFile}: ${problem}`);
+            } else {
+              writeFileSync(fullPath, content, "utf-8");
+              analysisFailure = `Verification failed after editing ${fixFile}; change was reverted.`;
+              fixDescription = `${analysisFailure} ${verification.summary}`;
+              log.warn(`Reverted autonomous improvement in ${target.dir}/${fixFile}: ${verification.summary.slice(0, 300)}`);
+            }
           } else {
             fixDescription = `Fix not applied: oldCode not found verbatim in ${fixFile}`;
           }
@@ -885,43 +1693,93 @@ Rules:
       } catch (parseErr) {
         fixDescription = `Fix parse failed: ${String(parseErr)}`;
       }
+    } else {
+      analysisFailure = parsed.error ?? "Unable to parse improvement proposal";
+      fixDescription = analysisFailure;
     }
   } catch (err) {
+    if (isProviderPressureErrorText(err)) {
+      const skipReason = `skipped-provider-pressure: ${String(err)}`;
+      await completeTask(taskId, skipReason, "completed", true);
+      log.info(`Improvement skipped because LLM provider is under pressure: ${String(err)}`);
+      return {
+        result: {
+          type: "observe-and-improve",
+          success: true,
+          result: skipReason.slice(0, 500),
+          data: { readOnly: readOnlyMode, fixApplied: false, analysisCompleted: false, skipped: true },
+        },
+        metricsChanged: [],
+      };
+    }
+
     analysisResult = `LLM analysis failed: ${String(err)}`;
+    analysisFailure = analysisResult;
     log.warn(`Improvement LLM call failed: ${String(err)}`);
   }
 
   log.info(`Improvement analysis done: fixApplied=${fixApplied}, ${fixDescription || "no fix"}`);
 
   const result = fixApplied
-    ? fixDescription
+    ? `${fixDescription}\n\nVerification:\n${verificationSummary || "verification passed"}`
     : `Analysis of ${target.dir}. ${fixDescription || "No concrete fix identified."} ${analysisResult.slice(0, 300)}`;
+  const taskStatus: "completed" | "failed" =
+    fixApplied || (analysisCompleted && !analysisFailure)
+      ? "completed"
+      : "failed";
 
-  await completeTask(taskId, result);
+  await completeTask(taskId, result, taskStatus);
 
   return {
     result: {
       type: "observe-and-improve",
-      success: true,
+      success: taskStatus === "completed",
       result: result.slice(0, 500),
-      data: { readOnly: readOnlyMode, fixApplied },
+      data: { readOnly: readOnlyMode, fixApplied, analysisCompleted },
     },
-    metricsChanged: [
-      { need: "growth", delta: fixApplied ? 20 : 10, reason: fixApplied ? "applied improvement fix" : "code analysis" },
-      { need: "meaning", delta: fixApplied ? 15 : 8, reason: readOnlyMode ? "observing self-improvement opportunities" : "working on user's assigned goal" },
-    ],
+    metricsChanged: taskStatus === "completed"
+      ? [
+          { need: "growth", delta: fixApplied ? 20 : 10, reason: fixApplied ? "applied improvement fix" : "code analysis" },
+          { need: "meaning", delta: fixApplied ? 15 : 8, reason: readOnlyMode ? "observing self-improvement opportunities" : "working on user's assigned goal" },
+        ]
+      : [],
   };
 }
 
-async function completeTask(taskId: string, result: string): Promise<void> {
+async function completeTask(
+  taskId: string,
+  result: string,
+  status: "completed" | "failed" = "completed",
+  resultDelivered = false,
+): Promise<void> {
   await updateEgoStore(resolveEgoStorePath(), (e) => {
     const t = (e.activeTasks ?? []).find((at) => at.id === taskId);
     if (t) {
-      t.status = "completed";
-      t.result = result;
+      const finalResult = isFinalTaskReport(result)
+        ? result
+        : `Status: ${status}
+Task: ${taskId}
+Finished: ${new Date().toISOString()}
+
+## Outcome
+${result}
+
+## Changes
+See outcome. If no file was changed, the task produced an analysis or recommendation only.
+
+## Verification
+The local observe-and-improve path completed its bounded analysis. No separate verification command was recorded by this helper.
+
+## Metrics
+No before/after benchmark metrics were recorded.
+
+## Next
+Run a focused verification command or a smaller follow-up improvement if the result needs implementation confirmation.`;
+      t.status = reportStatusToTaskStatus(finalResult);
+      t.result = finalResult;
       t.completedAt = Date.now();
       t.updatedAt = Date.now();
-      t.resultDelivered = false;
+      t.resultDelivered = resultDelivered;
     }
     return e;
   });
@@ -946,27 +1804,34 @@ function makeSkippedStep(action: string, reason: string): TaskStep {
  * Filters out common stop words and short tokens.
  */
 /**
- * Try to extract the sub-agent's final assistant message from recent session files.
- * This is a fallback when the agent doesn't write the result file.
+ * Try to extract the sub-agent's final report from recent session files.
+ * This is a fallback when the agent doesn't write the result file. It returns
+ * partial/failed status explicitly when the session timed out or only produced
+ * interim narration.
  * Looks for sessions created after `sinceMs` that contain "Soul-Autonomous".
  */
-function extractResultFromSessions(sinceMs: number): string | null {
+function extractResultFromSessions(task: AutonomousTask, sinceMs: number): { status: "completed" | "failed"; result: string } | null {
   const sessionsDir = join(homedir(), ".openclaw/agents/main/sessions");
   try {
-    const files = readdirSync(sessionsDir);
+    const markers = [task.resultFilePath, task.id, `${task.id}.md`].filter((value): value is string => Boolean(value));
+    const files = readdirSync(sessionsDir)
+      .filter((name) => name.endsWith(".jsonl"))
+      .map((name) => ({ name, fp: join(sessionsDir, name), mtimeMs: statSync(join(sessionsDir, name)).mtimeMs }))
+      .filter((file) => file.mtimeMs >= sinceMs - 60_000)
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
     for (const name of files) {
-      if (!name.endsWith(".jsonl")) continue;
-      const fp = join(sessionsDir, name);
-      const stat = statSync(fp);
-      // Only check sessions modified after the task was created
-      if (stat.mtimeMs < sinceMs - 60_000) continue;
-      const content = readFileSync(fp, "utf-8");
+      const content = readFileSync(name.fp, "utf-8");
       if (!content.includes("Soul-Autonomous")) continue;
-      // Find last assistant text message
+      if (markers.length > 0 && !markers.some((marker) => content.includes(marker))) continue;
       let lastAssistantText = "";
+      let promptError = "";
+      let toolFailure = "";
       for (const line of content.split("\n")) {
         try {
           const obj = JSON.parse(line.trim());
+          if (obj.type === "custom" && obj.customType === "openclaw:prompt-error") {
+            promptError = String(obj.data?.error ?? "prompt error");
+          }
           if (obj.type === "message" && obj.message?.role === "assistant") {
             const mc = obj.message.content;
             if (Array.isArray(mc)) {
@@ -977,10 +1842,33 @@ function extractResultFromSessions(sinceMs: number): string | null {
               }
             }
           }
+          if (obj.type === "message" && obj.message?.role === "toolResult") {
+            const text = JSON.stringify(obj.message.content ?? "");
+            if (/ParserError|Command exited with code [1-9]|EnvironmentLocationNotFound|timed out|timeout|error/i.test(text)) {
+              toolFailure = text.slice(0, 600);
+            }
+          }
         } catch { /* skip malformed lines */ }
       }
+      if (promptError) {
+        const detail = [
+          `Agent session ${name.name} failed before writing the required result file.`,
+          `Error: ${promptError}`,
+          toolFailure ? `Last tool failure: ${toolFailure}` : "",
+          lastAssistantText ? `Last assistant text: ${lastAssistantText.slice(0, 600)}` : "",
+        ].filter(Boolean).join("\n");
+        return { status: "failed", result: buildFailureTaskReport(task, detail) };
+      }
       if (lastAssistantText) {
-        return lastAssistantText.slice(0, 1000);
+        if (isCompleteTaskReport(lastAssistantText) && (!task.resultFilePath || hasFinalTaskResultFile(task))) {
+          return { status: "completed", result: lastAssistantText.slice(0, 1000) };
+        }
+        const detail = `Agent session ${name.name} stopped before producing a final result file${task.resultFilePath ? ` (${task.resultFilePath})` : ""}. Last partial output: ${lastAssistantText.slice(0, 1200)}`;
+        const hasUsefulPartial = /done|both configs|fail|passes|improved|worse|bug|root cause|clear|metric|CAGR|drawdown|B&H|baseline|\+|-|%|result/i.test(lastAssistantText);
+        return {
+          status: "failed",
+          result: hasUsefulPartial ? buildPartialTaskReport(task, detail) : buildFailureTaskReport(task, detail),
+        };
       }
     }
   } catch { /* sessions dir not accessible */ }
@@ -1087,7 +1975,7 @@ async function persistTask(task: AutonomousTask): Promise<void> {
  * Returns list of newly completed tasks (with results from file capture).
  */
 export async function pollActiveTasks(storePath: string): Promise<AutonomousTask[]> {
-  const STALE_MS = 30 * 60 * 1000; // 30 minutes
+  const STALE_MS = 8 * 60 * 1000; // hooks/agent times out at 5 minutes; leave a small settle window
   const MAX_TASKS = 20;
   const newlyCompleted: AutonomousTask[] = [];
 
@@ -1101,13 +1989,12 @@ export async function pollActiveTasks(storePath: string): Promise<AutonomousTask
       if (task.resultFilePath && !task.result) {
         try {
           const content = readFileSync(task.resultFilePath, "utf-8").trim();
-          if (content) {
+          if (content && isFinalTaskReport(content)) {
             task.result = content;
-            task.status = "completed";
+            task.status = reportStatusToTaskStatus(content);
             task.completedAt = Date.now();
             task.updatedAt = Date.now();
             newlyCompleted.push({ ...task });
-            try { unlinkSync(task.resultFilePath); } catch { /* ignore cleanup failure */ }
             continue;
           }
         } catch { /* file not ready yet */ }
@@ -1115,10 +2002,11 @@ export async function pollActiveTasks(storePath: string): Promise<AutonomousTask
 
       // Fallback: try to extract result from session files
       if (!task.result && task.requiresWritePermission) {
-        const sessionResult = extractResultFromSessions(task.createdAt);
+        const sessionResult = extractResultFromSessions(task, task.createdAt);
         if (sessionResult) {
-          task.result = sessionResult;
-          task.status = "completed";
+          task.result = sessionResult.result;
+          task.status = sessionResult.status;
+          writeTaskReportFile(task.resultFilePath, task.result);
           task.completedAt = Date.now();
           task.updatedAt = Date.now();
           newlyCompleted.push({ ...task });
@@ -1128,8 +2016,10 @@ export async function pollActiveTasks(storePath: string): Promise<AutonomousTask
 
       // Final fallback: stale timeout
       if (Date.now() - task.updatedAt > STALE_MS) {
-        task.status = "completed";
-        task.result = task.result ?? "Task timed out (stale >10 min)";
+        const detail = task.result ?? `Task timed out (stale >8 min). Required final result file was not produced${task.resultFilePath ? `: ${task.resultFilePath}` : ""}.`;
+        task.status = "failed";
+        task.result = buildFailureTaskReport(task, detail);
+        writeTaskReportFile(task.resultFilePath, task.result);
         task.completedAt = Date.now();
         task.updatedAt = Date.now();
         newlyCompleted.push({ ...task });
@@ -1147,7 +2037,7 @@ export async function pollActiveTasks(storePath: string): Promise<AutonomousTask
   });
 
   if (newlyCompleted.length > 0) {
-    log.info(`Tasks completed: ${newlyCompleted.map((t) => `${t.id}(${t.result ? "has-result" : "timeout"})`).join(", ")}`);
+    log.info(`Tasks finished: ${newlyCompleted.map((t) => `${t.id}(${t.status}${t.result ? ",has-result" : ",no-result"})`).join(", ")}`);
   }
   return newlyCompleted;
 }

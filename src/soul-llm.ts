@@ -12,6 +12,11 @@ export type SoulLLMConfig = {
 
 export type LLMGenerator = (prompt: string) => Promise<string>;
 
+function isProviderBackoffError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /rate limit|cooldown|No available auth profile|too many requests|429|suspending lanes/i.test(msg);
+}
+
 // ---------------------------------------------------------------------------
 // Gateway local API — call through openclaw gateway's /v1/chat/completions endpoint
 // Gateway handles all auth/provider routing, API formats, OAuth, etc.
@@ -306,6 +311,12 @@ export async function createSoulLLMGenerator(
       try {
         return await callViaGateway(gatewayUrl, gatewayAuthToken, "openclaw", prompt);
       } catch (err) {
+        // Respect the gateway's shared provider cooldown. Falling back directly
+        // on rate-limit/cooldown errors would bypass OpenClaw's budget control
+        // and keep pressuring the same provider from Soul's background loop.
+        if (isProviderBackoffError(err)) {
+          throw err;
+        }
         if (fallback) {
           log.warn(`Gateway local API failed: ${String(err)} — falling back to direct provider API`);
           return fallback(prompt);

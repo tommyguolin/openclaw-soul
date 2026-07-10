@@ -8,12 +8,14 @@ type OpenClawPluginApi = {
   on(event: string, handler: (event: PluginEvent, ctx?: PluginContext) => Promise<unknown>): void;
   registerService(service: { id: string; start: () => Promise<void>; stop: () => Promise<void> }): void;
 };
+import { readFileSync } from "node:fs";
 import { ThoughtService } from "./src/thought-service.js";
 import { createSoulActionHandler, type MessageSender } from "./src/soul-actions.js";
 import { createSoulLogger } from "./src/logger.js";
 import { resolveLLMConfigFromOpenClaw, type SoulLLMConfig } from "./src/soul-llm.js";
 import { getGatewayPort } from "./src/env.js";
 import { loadWorkspaceContext } from "./src/paths.js";
+import { resolveEgoStorePath, updateEgoStore } from "./src/ego-store.js";
 
 const log = createSoulLogger("plugin");
 
@@ -255,6 +257,24 @@ function autoDetectChannel(
   return undefined;
 }
 
+function loadPersistedProactiveEndpoint(): { channel?: string; target?: string } {
+  try {
+    const raw = readFileSync(resolveEgoStorePath(), "utf-8");
+    const parsed = JSON.parse(raw) as {
+      ego?: { proactiveChannel?: unknown; proactiveTarget?: unknown };
+    };
+    const channel = typeof parsed.ego?.proactiveChannel === "string"
+      ? parsed.ego.proactiveChannel
+      : undefined;
+    const target = typeof parsed.ego?.proactiveTarget === "string"
+      ? parsed.ego.proactiveTarget
+      : undefined;
+    return { channel, target };
+  } catch {
+    return {};
+  }
+}
+
 const plugin = {
   id: "soul",
   name: "Soul",
@@ -290,8 +310,9 @@ const plugin = {
 
     // Mutable state shared between service creation and hooks — must be at
     // register() scope so the message_received hook can auto-learn the target.
-    let proactiveChannel = config.proactiveChannel;
-    let proactiveTarget = config.proactiveTarget;
+    const persistedEndpoint = loadPersistedProactiveEndpoint();
+    let proactiveChannel = config.proactiveChannel ?? persistedEndpoint.channel;
+    let proactiveTarget = config.proactiveTarget ?? persistedEndpoint.target;
 
     // --- Service singleton: only create ThoughtService ONCE ---
     // The gateway may call register() multiple times (e.g. for different agent
@@ -321,6 +342,11 @@ const plugin = {
           proactiveTarget ??= detected.target;
           if (proactiveChannel && proactiveTarget) {
             log.info(`Proactive messaging: auto-detected ${proactiveChannel}/${proactiveTarget}`);
+            void updateEgoStore(resolveEgoStorePath(), (ego) => {
+              ego.proactiveChannel = proactiveChannel ?? null;
+              ego.proactiveTarget = proactiveTarget ?? null;
+              return ego;
+            }).catch((err) => log.warn(`Failed to persist proactive endpoint: ${String(err)}`));
           } else if (proactiveChannel) {
             log.info(`Proactive messaging: auto-detected channel ${proactiveChannel}`);
             log.warn(`proactiveTarget not set — soul will think but won't send messages. Set plugins.soul.config.proactiveTarget.`);
@@ -421,7 +447,21 @@ const plugin = {
           if (!proactiveChannel) proactiveChannel = channelId;
           proactiveTarget = from;
           service.updateProactiveTarget(channelId, from);
+          await updateEgoStore(resolveEgoStorePath(), (ego) => {
+            ego.proactiveChannel = proactiveChannel ?? channelId;
+            ego.proactiveTarget = from;
+            return ego;
+          });
           log.info(`Proactive target auto-learned from first message: ${channelId}/${from}`);
+        } else if (from && channelId) {
+          const endpoint = service.getProactiveEndpoint();
+          if (endpoint.channel !== channelId || endpoint.target !== from) {
+            await updateEgoStore(resolveEgoStorePath(), (ego) => {
+              ego.proactiveChannel = endpoint.channel ?? proactiveChannel ?? channelId;
+              ego.proactiveTarget = endpoint.target ?? proactiveTarget ?? from;
+              return ego;
+            });
+          }
         }
 
         // Abort any in-progress thought — user interaction takes priority
