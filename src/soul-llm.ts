@@ -8,6 +8,8 @@ export type SoulLLMConfig = {
   model?: string;
   apiKeyEnv?: string;
   baseUrl?: string;
+  /** Maximum generated tokens per call. Default: 1024. */
+  maxTokens?: number;
 };
 
 export type LLMGenerator = (prompt: string) => Promise<string>;
@@ -28,6 +30,7 @@ async function callViaGateway(
   authToken: string,
   model: string,
   prompt: string,
+  maxTokens: number,
 ): Promise<string> {
   const res = await fetch(gatewayUrl, {
     method: "POST",
@@ -37,7 +40,7 @@ async function callViaGateway(
     },
     body: JSON.stringify({
       model,
-      max_tokens: 1024,
+      max_tokens: maxTokens,
       messages: [{ role: "user", content: prompt }],
     }),
   });
@@ -58,6 +61,7 @@ async function callAnthropic(
   apiKey: string,
   model: string,
   prompt: string,
+  maxTokens: number,
 ): Promise<string> {
   const res = await fetch(`${baseUrl}/messages`, {
     method: "POST",
@@ -68,7 +72,7 @@ async function callAnthropic(
     },
     body: JSON.stringify({
       model,
-      max_tokens: 1024,
+      max_tokens: maxTokens,
       messages: [{ role: "user", content: prompt }],
     }),
   });
@@ -85,6 +89,7 @@ async function callOpenAICompatible(
   apiKey: string,
   model: string,
   prompt: string,
+  maxTokens: number,
 ): Promise<string> {
   const res = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
@@ -94,7 +99,7 @@ async function callOpenAICompatible(
     },
     body: JSON.stringify({
       model,
-      max_tokens: 1024,
+      max_tokens: maxTokens,
       messages: [{ role: "user", content: prompt }],
     }),
   });
@@ -290,6 +295,7 @@ export async function createSoulLLMGenerator(
 ): Promise<LLMGenerator | null> {
   const provider = config?.provider;
   const model = config?.model;
+  const maxTokens = Math.max(32, Math.min(4096, Math.floor(config?.maxTokens ?? 1024)));
 
   if (!provider || !model) {
     log.debug("No model configured for soul LLM");
@@ -309,7 +315,7 @@ export async function createSoulLLMGenerator(
     // Gateway expects model="openclaw" — it routes to the configured provider automatically
     return async (prompt: string): Promise<string> => {
       try {
-        return await callViaGateway(gatewayUrl, gatewayAuthToken, "openclaw", prompt);
+        return await callViaGateway(gatewayUrl, gatewayAuthToken, "openclaw", prompt, maxTokens);
       } catch (err) {
         // Respect the gateway's shared provider cooldown. Falling back directly
         // on rate-limit/cooldown errors would bypass OpenClaw's budget control
@@ -359,7 +365,9 @@ async function buildDirectFallback(
   log.info(`Direct fallback available: ${provider}/${model} (${isAnthropic ? "anthropic" : "openai-compatible"})`);
 
   if (isAnthropic) {
-    return async (prompt: string) => callAnthropic(baseUrl, apiKey, model, prompt);
+    const maxTokens = Math.max(32, Math.min(4096, Math.floor(config?.maxTokens ?? 1024)));
+    return async (prompt: string) => callAnthropic(baseUrl, apiKey, model, prompt, maxTokens);
   }
-  return async (prompt: string) => callOpenAICompatible(baseUrl, apiKey, model, prompt);
+  const maxTokens = Math.max(32, Math.min(4096, Math.floor(config?.maxTokens ?? 1024)));
+  return async (prompt: string) => callOpenAICompatible(baseUrl, apiKey, model, prompt, maxTokens);
 }

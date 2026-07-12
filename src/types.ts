@@ -106,6 +106,9 @@ export interface UserFact {
   firstMentionedAt: number;
   updatedAt: number;
   timesConfirmed: number;
+  validity?: "active" | "superseded";
+  supersededAt?: number;
+  supersededById?: string;
 }
 
 export interface UserPreference {
@@ -200,7 +203,33 @@ export interface SoulMemory {
   tier?: MemoryTier;
   consolidatedFrom?: string[];
   consolidationTimestamp?: number;
+  /** Original channel message provenance for idempotent interaction ingestion. */
+  sourceMessageId?: string;
+  sourceChannel?: string;
+  sourceConversationId?: string;
+  /** Language-independent intent labels produced by the LLM semantic pass. */
+  semanticSignals?: InteractionSemanticSignal[];
+  /** Provenance strength for learned factual content. Missing means legacy/unverified. */
+  evidenceKind?: "web" | "user" | "tool" | "model";
+  evidenceSources?: string[];
 }
+
+export interface MentalContext {
+  foreground: string[];
+  residue: string[];
+  backgroundConcerns: string[];
+  environmentalChanges: string[];
+  associativeEcho: string[];
+  updatedAt: number;
+}
+
+export type InteractionSemanticSignal =
+  | "question"
+  | "problem"
+  | "execution-directive"
+  | "topic-shift"
+  | "closure"
+  | "small-talk";
 
 export interface Thought {
   id: string;
@@ -315,6 +344,7 @@ export interface EgoState {
   userLanguage: string | null;
   recentUserMessages: string[];
   activeTasks: AutonomousTask[];
+  mentalContext: MentalContext;
 }
 
 export interface ThoughtGenerationContext {

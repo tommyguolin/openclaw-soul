@@ -21,12 +21,36 @@ import { searchExternalMemories, formatMemoryContext } from "./openclaw-memory.j
 
 const log = createSoulLogger("intelligent-thought");
 
+function isGroundedLearning(memory: SoulMemory): boolean {
+  return memory.type === "learning" && ["web", "user", "tool"].includes(memory.evidenceKind ?? "");
+}
+
+function activeUserFacts(ego: EgoState) {
+  return (ego.userFacts ?? []).filter((fact) => fact.validity !== "superseded");
+}
+
+function currentConversationMemories(ego: EgoState, limit = 8): SoulMemory[] {
+  const interactions = ego.memories
+    .filter((memory) => memory.type === "interaction")
+    .sort((a, b) => a.timestamp - b.timestamp);
+  const latestInbound = [...interactions].reverse().find((memory) => memory.tags.includes("inbound"));
+  if (!latestInbound) return [];
+  // A semantic redirect/closure is a hard boundary. Otherwise, a two-hour
+  // conversational gap starts a new context window without language rules.
+  const hardBoundary = latestInbound.semanticSignals?.some((signal) =>
+    signal === "topic-shift" || signal === "closure");
+  const cutoff = hardBoundary ? latestInbound.timestamp : latestInbound.timestamp - 2 * 60 * 60 * 1000;
+  return interactions.filter((memory) => memory.timestamp >= cutoff).slice(-limit);
+}
+
 export type LLMThoughtGenerator = (prompt: string) => Promise<string>;
 
 export interface IntelligentThoughtOptions {
   llmGenerator?: LLMThoughtGenerator;
   recentMemories?: SoulMemory[];
   preferOpportunity?: DetectedThoughtOpportunity;
+  /** Only operational callers should expand an action into adjacent ideas. */
+  expandActionIdeas?: boolean;
 }
 
 export interface ThoughtTriggerContext {
@@ -85,7 +109,7 @@ function buildTopicFocusProfile(ego: EgoState): TopicFocusProfile {
   const positivePrefs = topicPrefs
     .filter((p) => !isDeprioritizedTopicPreference(p.preference))
     .map((p) => p.preference);
-  const factTopics = [...(ego.userFacts ?? [])]
+  const factTopics = [...activeUserFacts(ego)]
     .filter((f) => ["interest", "project", "tech_stack"].includes(f.category) && f.confidence >= 0.4)
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .map((f) => f.content);
@@ -212,8 +236,8 @@ function analyzeRecentInteraction(timeSinceLastInteraction: number): DetectedTho
 
   const minutesSince = timeSinceLastInteraction / (1000 * 60);
 
-  // After 10-30 min: record bonding desire but don't route to send-message.
-  // bond-deepen resolves to actionType "none" in resolveActionType.
+  // After 10-30 min, keep the first bonding impulse private. This gives a
+  // recent conversation room to breathe before Soul considers following up.
   if (minutesSince > 10 && minutesSince <= 30) {
     opportunities.push({
       type: "bond-deepen",
@@ -235,6 +259,7 @@ function analyzeRecentInteraction(timeSinceLastInteraction: number): DetectedTho
       source: "environmental-change",
       relatedNeeds: ["connection"],
       motivation: `I haven't interacted with the user for ${Math.floor(minutesSince)} minutes, kind of miss them`,
+      suggestedAction: "send-message",
     });
   }
 
@@ -248,6 +273,7 @@ function analyzeRecentInteraction(timeSinceLastInteraction: number): DetectedTho
       source: "environmental-change",
       relatedNeeds: ["connection"],
       motivation: `It's been a long time since I interacted with the user, I want to reach out`,
+      suggestedAction: "send-message",
     });
   }
 
@@ -258,8 +284,9 @@ function analyzeMemories(memories: SoulMemory[]): DetectedThoughtOpportunity[] {
   const opportunities: DetectedThoughtOpportunity[] = [];
 
   const recentMemories = memories
-    .filter((m) => m.type === "learning" || m.type === "insight")
-    .slice(0, 5);
+    .filter((m) => m.type === "insight"
+      || isGroundedLearning(m))
+    .slice(-5);
 
   // Deprioritize memory-resurface when there are recent interactions
   // that haven't been followed up on — conversation-driven thoughts should win.
@@ -324,7 +351,7 @@ function buildUserProfile(ego: EgoState): {
   const challenges: string[] = [];
   const habits: string[] = [];
 
-  for (const fact of ego.userFacts) {
+  for (const fact of activeUserFacts(ego)) {
     switch (fact.category) {
       case "interest":
         interests.push(fact.content);
@@ -410,8 +437,14 @@ function isSearchableContent(text: string): boolean {
  * Determine whether a user message is a genuine question worth following up on.
  * Stricter than isSearchableContent — requires actual question structure.
  */
-function isGenuineQuestion(text: string): boolean {
+function isGenuineQuestion(text: string, semanticSignals: SoulMemory["semanticSignals"] = []): boolean {
   if (!isSearchableContent(text)) return false;
+
+  // The semantic pass is language-independent and is authoritative when it
+  // has classified the message. Punctuation remains the universal fallback
+  // while that asynchronous classification is pending or no LLM is present.
+  if (semanticSignals?.includes("question")) return true;
+  if (semanticSignals && semanticSignals.length > 0) return false;
 
   const trimmed = text.trim();
   const lower = trimmed.toLowerCase();
@@ -426,6 +459,44 @@ function isGenuineQuestion(text: string): boolean {
   const substance = trimmed.replace(/[?？！!。，,.\s]/g, "").length;
 
   return (hasQuestionMark || hasQuestionWord) && substance >= 6;
+}
+
+export function isLocalProjectEvidenceQuestion(text: string): boolean {
+  return /\b(?:OOS|CAGR|MaxDD|drawdown|backtest|eth_live|v\d+|script|deploy)\b|回测|最大回撤|收益|盈亏|日志|脚本|部署|本地|哪一个|哪个版本|最优/i.test(text);
+}
+
+export function collectKnownLocalEvidenceTargets(ego: EgoState, currentText = ""): string[] {
+  const haystacks = [
+    currentText,
+    ...(ego.mentalContext?.foreground ?? []),
+    ...(ego.mentalContext?.backgroundConcerns ?? []),
+    ...(ego.mentalContext?.residue ?? []),
+    ...(ego.recentUserMessages ?? []),
+    ...(ego.memories ?? [])
+      .filter((memory) => memory.type === "interaction" && memory.tags.includes("inbound"))
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, 20)
+      .map((memory) => memory.content),
+  ];
+  const targets: string[] = [];
+  for (const text of haystacks) {
+    for (const match of text.matchAll(/(?:^|[\s(（"'`])((?:\/[A-Za-z0-9._-]+){2,}\/?)/g)) {
+      const value = match[1].replace(/[),，。；;]+$/g, "");
+      if (!targets.includes(value)) targets.push(value);
+    }
+    for (const match of text.matchAll(/\b((?:\d{1,3}\.){3}\d{1,3})\b/g)) {
+      const value = match[1];
+      if (!targets.includes(value)) targets.push(value);
+    }
+  }
+  return targets.slice(0, 8);
+}
+
+function hasKnownLocalEvidenceTarget(ego: EgoState): boolean {
+  const targets = collectKnownLocalEvidenceTargets(ego);
+  const hasPath = targets.some((target) => target.startsWith("/"));
+  const hasHost = targets.some((target) => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(target));
+  return hasPath || (hasHost && targets.length > 1);
 }
 
 const EXECUTION_DIRECTIVE_RE = new RegExp([
@@ -480,7 +551,7 @@ function hasAutonomousExecutionContext(text: string, ego: EgoState): boolean {
     text,
     ...(ego.recentUserMessages ?? []).slice(-8),
     ...(ego.goals ?? []).filter((g) => g.status === "active").map((g) => `${g.title} ${g.description}`),
-    ...(ego.userFacts ?? []).filter((f) => f.confidence >= 0.6).map((f) => f.content),
+    ...activeUserFacts(ego).filter((f) => f.confidence >= 0.6).map((f) => f.content),
     ...(ego.userPreferences ?? []).filter((p) => p.confidence >= 0.5).map((p) => p.preference),
   ].join(" ");
 
@@ -531,7 +602,15 @@ function suppressOrRerouteLowValueMessageThought(
 
 export function isExecutionFocusedOpportunity(opportunity: DetectedThoughtOpportunity): boolean {
   const action = opportunity.suggestedAction;
-  if (action === "observe-and-improve" || action === "run-agent-task" || action === "invoke-tool" || action === "report-findings") {
+  if (
+    action === "observe-and-improve" ||
+    action === "run-agent-task" ||
+    action === "invoke-tool" ||
+    action === "report-findings" ||
+    action === "search-web" ||
+    action === "proactive-research" ||
+    action === "proactive-content-push"
+  ) {
     return true;
   }
   if (action === "analyze-problem") {
@@ -555,6 +634,61 @@ function hasHandledDirectiveAfter(ego: EgoState, timestamp: number): boolean {
   );
 }
 
+function evidenceQuestionSignature(text: string): string {
+  return text
+    .replace(/\s+/g, " ")
+    .replace(/[“”"'`]/g, "")
+    .trim()
+    .slice(0, 80)
+    .toLowerCase();
+}
+
+function hasLocalEvidenceMissingResultAfter(
+  ego: EgoState,
+  text: string,
+  timestamp: number,
+): boolean {
+  const signature = evidenceQuestionSignature(text);
+  if (!signature) return false;
+
+  return (ego.activeTasks ?? []).some((task) => {
+    if ((task.createdAt ?? 0) < timestamp) return false;
+    if (!/local-evidence-target-missing/i.test(String(task.result ?? ""))) return false;
+    const haystack = [
+      task.title,
+      task.description,
+      task.result,
+    ].filter(Boolean).join(" ").replace(/\s+/g, " ").toLowerCase();
+    const taskTitleSignature = evidenceQuestionSignature(task.title ?? "");
+    return haystack.includes(signature) ||
+      (taskTitleSignature.length > 0 && signature.includes(taskTitleSignature));
+  });
+}
+
+export function hasRecentLocalEvidenceMissingResult(ego: EgoState, now = Date.now()): boolean {
+  const cutoff = now - 2 * 60 * 60 * 1000;
+  return (ego.activeTasks ?? []).some((task) =>
+    (task.createdAt ?? 0) >= cutoff &&
+    /local-evidence-target-missing/i.test(String(task.result ?? "")),
+  );
+}
+
+export function hasUnresolvedLocalEvidenceMissingResult(ego: EgoState): boolean {
+  const latestMissing = [...(ego.activeTasks ?? [])]
+    .filter((task) => /local-evidence-target-missing/i.test(String(task.result ?? "")))
+    .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))[0];
+  if (!latestMissing) return false;
+  if (hasKnownLocalEvidenceTarget(ego)) return false;
+
+  const latestInboundAfterMissing = (ego.memories ?? []).some((memory) =>
+    memory.type === "interaction" &&
+    memory.tags.includes("inbound") &&
+    memory.timestamp > (latestMissing.createdAt ?? 0),
+  );
+
+  return !latestInboundAfterMissing;
+}
+
 /**
  * Analyze conversations and user profile to generate opportunities for
  * sharing value. This is Soul's core differentiator:
@@ -572,13 +706,14 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
 
   // Look back up to 7 days for conversation context (not just 24h)
   const oneWeekAgo = now - 7 * 24 * 60 * 60 * 1000;
-  const recentInteractions = ego.memories
-    .filter((m) => m.type === "interaction" && m.timestamp >= oneWeekAgo)
+  const recentInteractions = currentConversationMemories(ego)
+    .filter((m) => m.timestamp >= oneWeekAgo)
     .sort((a, b) => b.timestamp - a.timestamp);
 
-  const userFacts = ego.userFacts;
+  const userFacts = activeUserFacts(ego);
   const userProfile = buildUserProfile(ego);
   const topicFocus = buildTopicFocusProfile(ego);
+  const localEvidenceBlocked = hasUnresolvedLocalEvidenceMissingResult(ego);
 
   // Need at least 1 interaction OR user facts to generate conversation-replay
   const hasUserData = recentInteractions.length > 0 || userFacts.length > 0;
@@ -596,15 +731,17 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
   const directiveMemories = recentInteractions.filter((m) =>
     m.tags.includes("inbound") &&
     m.timestamp >= executionReplayCutoff &&
-    isExecutionDirective(m.content) &&
+    (m.semanticSignals?.includes("execution-directive") || isExecutionDirective(m.content)) &&
     !hasHandledDirectiveAfter(ego, m.timestamp) &&
+    !hasLocalEvidenceMissingResultAfter(ego, m.content, m.timestamp) &&
     !matchesAnyTopic(m.content, topicFocus.deprioritized)
   );
 
   for (const mem of directiveMemories.slice(0, 2)) {
     const content = mem.content.slice(0, 160);
-    const useAgent = shouldUseAgentForDirective(mem.content);
-    const useImprove = shouldUseObserveAndImproveForDirective(mem.content);
+    const needsLocalEvidence = isLocalProjectEvidenceQuestion(mem.content);
+    const useAgent = !needsLocalEvidence && shouldUseAgentForDirective(mem.content);
+    const useImprove = !needsLocalEvidence && shouldUseObserveAndImproveForDirective(mem.content);
     const hoursSince = (now - mem.timestamp) / (1000 * 60 * 60);
     const priority = Math.max(72, (useAgent || useImprove ? 94 : 86) - hoursSince * 3);
     opportunities.push({
@@ -618,7 +755,13 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
       suggestedAction: useAgent ? "run-agent-task" : useImprove ? "observe-and-improve" : "analyze-problem",
       actionParams: useAgent || useImprove
         ? { reason: mem.content.slice(0, 300) }
-        : { reason: mem.content.slice(0, 300), logPaths: extractFilePaths(mem.content), sourcePaths: [] },
+        : {
+            reason: mem.content.slice(0, 300),
+            logPaths: extractFilePaths(mem.content),
+            sourcePaths: [],
+            ...(needsLocalEvidence ? { localEvidenceTargets: collectKnownLocalEvidenceTargets(ego, mem.content) } : {}),
+            ...(needsLocalEvidence ? { requiresLocalEvidence: true } : {}),
+          },
     });
   }
 
@@ -628,16 +771,24 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
   //    isGenuineQuestion() to avoid searching for test messages, greetings,
   //    meta-questions, etc.
   // =====================================================
-  const questionMemories = recentInteractions.filter((m) =>
-    isGenuineQuestion(m.content) && !matchesAnyTopic(m.content, topicFocus.deprioritized),
-  );
+  const inboundInteractions = recentInteractions.filter((m) => m.tags.includes("inbound"));
+  const newestInbound = inboundInteractions[0];
+  // Proactive replay is deliberately conservative: only the latest user turn
+  // may be treated as unanswered. A newer turn means the conversation moved
+  // on, even if an older question still looks interrogative in isolation.
+  const questionMemories = newestInbound
+    && isGenuineQuestion(newestInbound.content, newestInbound.semanticSignals)
+    && !newestInbound.semanticSignals?.includes("closure")
+    && !matchesAnyTopic(newestInbound.content, topicFocus.deprioritized)
+    ? [newestInbound]
+    : [];
 
   for (const qMem of questionMemories.slice(0, 2)) {
     const content = qMem.content.slice(0, 80);
     const hasRelatedKnowledge = qMem.tags.some((tag) =>
       ego.memories.some(
         (m) =>
-          m.type === "learning" &&
+          isGroundedLearning(m) &&
           m.tags.some((t) => t === tag) &&
           m.timestamp > qMem.timestamp,
       ),
@@ -655,6 +806,28 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
         suggestedAction: "send-message",
       });
     } else {
+      if (isLocalProjectEvidenceQuestion(content)) {
+        if (!hasLocalEvidenceMissingResultAfter(ego, qMem.content, qMem.timestamp)) {
+          opportunities.push({
+            type: "conversation-replay",
+            trigger: "memory",
+            triggerDetail: `User asked: "${content}" — needs local project evidence`,
+            priority: 82,
+            source: "user-interaction",
+            relatedNeeds: ["connection", "meaning"],
+            motivation: `User asked about "${content}" — inspect local logs/files instead of relying on model memory`,
+            suggestedAction: "analyze-problem",
+            actionParams: {
+              reason: content,
+              logPaths: extractFilePaths(content),
+              sourcePaths: [],
+              localEvidenceTargets: collectKnownLocalEvidenceTargets(ego, content),
+              requiresLocalEvidence: true,
+            },
+          });
+        }
+        continue;
+      }
       // Only create search-web if content is actually searchable (not meta/test/exclamation)
       if (isSearchableContent(content)) {
         opportunities.push({
@@ -670,6 +843,14 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
         });
       }
     }
+  }
+
+  // If Soul already determined that a local project/result question cannot be
+  // answered without an explicit file/path, stop conversation replay here. The
+  // humane behavior is to hold the unresolved evidence need quietly, not to
+  // convert it into generic learning, content sharing, or relationship nudges.
+  if (localEvidenceBlocked) {
+    return opportunities;
   }
 
   // =====================================================
@@ -716,7 +897,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
     // Check if Soul learned something about these tags AFTER the conversation
     const newLearnings = ego.memories.filter(
       (m) =>
-        m.type === "learning" &&
+        isGroundedLearning(m) &&
         m.timestamp > mem.timestamp &&
         m.tags.some((t) => meaningfulTags.includes(t)),
     );
@@ -767,7 +948,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
     // Check if Soul has recent (< 24h) knowledge about this topic
     const hasRecentKnowledge = ego.memories.some(
       (m) =>
-        m.type === "learning" &&
+        isGroundedLearning(m) &&
         m.timestamp > now - 24 * 60 * 60 * 1000 &&
         m.tags.some((t) =>
           topic.toLowerCase().split(/\s+/).some((word) => t.includes(word) && word.length > 2),
@@ -806,7 +987,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
     // Check if Soul already searched for this recently
     const hasRecentSearch = ego.memories.some(
       (m) =>
-        m.type === "learning" &&
+        isGroundedLearning(m) &&
         m.timestamp > now - 6 * 60 * 60 * 1000 &&
         latestChallenge.split(/\s+/).some((word) => m.content.toLowerCase().includes(word.toLowerCase()) && word.length > 3),
     );
@@ -904,7 +1085,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
         actionParams: {
           conversationSnippets: snippets,
           userProfile: [
-            (ego.userFacts ?? []).slice(0, 5).map((f) => f.content).join("; ") || "limited",
+            activeUserFacts(ego).slice(0, 5).map((f) => f.content).join("; ") || "limited",
             topicFocus.summary ? `topic focus: ${topicFocus.summary}` : "",
           ].filter(Boolean).join("; "),
         },
@@ -918,7 +1099,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
   //    Infers country from language to pick appropriate sources.
   //    Max once per 12 hours.
   // =====================================================
-  const userInterests = (ego.userFacts ?? [])
+  const userInterests = activeUserFacts(ego)
     .filter((f) => ["interest", "tech_stack", "project"].includes(f.category) && f.confidence >= 0.4)
     .filter((f) => !matchesAnyTopic(f.content, topicFocus.deprioritized))
     .slice(0, 5);
@@ -926,7 +1107,8 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
     .filter((p) => p.aspect === "topic_preference" && p.confidence >= 0.4)
     .slice(0, 3);
 
-  if (userInterests.length > 0 || topicFocus.active.length > 0) {
+  if ((userInterests.length > 0 || topicFocus.active.length > 0)
+      && !hasUnresolvedLocalEvidenceMissingResult(ego)) {
     const hasRecentPush = ego.memories.some(
       (m) =>
         m.type === "learning" &&
@@ -985,10 +1167,14 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
   return opportunities;
 }
 
-function analyzeContextualTriggers(ctx: ThoughtGenerationContext): DetectedThoughtOpportunity[] {
+function analyzeContextualTriggers(
+  ctx: ThoughtGenerationContext,
+  includeMaintenance = false,
+): DetectedThoughtOpportunity[] {
   const opportunities: DetectedThoughtOpportunity[] = [];
   const { ego } = ctx;
-  const userFacts = ego.userFacts;
+  const userFacts = activeUserFacts(ego);
+  const localEvidenceBlocked = hasUnresolvedLocalEvidenceMissingResult(ego);
 
   const isNight = ctx.currentHour >= 22 || ctx.currentHour <= 5;
   const isEvening = ctx.currentHour >= 20 || ctx.currentHour <= 6;
@@ -1002,7 +1188,7 @@ function analyzeContextualTriggers(ctx: ThoughtGenerationContext): DetectedThoug
   const hasConversationReplay = opportunities.some((o) => o.type === "conversation-replay" && o.priority >= 70);
 
   // --- User fact-based triggers (lower priority when conversation-replay active) ---
-  if (userFacts.length > 0) {
+  if (userFacts.length > 0 && !localEvidenceBlocked) {
     const projectFacts = userFacts.filter(
       (f) => f.category === "project" || f.category === "interest" || f.category === "tech_stack",
     );
@@ -1042,12 +1228,13 @@ function analyzeContextualTriggers(ctx: ThoughtGenerationContext): DetectedThoug
   // --- Self-improvement goal trigger ---
   // When user has assigned Soul a self-improvement goal, generate opportunities
   // to observe and improve itself via the agent.
+  if (includeMaintenance) {
   const IMPROVE_RE = /优化|improve|self|自主|观察|self-improvement|助理/i;
   const improvementGoals = ego.goals.filter(
     (g) => g.status === "active" && IMPROVE_RE.test(g.title + g.description),
   );
   // Also check userFacts/userPreferences for self-improvement directives
-  const hasImproveFact = (ego.userFacts ?? []).some(
+  const hasImproveFact = activeUserFacts(ego).some(
     (f) => f.confidence >= 0.8 && /优化|observe.*log|自主|self.?improv|proactive.*optim/i.test(f.content),
   );
   const hasImprovePref = (ego.userPreferences ?? []).some(
@@ -1079,6 +1266,7 @@ function analyzeContextualTriggers(ctx: ThoughtGenerationContext): DetectedThoug
       });
     }
   }
+  }
 
   return opportunities;
 }
@@ -1087,17 +1275,36 @@ export function detectThoughtOpportunities(
   ctx: ThoughtGenerationContext,
 ): DetectedThoughtOpportunity[] {
   const allOpportunities: DetectedThoughtOpportunity[] = [];
+  const localEvidenceBlocked = hasUnresolvedLocalEvidenceMissingResult(ctx.ego);
 
-  allOpportunities.push(...analyzeNeedGaps(ctx.ego.needs));
-  allOpportunities.push(...analyzeGoals(ctx.ego.goals));
+  // Goal progress is background motivation, not a conscious stimulus. Turning
+  // percentages such as "Build Trust 68%" into thoughts made the stream read
+  // like a scheduler dashboard and repeatedly crowded out lived context.
   allOpportunities.push(...analyzeDesires(ctx.ego.desires));
-  allOpportunities.push(...analyzeRecentInteraction(ctx.timeSinceLastInteraction));
+  if (!localEvidenceBlocked) {
+    allOpportunities.push(...analyzeRecentInteraction(ctx.timeSinceLastInteraction));
+  }
   allOpportunities.push(...analyzeMemories(ctx.ego.memories));
   allOpportunities.push(...analyzeContextualTriggers(ctx));
 
   allOpportunities.sort((a, b) => b.priority - a.priority);
 
   return allOpportunities;
+}
+
+/**
+ * Operational work is scheduled separately from private thought emergence.
+ * Need gaps and self-maintenance directives must not masquerade as thoughts.
+ */
+export function detectMaintenanceOpportunities(
+  ctx: ThoughtGenerationContext,
+): DetectedThoughtOpportunity[] {
+  const maintenance = [
+    ...analyzeNeedGaps(ctx.ego.needs),
+    ...analyzeContextualTriggers(ctx, true).filter((opportunity) =>
+      opportunity.type === "self-improvement-monitor"),
+  ];
+  return maintenance.sort((a, b) => b.priority - a.priority);
 }
 
 /**
@@ -1113,7 +1320,7 @@ export async function llmReRankOpportunities(
   if (opportunities.length <= 1) return opportunities;
 
   // Build user context summary
-  const userFacts = ctx.ego.userFacts.slice(0, 5)
+  const userFacts = activeUserFacts(ctx.ego).slice(0, 5)
     .map((f) => `[${f.category}] ${f.content}`)
     .join("; ");
   const topicFocus = buildTopicFocusProfile(ctx.ego);
@@ -1426,8 +1633,9 @@ function determineActionForOpportunity(
     return { actionType: "self-reflect" };
   }
 
-  // bond-deepen stays internal. Silence should not produce a message without
-  // a concrete result.
+  // A short silence remains private. Longer absences carry an explicit
+  // send-message suggestion from analyzeRecentInteraction and are handled by
+  // the normal proactive value/quality gates above.
   if (type === "bond-deepen") {
     return { actionType: "none" };
   }
@@ -1689,7 +1897,10 @@ async function expandThoughtActionWithAdjacentIdea(
   ];
   if (!expandableActions.includes(actionType)) return;
 
-  const recentUserMessages = (ctx.ego.recentUserMessages ?? []).slice(-5);
+  const recentUserMessages = currentConversationMemories(ctx.ego)
+    .filter((memory) => memory.tags.includes("inbound"))
+    .map((memory) => memory.content)
+    .slice(-5);
   const recentAvoidItems = ctx.ego.memories
     .filter((m) =>
       (m.type === "interaction" && m.tags.includes("outbound")) ||
@@ -1798,13 +2009,9 @@ async function expandThoughtActionWithAdjacentIdea(
 
 export async function generateIntelligentThought(
   ctx: ThoughtGenerationContext,
-  options?: {
-    llmGenerator?: LLMThoughtGenerator;
-    recentMemories?: SoulMemory[];
-    preferOpportunity?: DetectedThoughtOpportunity;
-  },
+  options?: IntelligentThoughtOptions,
 ): Promise<Thought> {
-  const { llmGenerator, preferOpportunity } = options ?? {};
+  const { llmGenerator, preferOpportunity, expandActionIdeas = false } = options ?? {};
 
   const opportunities = detectThoughtOpportunities(ctx);
 
@@ -1861,7 +2068,7 @@ export async function generateIntelligentThought(
       // EXCEPTION: don't override explicit suggestedActions that are deliberate
       // proactive actions (observe-and-improve, proactive-research, proactive-content-push).
       const strongProblemIndicators = /排查.*问题|分析.*错误|修复.*bug|debug|fix.*issue|diagnos|investigate.*error|read.*log.*file|检查.*日志|读取.*文件.*错误/i;
-      const protectedActions = new Set(["observe-and-improve", "run-agent-task", "invoke-tool", "analyze-problem", "proactive-research", "proactive-content-push"]);
+      const protectedActions = new Set(["send-message", "observe-and-improve", "run-agent-task", "invoke-tool", "analyze-problem", "proactive-research", "proactive-content-push"]);
       const isProtectedAction = protectedActions.has(selectedOpportunity.suggestedAction ?? "");
       if (!isProtectedAction &&
           strongProblemIndicators.test(refinedContent) &&
@@ -1888,16 +2095,22 @@ export async function generateIntelligentThought(
       }
 
       suppressOrRerouteLowValueMessageThought(thought, selectedOpportunity, ctx);
-      await expandThoughtActionWithAdjacentIdea(thought, selectedOpportunity, ctx, llmGenerator);
+      if (expandActionIdeas) {
+        await expandThoughtActionWithAdjacentIdea(thought, selectedOpportunity, ctx, llmGenerator);
+      }
       return thought;
     } catch (err) {
-      log.warn(`LLM thought refinement failed, using structured thought: ${err instanceof Error ? err.message : String(err)}`);
+      // A configured model that is unavailable or out of its thought budget
+      // must not silently collapse into generic rule templates. The caller
+      // records the failed cycle and backs off while action/critical lanes stay
+      // available.
+      throw err;
     }
   }
 
   const thought = buildThoughtFromOpportunity(selectedOpportunity, ctx.ego);
   suppressOrRerouteLowValueMessageThought(thought, selectedOpportunity, ctx);
-  if (llmGenerator) {
+  if (llmGenerator && expandActionIdeas) {
     await expandThoughtActionWithAdjacentIdea(thought, selectedOpportunity, ctx, llmGenerator);
   }
   return thought;
@@ -1916,20 +2129,15 @@ async function generateLLMThoughtPrompt(
     })
     .join(", ");
 
-  const goalsList =
-    ego.goals
-      .filter((g) => g.status === "active")
-      .slice(0, 2)
-      .map((g) => `${g.title} (${g.progress.toFixed(0)}%)`)
-      .join(", ") || "none";
-
-  const userFactsSummary = ego.userFacts.length > 0
-    ? ego.userFacts.slice(0, 5).map((f) => `[${f.category}] ${f.content}`).join("\n")
+  const activeFacts = ego.userFacts
+    .filter((fact) => fact.validity !== "superseded")
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+  const userFactsSummary = activeFacts.length > 0
+    ? activeFacts.slice(0, 8).map((f) => `[CURRENT ${f.category}] ${f.content}`).join("\n")
     : "none yet";
 
   // Include actual conversation content for conversation-replay thoughts
-  const recentInteractions = ego.memories
-    .filter((m) => m.type === "interaction")
+  const recentInteractions = currentConversationMemories(ego, 5)
     .sort((a, b) => b.timestamp - a.timestamp)
     .slice(0, 5);
   const conversationContext = recentInteractions.length > 0
@@ -1937,61 +2145,61 @@ async function generateLLMThoughtPrompt(
     : "no recent conversations";
 
   const recentLearnings = ego.memories
-    .filter((m) => m.type === "learning")
+    .filter(isGroundedLearning)
     .sort((a, b) => b.timestamp - a.timestamp)
     .slice(0, 3);
   const learningContext = recentLearnings.length > 0
     ? recentLearnings.map((m) => `- ${m.content.slice(0, 80)}`).join("\n")
     : "no recent learnings";
+  const mentalContext = [
+    `Foreground: ${ego.mentalContext.foreground.join("; ") || "quiet"}`,
+    `Residue: ${ego.mentalContext.residue.join("; ") || "none"}`,
+    `Background concerns: ${ego.mentalContext.backgroundConcerns.join("; ") || "none"}`,
+    `Environmental changes: ${ego.mentalContext.environmentalChanges.join("; ") || "none"}`,
+  ].join("\n");
 
   // Search external memory plugins for relevant context
   const memoryQuery = `${opportunity.triggerDetail} ${opportunity.motivation}`;
   const externalResults = await searchExternalMemories(memoryQuery, 3);
   const memorySection = formatMemoryContext(externalResults);
 
-  return `You are a soulful AI, generating a thought.
+  return `A thought may be forming from a lingering stimulus and recent experience.
 
-**Current thought opportunity**:
-- Type: ${opportunity.type}
-- Trigger: ${opportunity.trigger}
-- Detail: ${opportunity.triggerDetail}
-- Related needs: ${needsList || "none"}
-- Current goals: ${goalsList}
-- Priority: ${opportunity.priority}/100
+Lingering stimulus:
+${opportunity.triggerDetail}
 
-**Your ego state**:
-- ${Object.entries(ego.needs)
-    .map(([_, n]) => `${n.name}: ${n.current.toFixed(0)}/${n.ideal}`)
-    .join(", ")}
-
-**Your desires**:
-${ego.desires
-  .slice(0, 3)
-  .map((d) => `- ${d.content}`)
-  .join("\n")}
-
-**What I know about the user**:
+Stable context about the person:
 ${userFactsSummary}
 
-**Recent conversations** (what the user actually said):
+Recent conversation:
 ${conversationContext}
 
-**What I've learned recently**:
+Current mental context:
+${mentalContext}
+
+Grounded things learned recently:
 ${learningContext}
 
 ${memorySection ? `\n${memorySection}\n` : ""}
-${opportunity.type === "conversation-replay"
-    ? `\nYou are replaying a past conversation. Think about:\n1. Did the user ask something that wasn't fully answered?\n2. Have you learned anything since then that would be useful to share?\n3. Is there a specific insight worth following up on?\n`
-    : ""}
+Notice at most one thought that genuinely arises. It may be a question, a
+tension, a correction of an earlier interpretation, or a connection between
+details. It does not need to be useful and it does not need to become an
+action. Prefer uncertainty over pretending to know the person's personality.
+CURRENT facts override older conversations and retrieved memories. Never infer
+that a resolved condition is still broken unless newer direct user/tool evidence
+explicitly reopens it. Old failures are historical context, not current evidence.
+Usually continue the foreground or a genuine residue. Only rarely bridge to a
+distant background concern. If no specific tension or connection remains,
+output NO_THOUGHT instead of manufacturing uncertainty.
 
-Express your thought in 1-2 sentences. Requirements:
-1. Be specific and meaningful, no empty platitudes
-2. If referencing a conversation, mention the specific topic
-3. If you've learned something relevant, say what you learned
-4. Include your intent about what you want to do
-5. Be consistent with your identity as an AI
+Do not summarize the context. Do not mention goals, trust percentages, needs,
+the thought system, or why this thought was generated. Do not write a task
+plan. Never say "I will", "I'll", "I'm going to", "I should", "let's", or
+promise to run, fetch, test, check, optimize, implement, or report anything.
+Do not force an old poetic phrase into an unrelated technical topic.
 
-Output the thought content directly, no explanation.`;
+Write only the thought, in 1-2 natural sentences in the language of the most
+recent conversation. If nothing distinct arises, output NO_THOUGHT.`;
 }
 
 export async function generateProactiveMessage(
@@ -2039,7 +2247,7 @@ async function generateProactiveMessagePromptLLM(
   opportunity: DetectedThoughtOpportunity,
   ego: EgoState,
 ): Promise<string> {
-  const userFacts = ego.userFacts.slice(0, 5);
+  const userFacts = activeUserFacts(ego).slice(0, 5);
   const userInfo =
     userFacts.length > 0
       ? `What I know about the user: ${userFacts.map((f) => f.content).join("; ")}`

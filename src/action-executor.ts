@@ -80,6 +80,10 @@ function isTimeSensitiveTopic(text: string): boolean {
   return TIME_SENSITIVE_PATTERNS.some((p) => p.test(text));
 }
 
+export function isLocalProjectEvidenceQuery(text: string): boolean {
+  return /\b(?:OOS|CAGR|MaxDD|drawdown|backtest|eth_live|v\d+|script|deploy)\b|回测|最大回撤|收益|盈亏|日志|脚本|部署|本地|哪一个|哪个版本|最优/i.test(text);
+}
+
 /**
  * Truncate text at a sentence boundary (period, question mark, exclamation)
  * instead of cutting mid-sentence. Falls back to hard cut only if no
@@ -227,6 +231,7 @@ const META_WORK_PROMISE_PATTERNS = [
   /\u522b\u7a7a\u804a/i,
   /\u6211\u4e00\u76f4\u5728/i,
   /\bI should\b/i,
+  /\bI(?:'ll| will| am going to|'m going to)\s+(?:run|fetch|test|check|investigate|backtest|optimi[sz]e|implement|forward|send|share|report)\b/i,
   /\bI(?:'ll| will) (?:keep|continue|report|share)\b.{0,80}\b(?:when|once|after)\b/i,
   /\b(?:no substantive progress|keep working quietly|will report when|not disturb|don't disturb)\b/i,
 ];
@@ -274,12 +279,35 @@ const VAGUE_STATUS_PATTERNS = [
   /\u51c6\u5907|\u6253\u7b97|\u60f3\u8981|\u53ef\u4ee5\u5e2e|\u6211\u6765\u67e5/i,
 ];
 
-function assessOutgoingProactiveMessage(message: string): MessageQualityCheck {
+const RESOLVED_SSH_CONFIG_CONFIRMATION_PATTERNS = [
+  /\b192\.168\.1\.206\b.{0,160}\b(?:PermitRootLogin|authorized_keys|sshd_config|PubkeyAuthentication)\b/i,
+  /\b(?:PermitRootLogin|authorized_keys|sshd_config|PubkeyAuthentication)\b.{0,160}\b192\.168\.1\.206\b/i,
+  /\b(?:root|ssh|sshd)\b.{0,80}\b(?:PermitRootLogin|authorized_keys|sshd_config|PubkeyAuthentication)\b/i,
+];
+
+export function assessOutgoingProactiveMessage(message: string): MessageQualityCheck {
   const text = message.replace(/\s+/g, " ").trim();
   if (!text) return { ok: false, reason: "empty" };
 
   if (META_WORK_PROMISE_PATTERNS.some((pattern) => pattern.test(text))) {
     return { ok: false, reason: "meta-work-promise" };
+  }
+
+  const permissionOrMenuQuestion = /(?:你(?:更)?想(?:先)?|你希望|要不要|是否需要我|需要我|让我|我可以).{0,80}(?:还是|或者|吗|么|？|\?)/i.test(text)
+    || /(?:先[\s\S]{0,60}还是|还是先)/i.test(text)
+    || /(?:would you like|do you want|shall i|should i|which would you prefer).{0,100}(?:or|\?)/i.test(text);
+  if (permissionOrMenuQuestion) {
+    return { ok: false, reason: "permission-menu-question" };
+  }
+
+  if (RESOLVED_SSH_CONFIG_CONFIRMATION_PATTERNS.some((pattern) => pattern.test(text))) {
+    return { ok: false, reason: "resolved-ssh-config-confirmation" };
+  }
+
+  const speculativeLocalEvidence = /(?:我(?:怀疑|不确定|想知道|想确认|在想|觉得)|可能|是否|有没有|到底|不清楚).{0,120}(?:回测|手续费|滑点|收益|回撤|最大回撤|盈亏|实盘|日志|\b(?:OOS|CAGR|MaxDD|drawdown|backtest|slippage|fee|pnl)\b)/i.test(text)
+    || /\b(?:I suspect|I wonder|not sure|maybe|might|could)\b.{0,120}\b(?:backtest|drawdown|CAGR|MaxDD|slippage|fee|PnL|live trading|log)\b/i.test(text);
+  if (speculativeLocalEvidence) {
+    return { ok: false, reason: "unsupported-local-evidence-speculation" };
   }
 
   const hasConcreteSignal = CONCRETE_WORK_SIGNAL_PATTERNS.some((pattern) => pattern.test(text));
@@ -318,29 +346,40 @@ function isBlockedMetaWorkThought(message: string): boolean {
 const ACTION_COOLDOWNS_MS: Record<ActionType, number> = {
   none: 0,
   "send-message": 5 * 60 * 1000,
-  "learn-topic": 4 * 60 * 60 * 1000,
+  "learn-topic": 45 * 60 * 1000,
   "search-web": 10 * 60 * 1000,
   "self-reflect": 5 * 60 * 1000,
-  "recall-memory": 2 * 60 * 60 * 1000,
-  "create-goal": 60 * 60 * 1000,
+  "recall-memory": 30 * 60 * 1000,
+  "create-goal": 30 * 60 * 1000,
   "invoke-tool": 5 * 60 * 1000,
   "analyze-problem": 30 * 60 * 1000,
-  "run-agent-task": 2 * 60 * 60 * 1000,
+  "run-agent-task": 60 * 60 * 1000,
   "report-findings": 2 * 60 * 1000,
-  "observe-and-improve": 2 * 60 * 60 * 1000,
-  "proactive-research": 4 * 60 * 60 * 1000,
-  "proactive-content-push": 8 * 60 * 60 * 1000, // 8 hours
+  "observe-and-improve": 45 * 60 * 1000,
+  "proactive-research": 60 * 60 * 1000,
+  "proactive-content-push": 90 * 60 * 1000,
 };
 
 const MIN_ACTION_COOLDOWNS_MS: Partial<Record<ActionType, number>> = {
-  "learn-topic": 2 * 60 * 60 * 1000,
-  "recall-memory": 60 * 60 * 1000,
-  "analyze-problem": 15 * 60 * 1000,
-  "run-agent-task": 90 * 60 * 1000,
-  "observe-and-improve": 90 * 60 * 1000,
+  "learn-topic": 15 * 60 * 1000,
+  "recall-memory": 15 * 60 * 1000,
+  "analyze-problem": 10 * 60 * 1000,
+  "run-agent-task": 30 * 60 * 1000,
+  "observe-and-improve": 20 * 60 * 1000,
   "report-findings": 30 * 1000,
-  "proactive-research": 2 * 60 * 60 * 1000,
-  "proactive-content-push": 4 * 60 * 60 * 1000,
+  "proactive-research": 30 * 60 * 1000,
+  "proactive-content-push": 30 * 60 * 1000,
+};
+
+const TEST_MODE_MIN_ACTION_COOLDOWNS_MS: Partial<Record<ActionType, number>> = {
+  "send-message": 2 * 60 * 1000,
+  "learn-topic": 5 * 60 * 1000,
+  "recall-memory": 5 * 60 * 1000,
+  "analyze-problem": 5 * 60 * 1000,
+  "run-agent-task": 15 * 60 * 1000,
+  "observe-and-improve": 10 * 60 * 1000,
+  "proactive-research": 30 * 60 * 1000,
+  "proactive-content-push": 20 * 60 * 1000,
 };
 
 const lastActionTime: Record<string, number> = {};
@@ -351,7 +390,10 @@ export function getActionCooldownState(
   now = Date.now(),
 ): { ready: boolean; remainingMs: number; cooldownMs: number; lastTime: number } {
   const scaledCooldownMs = (ACTION_COOLDOWNS_MS[actionType] ?? 30 * 60 * 1000) * thoughtFrequency;
-  const cooldownMs = Math.max(scaledCooldownMs, MIN_ACTION_COOLDOWNS_MS[actionType] ?? 0);
+  const minCooldowns = thoughtFrequency < 0.5 ? TEST_MODE_MIN_ACTION_COOLDOWNS_MS : MIN_ACTION_COOLDOWNS_MS;
+  const cooldownMs = thoughtFrequency < 0.5 && TEST_MODE_MIN_ACTION_COOLDOWNS_MS[actionType] !== undefined
+    ? TEST_MODE_MIN_ACTION_COOLDOWNS_MS[actionType]
+    : Math.max(scaledCooldownMs, minCooldowns[actionType] ?? 0);
   const lastTime = lastActionTime[actionType] ?? 0;
   const elapsedMs = now - lastTime;
   const remainingMs = Math.max(0, cooldownMs - elapsedMs);
@@ -409,7 +451,7 @@ const SEARCH_DEDUP_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 /** Track recent proactive message content to prevent duplicates */
 const recentSentMessages: Map<string, number> = new Map();
-const MESSAGE_DEDUP_MS = 2 * 60 * 60 * 1000; // 2 hours
+const MESSAGE_DEDUP_MS = 45 * 60 * 1000;
 const PROACTIVE_MESSAGE_BASE_MIN_INTERVAL_MS = 45 * 60 * 1000; // 45 minutes at thoughtFrequency=1
 const PROACTIVE_MESSAGE_BASE_DAILY_LIMIT = 10;
 
@@ -1146,10 +1188,9 @@ async function generateValuableMessage(
       // Determine if this is a follow-up on a user's actual topic (vs. generic ego thought)
       const isUserTopicFollowUp = thought.type === "conversation-replay" && recentKnowledge.length > 0;
 
-      // Lower thoughtFrequency makes Soul think more often, so each generated
-      // message must clear a stricter bar to avoid notification spam.
       const freq = options.thoughtFrequency ?? 1.0;
-      const strictGate = freq < 0.8;
+      const observationMode = freq < 0.5;
+      const isRelationshipFollowUp = thought.type === "bond-deepen";
 
       const prompt = `You are a proactive AI assistant. You must output ONLY a short message to send to the user, or NO_MESSAGE.
 
@@ -1160,7 +1201,9 @@ ${timeContext}
 ${userInfo ? `User profile:\n${userInfo}\n` : ""}Relationship/personality profile:\n${soulProfileContext}\n${interactionContext ? `Recent conversations:\n${interactionContext}\n` : ""}${knowledgeContext ? `Knowledge I've learned:\n${knowledgeContext}\n` : ""}${options.workspaceContext ? `Workspace rules:\n${options.workspaceContext}\n` : ""}${thought.type !== "bond-deepen" ? `Thought: ${thought.motivation}` : ""}
 ${adjacentGuidance}
 
-${isUserTopicFollowUp
+${isRelationshipFollowUp
+  ? `**IMPORTANT — relationship follow-up**: A meaningful absence triggered this message. You MAY send one warm, context-aware question about a real recent topic, decision, feeling, or unfinished thread. A useful question counts as value here even without web research. Do not infer personality from a single phrase, repeat the user's words decoratively, or claim you ran/will run work.`
+  : isUserTopicFollowUp
   ? `**IMPORTANT**: You just searched for or learned about a topic the user previously discussed. You SHOULD share your finding in 2-3 sentences. Reference the specific topic and what you found. Only say NO_MESSAGE if the knowledge is completely unrelated to what the user cares about.`
   : `**What counts as valuable** (only send if you have something like this):
 - A specific insight related to something the user discussed
@@ -1168,16 +1211,18 @@ ${isUserTopicFollowUp
 - An answer to a question the user previously asked
 - A relevant update on a topic the user cares about`}
 
-**What does NOT count as valuable** (always say NO_MESSAGE):${strictGate ? "\n- Because the thought loop is running frequently, modest insights are not enough; only send if the message is clearly useful now" : ""}
-- Just saying hi, checking in, or "how are you"
+**What does NOT count as valuable** (always say NO_MESSAGE):${observationMode ? "\n- Observation-test mode is active: prefer a concise, honest contextual follow-up when appropriate; frequency is handled by cooldowns, not by inventing extra value" : ""}
+- Just saying hi, "how are you", or checking in without a specific recent thread
 - Generic encouragement or small talk without substance
 - "I was thinking about..." without a concrete insight to share
 - Paraphrasing what the user already knows
 - Asking "do you have new thoughts?" without adding value
+- Asking the user to choose from a menu ("先看 A 还是做 B") or asking permission to perform work
 - Offering to help, debug, read logs, or do tasks for the user (you are a proactive messenger, NOT an assistant responding to requests)
 - Saying "I'm ready to help" or "let me check X for you" — this is assistant behavior, not proactive insight
 - Messages about yourself (the AI/bot/plugin), your capabilities, or your internal state
 - Restating the user's own words back to them as if it were new information
+- Reopening already-resolved SSH/login setup checks such as PermitRootLogin, authorized_keys, sshd_config, or PubkeyAuthentication for 192.168.1.206
 - Internal plans or status such as "I should keep working", "I'll report when there is data", or "boss X hours absent"
 - Work updates without completed work, measured results, changed files, verification, or a concrete blocker
 
@@ -1186,6 +1231,8 @@ ${isUserTopicFollowUp
 - For project/backtest/optimization work, send only after a completed check, before/after metric, changed file, verification command, or exact blocker. Otherwise output NO_MESSAGE.
 - For investigation or code-improvement updates, include what was checked, what changed, how it was verified, and the next useful step in 3-6 sentences or a few compact bullets
 - For simple insights, 2-3 sentences is enough
+- For a relationship follow-up, ask at most one concrete question and keep it to 1-2 sentences
+- Never promise future tool use or work unless a real execution action has already been scheduled; do not say you will run, fetch, test, check, backtest, optimize, or forward results
 - A direct opening is allowed; do not pad the message with a stock phrase
 - Make the relationship reason implicit and human: connect to a long-term theme or recent emotional tone, without saying "relationship profile"
 - NO analysis, NO numbering, NO "Let me analyze", NO meta-commentary
@@ -1345,6 +1392,8 @@ async function executeLearnTopic(
       importance: source === "web-search" ? 0.7 : 0.55,
       timestamp: Date.now(),
       tags: ["learning", source, topic.toLowerCase()],
+      evidenceKind: source === "web-search" ? "web" : "model",
+      ...(sourceUrl ? { evidenceSources: [sourceUrl] } : {}),
     };
     await addSoulMemoryToEgo(memory);
   };
@@ -1478,6 +1527,19 @@ async function executeSearchWeb(
     };
   }
 
+  if (isLocalProjectEvidenceQuery(query)) {
+    log.info(`Skipping search-web LLM fallback for local project evidence query: "${query}"`);
+    return {
+      result: {
+        type: "search-web",
+        success: true,
+        result: "skipped-local-project-evidence-query",
+        data: { query, requiresLocalEvidence: true },
+      },
+      metricsChanged: [],
+    };
+  }
+
   // Non-time-sensitive topics: don't spend web search budget, but still produce
   // a useful result via LLM fallback (otherwise the user sees "search-web"
   // actions that do nothing).
@@ -1509,6 +1571,7 @@ Be concrete and practical; avoid generic filler.`;
             importance: 0.55,
             timestamp: Date.now(),
             tags: ["search", "llm-fallback", query.toLowerCase()],
+            evidenceKind: "model",
           };
           await addSoulMemoryToEgo(memory);
         }
@@ -1615,6 +1678,8 @@ Please extract 2-3 of the most important knowledge points or findings, each in o
       importance: 0.7,
       timestamp: Date.now(),
       tags: ["search", "web-search", query.toLowerCase()],
+      evidenceKind: "web",
+      evidenceSources: searchResults.map((result) => result.url).filter((url): url is string => !!url).slice(0, 5),
     };
     await addSoulMemoryToEgo(memory);
 
@@ -1653,6 +1718,7 @@ Since you cannot directly access the internet, based on your existing knowledge,
         importance: 0.6,
         timestamp: Date.now(),
         tags: ["search", query.toLowerCase()],
+        evidenceKind: "model",
       };
       await addSoulMemoryToEgo(memory);
     } catch (err) {
@@ -1674,9 +1740,9 @@ Since you cannot directly access the internet, based on your existing knowledge,
 /**
  * Proactive research: mine conversations for latent needs, search the web
  * for useful information, and share findings with the user.
- * Falls back to LLM knowledge if no search API is available.
+ * Requires grounded search evidence; it never sends model-only factual claims.
  */
-async function executeProactiveResearch(
+export async function executeProactiveResearch(
   thought: Thought,
   ego: EgoState,
   options: ActionExecutorOptions,
@@ -1769,7 +1835,8 @@ ${snippets.slice(0, 1800)}`,
 
   log.info(`Proactive research topic: "${topic}", query: "${searchQuery}"`);
 
-  // Step 2: Search the web (or fallback to LLM knowledge)
+  // Step 2: Search the web. Proactive claims require external evidence: an
+  // ungrounded model fallback can confidently invent limits, paths or config.
   let researchContent: string;
   let usedWebSearch = false;
 
@@ -1806,10 +1873,8 @@ Write 3-5 concise insights in flowing prose (NOT a numbered list). Each insight 
       throw new Error("No search results");
     }
   } catch (err) {
-    // Fallback: use LLM's own knowledge
-    log.info(`Proactive research: falling back to LLM knowledge (reason: ${err instanceof Error ? err.message : String(err)})`);
-    const fallbackPrompt = `The user mentioned something related to "${topic}". Based on your knowledge, share 3-5 genuinely useful tips or recommendations in 3-5 sentences. Be specific and practical. Do NOT use numbered lists.`;
-    researchContent = await llmGenerator(fallbackPrompt);
+    log.info(`Proactive research skipped: no grounded search evidence (${err instanceof Error ? err.message : String(err)})`);
+    return { result: { type: "proactive-research", success: true, result: "skipped-no-search-evidence" }, metricsChanged: [] };
   }
 
   researchContent = researchContent.replace(/<think[\s\S]*?<\/think>/gi, "").trim().slice(0, 1000);
@@ -1910,6 +1975,7 @@ Write 3-5 sentences as a natural message to the user. Rules:
     importance: 0.6,
     timestamp: Date.now(),
     tags: ["learning", "proactive-research", ...topic.toLowerCase().split(/\s+/).filter((w) => w.length > 2).slice(0, 3)],
+    evidenceKind: "web",
   });
 
   return {
@@ -2020,14 +2086,8 @@ In 3-5 sentences, describe the most interesting finding. Be specific — mention
       throw new Error("No results");
     }
   } catch (err) {
-    // Fallback to LLM knowledge
-    log.info(`Content push: falling back to LLM knowledge (reason: ${err instanceof Error ? err.message : String(err)})`);
-    const fallbackPrompt = `Share an interesting insight about "${topic ?? searchQuery}" for a user interested in "${interests}".
-
-Explain the bridge: ${bridge ?? why ?? "why this adjacent topic may matter"}.
-
-Write 3-5 sentences. Be specific and mention concrete details. Do NOT use numbered lists.`;
-    articleContent = await llmGenerator(fallbackPrompt);
+    log.info(`Content push skipped: no grounded search evidence (${err instanceof Error ? err.message : String(err)})`);
+    return { result: { type: "proactive-content-push", success: true, result: "skipped-no-search-evidence" }, metricsChanged: [] };
   }
 
   articleContent = articleContent.replace(/<think[\s\S]*?<\/think>/gi, "").trim().slice(0, 1000);
@@ -2125,6 +2185,8 @@ Write 3-5 sentences as a natural message sharing this find. Rules:
       importance: 0.5,
       timestamp: Date.now(),
       tags: ["learning", "proactive-content-push"],
+      evidenceKind: "web",
+      ...(articleUrl ? { evidenceSources: [articleUrl] } : {}),
     });
   } catch {
     // Non-critical

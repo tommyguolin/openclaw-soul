@@ -26,6 +26,7 @@ const AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS = 150;
 const AUTONOMOUS_AGENT_QUICK_CHECK_SECONDS = 60;
 const AUTONOMOUS_FAILURE_BACKOFF_MS = 2 * 60 * 60 * 1000;
 const AUTONOMOUS_FAILURE_LOOKBACK_MS = 6 * 60 * 60 * 1000;
+const READABLE_EVIDENCE_EXTENSIONS = [".log", ".txt", ".json", ".csv", ".md", ".yaml", ".yml", ".conf"];
 
 /** Track recently sent report messages to prevent duplicates. */
 const recentReportedMessages: Map<string, number> = new Map();
@@ -87,7 +88,7 @@ function isTaskBlockedResult(result: string): boolean {
 
 function isProviderPressureErrorText(value: unknown): boolean {
   const text = value instanceof Error ? value.message : String(value ?? "");
-  return /Soul LLM backoff active|Soul LLM call budget exhausted|rate limit|cooldown|No available auth profile|too many requests|429|suspending lanes|embedded run timeout|Request timed out|ECONNRESET|fetch failed/i.test(text);
+  return /Soul LLM backoff active|Soul LLM (?:call|\w+ lane) budget exhausted|rate limit|cooldown|No available auth profile|too many requests|429|suspending lanes|embedded run timeout|Request timed out|ECONNRESET|fetch failed/i.test(text);
 }
 
 function isLowValueAutonomousFailure(task: AutonomousTask): boolean {
@@ -616,9 +617,79 @@ function isInternalNeedDiagnostic(thought: Thought): boolean {
 
 function isOnlyProviderPressureDiagnostic(result: string): boolean {
   const text = result.replace(/<think[\s\S]*?<\/think>/gi, "");
-  const hasProviderPressure = /Soul LLM backoff active|Soul LLM call budget exhausted|provider backoff active|rate limit|cooldown|too many requests|429/i.test(text);
+  const hasProviderPressure = /Soul LLM backoff active|Soul LLM (?:call|\w+ lane) budget exhausted|provider backoff active|rate limit|cooldown|too many requests|429/i.test(text);
   const hasExternalSignal = /traceback|exception|parsererror|command exited with code [1-9]|500|401|403|TypeError|ReferenceError|SyntaxError|Cannot find module/i.test(text);
   return hasProviderPressure && !hasExternalSignal;
+}
+
+function collectKnownLocalEvidenceTargets(ego: EgoState, currentText = ""): string[] {
+  const haystacks = [
+    currentText,
+    ...(ego.mentalContext?.foreground ?? []),
+    ...(ego.mentalContext?.backgroundConcerns ?? []),
+    ...(ego.mentalContext?.residue ?? []),
+    ...(ego.recentUserMessages ?? []),
+    ...(ego.memories ?? [])
+      .filter((memory) => memory.type === "interaction" && memory.tags.includes("inbound"))
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, 20)
+      .map((memory) => memory.content),
+  ];
+  const targets: string[] = [];
+  for (const text of haystacks) {
+    for (const match of text.matchAll(/(?:^|[\s(（"'`])((?:\/[A-Za-z0-9._-]+){2,}\/?)/g)) {
+      const value = match[1].replace(/[),，。；;]+$/g, "");
+      if (!targets.includes(value)) targets.push(value);
+    }
+    for (const match of text.matchAll(/\b((?:\d{1,3}\.){3}\d{1,3})\b/g)) {
+      const value = match[1];
+      if (!targets.includes(value)) targets.push(value);
+    }
+  }
+  return targets.slice(0, 8);
+}
+
+function isReadableEvidenceFile(filePath: string): boolean {
+  const lower = filePath.toLowerCase();
+  return READABLE_EVIDENCE_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
+
+async function readLocalEvidenceTarget(target: string): Promise<{ steps: TaskStep[]; evidence: string[] }> {
+  const steps: TaskStep[] = [];
+  const evidence: string[] = [];
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(target)) {
+    steps.push(makeSkippedStep("known-remote-host", `Remote host target known but not read by bounded local analyzer: ${target}`));
+    return { steps, evidence };
+  }
+  try {
+    const stat = statSync(target);
+    if (stat.isFile() && isReadableEvidenceFile(target)) {
+      const step = await readLocalFile("read-context-evidence-file", target);
+      steps.push(step);
+      if (step.success && step.output) evidence.push(`=== Context target: ${target} ===\n${step.output}`);
+      return { steps, evidence };
+    }
+    if (stat.isDirectory()) {
+      const candidates = readdirSync(target)
+        .filter((name) => isReadableEvidenceFile(name))
+        .slice(0, 5)
+        .map((name) => join(target, name));
+      if (candidates.length === 0) {
+        steps.push(makeSkippedStep("known-local-directory-empty", `No readable evidence files found in ${target}`));
+      }
+      for (const filePath of candidates) {
+        const step = await readLocalFile("read-context-evidence-file", filePath);
+        steps.push(step);
+        if (step.success && step.output) evidence.push(`=== Context target: ${filePath} ===\n${step.output}`);
+      }
+      return { steps, evidence };
+    }
+    steps.push(makeSkippedStep("known-local-target-unsupported", `Known target is not a regular file or directory: ${target}`));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    steps.push(makeSkippedStep("known-local-target-unreadable", `${target}: ${msg}`));
+  }
+  return { steps, evidence };
 }
 
 export async function executeAnalyzeProblem(
@@ -658,6 +729,11 @@ export async function executeAnalyzeProblem(
   // Phase 1: Gather information
   const filePaths = (thought.actionParams?.logPaths as string[]) ?? [];
   const sourcePaths = (thought.actionParams?.sourcePaths as string[]) ?? [];
+  const requiresLocalEvidence = thought.actionParams?.requiresLocalEvidence === true;
+  const contextualTargets = [
+    ...((thought.actionParams?.localEvidenceTargets as string[]) ?? []),
+    ...collectKnownLocalEvidenceTargets(ego, `${thought.content}\n${thought.motivation}`),
+  ].filter((value, index, arr) => Boolean(value) && arr.indexOf(value) === index).slice(0, 8);
 
   // Read any files mentioned in conversation (logs, source, config, etc.)
   for (const filePath of filePaths.slice(0, 5)) {
@@ -673,9 +749,20 @@ export async function executeAnalyzeProblem(
     if (step.success && step.output) gatheredInfo.push(`=== Source: ${srcPath} ===\n${step.output}`);
   }
 
+  if (gatheredInfo.length === 0 && requiresLocalEvidence && contextualTargets.length > 0) {
+    for (const target of contextualTargets) {
+      const resolved = await readLocalEvidenceTarget(target);
+      steps.push(...resolved.steps);
+      gatheredInfo.push(...resolved.evidence);
+      if (gatheredInfo.length > 0) break;
+    }
+  }
+
   // If no files were found from conversation, try reading recent logs from
-  // common locations — not limited to OpenClaw itself.
-  if (gatheredInfo.length === 0) {
+  // common locations — not limited to OpenClaw itself. Local-evidence tasks are
+  // different: without an explicit target file/path, OpenClaw's own log is
+  // unrelated evidence and should not be reported as if it answered the user.
+  if (gatheredInfo.length === 0 && !requiresLocalEvidence) {
     const today = new Date().toISOString().slice(0, 10);
     const defaultPaths = [
       join(tmpdir(), "openclaw", `openclaw-${today}.log`),
@@ -699,6 +786,25 @@ export async function executeAnalyzeProblem(
   let analysisResult = "";
   if (gatheredInfo.length > 0) {
     analysisResult = buildRuleBasedAnalysis(thought, ego, gatheredInfo, steps);
+  } else if (requiresLocalEvidence) {
+    if (contextualTargets.length > 0) {
+      analysisResult = [
+        "Status: blocked",
+        "Reason: local-evidence-target-known-unreadable",
+        `Context: ${thought.motivation || thought.content}`,
+        `Known targets: ${contextualTargets.join(", ")}`,
+        "",
+        "Soul found prior local/remote target context, so this is not treated as a missing-target thought block. The bounded local analyzer could not read usable evidence from those targets and did not answer from model memory.",
+      ].join("\n");
+    } else {
+      analysisResult = [
+        "Status: blocked",
+        "Reason: local-evidence-target-missing",
+        `Context: ${thought.motivation || thought.content}`,
+        "",
+        "No explicit local log/source path was available, so Soul did not use model memory or unrelated OpenClaw logs to answer a project-specific result question.",
+      ].join("\n");
+    }
   } else if (gatheredInfo.length === 0) {
     analysisResult = "No relevant information could be gathered for analysis.";
   }
@@ -712,7 +818,8 @@ export async function executeAnalyzeProblem(
       t.result = analysisResult;
       t.updatedAt = Date.now();
       t.completedAt = Date.now();
-      if (isInternalNeedDiagnostic(thought) && isOnlyProviderPressureDiagnostic(analysisResult)) {
+      if ((requiresLocalEvidence && gatheredInfo.length === 0)
+        || (isInternalNeedDiagnostic(thought) && isOnlyProviderPressureDiagnostic(analysisResult))) {
         t.resultDelivered = true;
       }
     }

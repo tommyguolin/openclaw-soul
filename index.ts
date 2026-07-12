@@ -5,7 +5,7 @@ type PluginContext = any;
 type OpenClawPluginApi = {
   pluginConfig: Record<string, unknown>;
   config: Record<string, unknown>;
-  on(event: string, handler: (event: PluginEvent, ctx?: PluginContext) => Promise<unknown>): void;
+  on(event: string, handler: (event: PluginEvent, ctx?: PluginContext) => unknown | Promise<unknown>): void;
   registerService(service: { id: string; start: () => Promise<void>; stop: () => Promise<void> }): void;
 };
 import { readFileSync } from "node:fs";
@@ -24,6 +24,9 @@ const log = createSoulLogger("plugin");
  * Discord requires "user:<id>" for DMs — auto-prefix bare numeric IDs.
  */
 function normalizeTarget(channel: string, target: string): string {
+  if (channel === "feishu" && target.startsWith("feishu:")) {
+    return target.slice("feishu:".length);
+  }
   if (channel === "discord" && /^\d{10,}$/.test(target)) {
     return `user:${target}`;
   }
@@ -194,6 +197,8 @@ type PluginConfig = {
   workspaceFiles?: string[];
   /** Thought frequency multiplier. Default: 1.0. Set lower (e.g. 0.2) for faster testing. */
   thoughtFrequency?: number;
+  /** Private shadow emergence probability per eligible interval. Default: 0.1. */
+  shadowThoughtRate?: number;
 };
 // Note: `enabled` in PluginConfig is the inner service toggle (default: true).
 // The outer `plugins.entries.soul.enabled` (in openclaw.json) controls plugin loading.
@@ -269,7 +274,10 @@ function loadPersistedProactiveEndpoint(): { channel?: string; target?: string }
     const target = typeof parsed.ego?.proactiveTarget === "string"
       ? parsed.ego.proactiveTarget
       : undefined;
-    return { channel, target };
+    return {
+      channel,
+      target: channel && target ? normalizeTarget(channel, target) : target,
+    };
   } catch {
     return {};
   }
@@ -288,6 +296,18 @@ const plugin = {
       enabled: { type: "boolean", description: "Enable/disable soul service. Default: true" },
       autonomousActions: { type: "boolean", description: "Enable autonomous write operations (editing files, running commands). Read operations always allowed. Default: false" },
       thoughtFrequency: { type: "number", description: "Thought frequency multiplier. Default: 1.0. Lower = more frequent (e.g. 0.2 for testing), higher = less frequent" },
+      shadowThoughtRate: { type: "number", minimum: 0, maximum: 1, description: "Private actionless shadow thought probability. Default: 0.1" },
+      llm: {
+        type: "object",
+        additionalProperties: true,
+        properties: {
+          provider: { type: "string" },
+          model: { type: "string" },
+          apiKeyEnv: { type: "string" },
+          baseUrl: { type: "string" },
+          maxTokens: { type: "number", minimum: 32, maximum: 4096 },
+        },
+      },
     },
   },
 
@@ -313,6 +333,8 @@ const plugin = {
     const persistedEndpoint = loadPersistedProactiveEndpoint();
     let proactiveChannel = config.proactiveChannel ?? persistedEndpoint.channel;
     let proactiveTarget = config.proactiveTarget ?? persistedEndpoint.target;
+    const observedInboundChannels = new Set<string>();
+    if (proactiveChannel) observedInboundChannels.add(proactiveChannel);
 
     // --- Service singleton: only create ThoughtService ONCE ---
     // The gateway may call register() multiple times (e.g. for different agent
@@ -340,6 +362,9 @@ const plugin = {
         if (detected) {
           proactiveChannel ??= detected.channel;
           proactiveTarget ??= detected.target;
+          if (proactiveChannel && proactiveTarget) {
+            proactiveTarget = normalizeTarget(proactiveChannel, proactiveTarget);
+          }
           if (proactiveChannel && proactiveTarget) {
             log.info(`Proactive messaging: auto-detected ${proactiveChannel}/${proactiveTarget}`);
             void updateEgoStore(resolveEgoStorePath(), (ego) => {
@@ -382,6 +407,7 @@ const plugin = {
         onThought: createSoulActionHandler(),
         workspaceFiles,
         thoughtFrequency: config.thoughtFrequency ?? 1.0,
+        shadowThoughtRate: config.shadowThoughtRate ?? 0.1,
       });
 
       api.registerService({
@@ -434,39 +460,54 @@ const plugin = {
         typeof _ctx === "object" && _ctx !== null && "channelId" in _ctx
           ? String((_ctx as { channelId?: string }).channelId ?? "")
           : "";
+      const messageId =
+        typeof _event === "object" && _event !== null && "messageId" in _event
+          ? String((_event as { messageId?: string }).messageId ?? "")
+          : "";
+      const conversationId =
+        typeof _ctx === "object" && _ctx !== null && "conversationId" in _ctx
+          ? String((_ctx as { conversationId?: string }).conversationId ?? "")
+          : "";
 
       // Unconditional diagnostic — fires regardless of service state
       log.info(`message_received hook fired: text=${text.length} chars, from=${from || "(none)"}, channel=${channelId || "(none)"}, running=${thoughtService?.isRunning() ?? "no service"}`);
 
       const service = thoughtService;
-      if (!service?.isRunning()) return;
+      if (!service) return;
+
+      if (channelId) observedInboundChannels.add(channelId);
 
       try {
         // Auto-learn proactive channel/target from first inbound message
         if (from && channelId && !proactiveTarget) {
           if (!proactiveChannel) proactiveChannel = channelId;
-          proactiveTarget = from;
-          service.updateProactiveTarget(channelId, from);
+          proactiveTarget = normalizeTarget(channelId, from);
+          service.updateProactiveTarget(channelId, proactiveTarget);
           await updateEgoStore(resolveEgoStorePath(), (ego) => {
             ego.proactiveChannel = proactiveChannel ?? channelId;
-            ego.proactiveTarget = from;
+            ego.proactiveTarget = proactiveTarget ?? null;
             return ego;
           });
-          log.info(`Proactive target auto-learned from first message: ${channelId}/${from}`);
+          log.info(`Proactive target auto-learned from first message: ${channelId}/${proactiveTarget}`);
         } else if (from && channelId) {
           const endpoint = service.getProactiveEndpoint();
+          const normalizedEndpointTarget = endpoint.channel && endpoint.target
+            ? normalizeTarget(endpoint.channel, endpoint.target)
+            : endpoint.target;
           if (endpoint.channel !== channelId || endpoint.target !== from) {
             await updateEgoStore(resolveEgoStorePath(), (ego) => {
               ego.proactiveChannel = endpoint.channel ?? proactiveChannel ?? channelId;
-              ego.proactiveTarget = endpoint.target ?? proactiveTarget ?? from;
+              ego.proactiveTarget = normalizedEndpointTarget ?? proactiveTarget ?? normalizeTarget(channelId, from);
               return ego;
             });
           }
         }
 
         // Abort any in-progress thought — user interaction takes priority
-        service.abortCurrentThought();
-        service.resume();
+        if (service.isRunning()) {
+          service.abortCurrentThought();
+          service.resume();
+        }
 
         // Run all processing in the background so we don't block the agent
         // turn. The hook must return quickly (<1s) to avoid feishu streaming
@@ -480,15 +521,27 @@ const plugin = {
         // response LLM call for gateway/provider resources.
         if (text.length >= 15) {
           const delayMs = 2 * 60 * 1000; // 2 minutes
-          service.recordInteractionWithText({ type: "inbound", text })
+          service.recordInteractionWithText({
+            type: "inbound",
+            text,
+            messageId: messageId || undefined,
+            channel: channelId || undefined,
+            conversationId: conversationId || undefined,
+          })
             .catch((err) => log.warn(`Record interaction failed: ${String(err)}`));
           setTimeout(() => {
-            service.extractUserFacts(text)
+            service.extractUserFacts(text, messageId || undefined)
               .then(() => service.extractUserPreferences(text))
               .catch((err) => log.warn(`Background message processing failed: ${String(err)}`));
           }, delayMs);
         } else if (text.length >= 5) {
-          service.recordInteractionWithText({ type: "inbound", text })
+          service.recordInteractionWithText({
+            type: "inbound",
+            text,
+            messageId: messageId || undefined,
+            channel: channelId || undefined,
+            conversationId: conversationId || undefined,
+          })
             .catch((err) => log.warn(`Record interaction failed: ${String(err)}`));
         } else {
           service.recordInteraction({ type: "inbound" }).catch((err) =>
@@ -500,16 +553,70 @@ const plugin = {
       }
     });
 
-    api.on("message_sent", async (_event) => {
-      if (!thoughtService?.isRunning()) return;
+    const recordOutboundInteraction = async (_event: PluginEvent, _ctx?: PluginContext): Promise<void> => {
+      if (!thoughtService) return;
       try {
-        await thoughtService.recordInteraction({ type: "outbound" });
+        const text = typeof _event?.content === "string" ? _event.content : "";
+        const messageId = typeof _event?.messageId === "string" ? _event.messageId : undefined;
+        const channel = typeof _ctx?.channelId === "string" ? _ctx.channelId : undefined;
+        const conversationId = typeof _ctx?.conversationId === "string" ? _ctx.conversationId : undefined;
+        if (!channel || !observedInboundChannels.has(channel)) return;
+        if (text.length >= 5) {
+          await thoughtService.recordInteractionWithText({
+            type: "outbound",
+            text,
+            messageId,
+            channel,
+            conversationId,
+          });
+        } else {
+          await thoughtService.recordInteraction({ type: "outbound" });
+        }
       } catch (err) {
-        log.warn(`message_sent hook failed: ${String(err)}`);
+        log.warn(`outbound message hook failed: ${String(err)}`);
       }
+    };
+
+    // Some channel adapters (including Feishu streaming replies) emit
+    // message_sending but not message_sent. Register both and rely on
+    // message provenance/content idempotency to avoid duplicate memories.
+    api.on("message_sending", recordOutboundInteraction);
+    api.on("message_sent", recordOutboundInteraction);
+
+    // Some streaming adapters bypass the generic outbound lifecycle. The
+    // synchronous transcript-write hook is not a raw-conversation typed hook,
+    // so non-bundled plugins do not need allowConversationAccess. Restrict it
+    // to channel-backed assistant sessions: internal Soul/shadow model runs
+    // have no channel segment and remain private.
+    api.on("before_message_write", (_event, _ctx) => {
+      const message = _event?.message;
+      if (!thoughtService || !message || message.role !== "assistant") return;
+      const sessionKey = typeof _event?.sessionKey === "string"
+        ? _event.sessionKey
+        : typeof _ctx?.sessionKey === "string" ? _ctx.sessionKey : "";
+      const parts = sessionKey.split(":");
+      const channel = parts[0] === "agent" && parts.length >= 4 ? parts[2] : undefined;
+      if (!channel || !observedInboundChannels.has(channel)) return;
+      const content = message.content;
+      const text = typeof content === "string"
+        ? content
+        : Array.isArray(content)
+          ? content.filter((part: unknown): part is { type: string; text: string } =>
+            !!part && typeof part === "object"
+            && (part as { type?: unknown }).type === "text"
+            && typeof (part as { text?: unknown }).text === "string",
+          ).map((part: { text: string }) => part.text).join("\n")
+          : "";
+      if (text.trim().length < 5) return;
+      void thoughtService.recordInteractionWithText({
+        type: "outbound",
+        text,
+        channel,
+        conversationId: sessionKey,
+      }).catch((err) => log.warn(`before_message_write outbound capture failed: ${String(err)}`));
     });
 
-    log.debug("Soul plugin registered (hooks: before_prompt_build, message_received, message_sent)");
+    log.debug("Soul plugin registered (hooks: before_prompt_build, message_received, before_message_write, message_sending, message_sent)");
   },
 };
 

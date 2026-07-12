@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+### Changes
+
+- **Add Thought Pool v3 reality constraints**: Resolution tombstones persist closed states, superseded stateful facts are excluded from current context, and contradictory private/shadow premises are rejected before incubation.
+- **Make thought maturity evidence-based**: Only semantically related user/tool/web evidence creates distinct activations; repeated model guesses no longer mature themselves.
+- **Add continuous mental context and natural silence**: Foreground, cognitive residue, background concerns, environmental changes, and rare associative echoes guide generation, while `NO_THOUGHT` is tracked as a valid outcome.
+- **Bias spontaneous thought toward continuity**: Recent related memories are the default source and distant-memory association becomes an exceptional lane instead of the dominant mechanism.
+- **Revalidate legacy Thought Pool evidence on startup**: Existing maturity is recomputed from semantically related inbound/user/tool/web memories, demoting candidates that matured through model repetition or unrelated source IDs.
+- **Allow silence after repetitive questioning**: A third consecutive question/speculation is withheld as natural silence instead of adding another interrogative seed.
+- **Reject permission-menu proactive messages**: Generated outreach such as “先看 A 还是做 B” is blocked even when it contains project keywords that previously looked concrete.
+- **Route local evidence questions to local analysis**: Backtest/log/script/result questions such as OOS CAGR or MaxDD no longer use `search-web` or model fallback. They route to local analysis, and if no explicit local file/path is available the task is kept internal as `local-evidence-target-missing` instead of sending an empty report.
+- **Quiet local-evidence blocked state**: After a `local-evidence-target-missing` result, Soul now suppresses relationship nudges, generic interest learning, content pushes, and unsupported local-metric speculation until new evidence appears. Menu-style proactive questions and speculative local-evidence fallbacks are rejected by the outgoing message quality gate.
+- **Tighten naturalness metrics**: Cross-topic association now requires genuinely divergent grounded activations, useful surprise requires independent evidence, and specificity requires concrete identifiers rather than arbitrary prose.
+
+- **Add durable Thought Cycle Journal**: Eligible cycles now append context, candidates, selection, outcome, thought, and diversity state to `thought-cycles.jsonl`; recent thought types, topics, and actions are restored after restart.
+- **Add Thought Laboratory**: Read-only accelerated baseline and spontaneous-path experiments produce JSONL traces, diversity metrics, source-memory analysis, and prompt-leakage indicators.
+- **Preserve bidirectional conversation history**: Outbound message text now joins inbound text in interaction Memory with channel, conversation, and message provenance.
+- **Improve remote-memory experiments**: Spontaneous sampling prioritizes unused memories across coarse topic clusters before lexical distance and always remains actionless.
+- **Add private shadow emergence and Thought Pool**: Low-frequency cross-memory associations now incubate in `thought-pool.json` with novelty, coherence, resonance, relevance, and quality scores. Shadow candidates cannot send messages or execute actions.
+- **Separate maintenance from inner thought**: Need deficits and self-improvement checks run on a dedicated maintenance path instead of appearing as user-facing thoughts or consuming thought diversity history.
+- **Reserve LLM capacity by lane**: Critical memory extraction, actions, normal thoughts, and shadow emergence have separate limits under a shared 15-minute ceiling, so frequent background thinking cannot starve useful work.
+- **Add language-independent interaction semantics**: The existing fact-extraction model call now also persists question, problem, directive, topic-shift, closure, and semantic topic labels. Opportunity detection no longer requires adding keyword tables for every human language.
+- **Use structured shadow-thought assessment**: Cognitive moves and quality flags come from model-returned structured semantics; Unicode tokenization supports accented Latin, Cyrillic, Greek, and other scripts.
+
+### Fixes
+
+- **Deduplicate interaction hook delivery**: Repeated inbound/outbound events are ignored by message provenance, with a short content-based fallback when a channel has no message ID.
+- **Keep outbound tone from changing user sentiment**: Soul's own messages no longer influence average user sentiment or personality inference.
+- **Bound Thought Lab generations**: Lab model calls default to 192 output tokens and support `--max-tokens`; existing JSONL runs can be reanalyzed with `--input` without new model calls.
+- **Create Lab output directories automatically**: Nested `--output` paths no longer fail after completing a run.
+- **Capture outbound text before delivery**: Soul listens to both `message_sending` and `message_sent`, with idempotent storage for OpenClaw versions that emit both hooks.
+- **Capture streaming assistant replies**: Channel-backed `before_message_write` records normal replies when an adapter bypasses outbound delivery hooks, while internal and shadow model sessions stay private.
+- **Require evidence for proactive claims**: Proactive research and content pushes no longer fall back to ungrounded model knowledge when search is unavailable or empty.
+- **Stop reviving superseded questions**: Conversation replay treats only the latest user turn as potentially unanswered and honors language-independent closure/topic-shift labels.
+- **Suppress repeated opportunities at the source**: A candidate that generates a repeated thought is muted for 30 minutes instead of being selected on every retry.
+- **Avoid privileged conversation hooks for streaming capture**: Assistant transcript writes are captured through channel-backed `before_message_write`; private internal model sessions are ignored and non-bundled installs no longer require `allowConversationAccess`.
+- **Quarantine unverified legacy learning**: Learning memories now carry web/user/tool/model evidence provenance. Legacy entries without provenance and model-only learnings cannot resurface as factual thoughts.
+- **Stop mechanical fallback under model pressure**: When the configured thought model or thought lane is unavailable, the cycle backs off instead of emitting generic structured templates.
+- **Add persistent family cooldowns**: Bonding, generic system-goal, and generic content-push opportunity families receive multi-hour cooldowns restored from the Thought Journal after restart.
+- **Restrict transcript capture to verified messaging channels**: `before_message_write` records assistant output only after that channel has delivered a real inbound message (or is the persisted proactive channel), preventing OpenAI-compatible internal, adjacent-idea, and shadow generations from entering conversation memory.
+- **Clean leaked internal transcripts on startup**: A safe migration removes prior `agent:*:openai:*` outbound interactions while preserving real Feishu/Telegram/Discord/etc. replies.
+- **Bound thought context to the current conversation window**: A semantic topic shift/closure creates a hard boundary; otherwise a two-hour gap starts a new window. Old corrected topics no longer re-enter thought and adjacent prompts merely because they remain in the last-five message cache.
+- **Add distinct-cause Thought Pool incubation**: Candidate maturity grows only when a similar thought returns through a new source-memory/topic fingerprint; same-cause repetition no longer manufactures maturity.
+- **Add private Attention Gate**: Clean candidates with at least three distinct activations, maturity >= 0.4, coherence >= 0.65, and attention >= 0.65 can enter the Thought Journal as actionless `reflect-on-memory` thoughts. The gate never calls handlers, messaging, or action execution.
+- **Persist Thought Pool evaluation metrics**: Version 2 pool snapshots include lifecycle states, activation rate, cognitive moves, association/source diversity, source-memory age buckets, useful-surprise and nonsense proxies, and quality-leakage rates. Version 1 pools migrate in place without candidate loss.
+
 ## 2.5.0 (2026-05-16)
 
 ### Changes

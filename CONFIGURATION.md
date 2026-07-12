@@ -27,11 +27,11 @@ Whether Soul can edit files and run shell commands on its own.
 | **Default** | `1.0` |
 | **Command** | `openclaw config set plugins.entries.soul.config.thoughtFrequency 0.5` |
 
-Multiplier for how often Soul generates thoughts and sends messages. Affects all intervals and cooldowns proportionally.
+Multiplier for how often Soul generates thoughts and sends messages. Values below `0.5` enter observation-test mode: thought budgets are higher, proactive outreach cooldowns are minutes rather than hours, and startup greetings can repeat after about 30 minutes.
 
 | Value | Behavior |
 |-------|----------|
-| `0.2` | Testing — thoughts every ~1 min, messages frequently |
+| `0.2` | Testing — thoughts every ~1 min, proactive messages can recur after short cooldowns |
 | `0.5` | Chatty — 2x more active than default |
 | `1.0` | Default — balanced (8-12 min active, 20-45 min away) |
 | `2.0` | Quiet — 2x less frequent |
@@ -61,6 +61,16 @@ These options have good defaults and rarely need changing. Set them only if you 
 | **Command** | `openclaw config set plugins.entries.soul.config.checkIntervalMs 30000` |
 
 How often (in milliseconds) Soul checks whether to generate a new thought. This is the base interval — Soul adjusts it dynamically based on your engagement level (more frequent during active conversations, less when you're away). The `thoughtFrequency` multiplier also scales this value.
+
+### `shadowThoughtRate`
+
+| | |
+|---|---|
+| **Type** | `number` between `0` and `1` |
+| **Default** | `0.1` |
+| **Command** | `openclaw config set plugins.entries.soul.config.shadowThoughtRate 0.1` |
+
+Probability of attempting a private, spontaneous association when its five-minute eligibility window opens. Most attempts follow recent mental context; roughly 30% of accepted shadow attempts sample a distant memory pair. These candidates are stored in `~/.openclaw/soul/thought-pool.json` and can never directly execute actions. Maturity requires semantically relevant independent user/tool/web evidence; model repetition does not count. Set to `0` to disable this path (ordinary non-operational thoughts can still enter the pool).
 
 ### `proactiveMessaging`
 
@@ -117,6 +127,7 @@ openclaw config set plugins.entries.soul.config.llm.provider openai
 openclaw config set plugins.entries.soul.config.llm.model gpt-4o
 openclaw config set plugins.entries.soul.config.llm.apiKeyEnv OPENAI_API_KEY
 openclaw config set plugins.entries.soul.config.llm.baseUrl https://api.openai.com/v1
+openclaw config set plugins.entries.soul.config.llm.maxTokens 1024
 ```
 
 | Field | Description |
@@ -125,3 +136,6 @@ openclaw config set plugins.entries.soul.config.llm.baseUrl https://api.openai.c
 | `model` | Model ID (e.g., gpt-4o, claude-sonnet-4-6) |
 | `apiKeyEnv` | Environment variable name containing the API key |
 | `baseUrl` | Custom API base URL (optional) |
+| `maxTokens` | Maximum generated tokens per call, 32-4096 (default: 1024) |
+
+`maxTokens` applies to all Soul model calls, including analysis actions. Keep the production default unless every Soul task is intentionally short. Thought Laboratory uses a separate default of 192 tokens.

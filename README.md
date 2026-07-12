@@ -52,6 +52,7 @@ Soul runs a background thought service that generates thoughts based on:
 - **Problem detection** — When you discuss bugs, errors, or optimizations, Soul autonomously investigates
 - **User interests** — Extracts topics from conversations and proactively learns about them
 - **Emotional needs** — Five core needs (survival, connection, growth, meaning, security) that drive behavior
+- **Private associations** — Occasionally connects distant memories and incubates the result without immediately turning it into a task or message
 
 Thought frequency is **adaptive**, not mechanical: 8-12 min during active conversations, 20-45 min when you're away.
 
@@ -86,6 +87,13 @@ Soul remembers your conversations, preferences, and knowledge:
 - **Knowledge store** from web search and self-reflection
 - **User profile** built from facts, preferences, and conversation history
 - **Memory association graph** — memories are linked and recalled contextually
+- **Evidence-aware learning** — web, user, tool, and model provenance are distinguished; unverified or model-only claims cannot resurface as factual proactive thoughts
+
+### Language Independence
+
+Soul uses the configured model to classify interaction meaning and semantic topics regardless of the language used by the user. Fixed English/Chinese keyword rules remain only as a conservative no-model fallback. Unicode-aware association works across accented Latin, Cyrillic, Greek, CJK, and other writing systems, so supporting another language does not require adding a new keyword dictionary.
+
+Thought context follows the current conversation window rather than flattening unrelated historical turns together. Explicit semantic redirects and closures form hard boundaries; a long conversational gap forms a new window automatically.
 
 ## Quick Start
 
@@ -148,7 +156,7 @@ Just start chatting. Soul begins thinking and building a profile immediately.
 | Hook | What Soul Does |
 |------|---------------|
 | `message_received` | Records interaction, detects language, extracts user facts |
-| `message_sent` | Tracks engagement, updates behavior log |
+| `message_sending` / `message_sent` | Stores outbound conversation memory idempotently across OpenClaw hook versions |
 | `before_prompt_build` | Injects soul context (needs, memories, knowledge, personality) |
 
 ### Self-Improvement Loop
@@ -172,6 +180,22 @@ This creates a closed loop: **observe → analyze → fix → verify → report*
 4. **Action execution** — learn, search, message, analyze, or self-improve
 5. **Behavior learning** — Tracks outcomes and adjusts future behavior
 
+Each eligible thought cycle is appended to `~/.openclaw/soul/thought-cycles.jsonl`, including its context, candidates, selection, result, and recent diversity state. On restart, Soul restores recent thought types, topics, and actions from this journal instead of forgetting its diversity history.
+
+Need deficits, goal percentages, and self-improvement checks stay in background maintenance rather than masquerading as thoughts. Both ordinary non-operational reflections and spontaneous associations enter `~/.openclaw/soul/thought-pool.json` as private seeds instead of immediately learning, searching, or messaging. Most spontaneous associations continue the recent foreground or cognitive residue; only a small minority use a distant-memory bridge.
+
+Thought Pool candidates mature only when a similar thought reappears through semantically related, independently grounded user/tool/web evidence. Model-generated guesses and changed memory IDs do not count as new evidence. Version 3 also persists resolution tombstones: a thought whose premise conflicts with a currently resolved state is rejected before incubation, and superseded facts are excluded from current-context prompts and opportunity detection. A candidate needs at least three distinct activations, sufficient coherence/maturity, no quality flags, and an attention score of at least 0.65 before the private Attention Gate can notice it. Attention remains private and actionless. After a separate pause, a mature, coherent, user-relevant candidate gets one independent expression review through the normal value, factuality, deduplication, cooldown, and delivery gates; it may still remain unspoken.
+
+Quality flags describe the recent trajectory rather than permanently poisoning a candidate: two clean reactivations clear old task-pressure/truncation flags, while meta-framing needs three. In observation-test mode, the same stable stimulus waits five minutes before another model generation (fifteen minutes normally); this interval is restored from the pool after restart and is cleared early by a new inbound interaction.
+
+Attention remains private: the candidate is marked `attended` and journaled as an actionless `reflect-on-memory` thought, but it bypasses the normal thought handler, message sender, and action executor. `thought-pool.json` includes aggregate metrics for activation rate, maturity, attention, cognitive moves, remote association, source-memory age, natural silence, resolved-topic recurrence, contradicted premises, useful-surprise proxy, and low-coherence/task/meta leakage. `NO_THOUGHT` is a valid observation outcome rather than a generation failure.
+
+On startup, legacy candidates are revalidated against the current grounded memories. Historical maturity built from unrelated memory IDs or model-generated repetition is demoted before Attention or Expression review. During normal running, a third consecutive question/speculation becomes a measured silence, and proactive permission/menu questions are rejected unless the message contains an actual finding rather than a choice of future work.
+
+Local project evidence is treated differently from general knowledge. Questions about backtests, OOS CAGR, MaxDD, logs, scripts, deployment, or local result versions are routed to local analysis rather than `search-web`; if Soul has no explicit local file or path to inspect, it records an internal `local-evidence-target-missing` result and does not send a fabricated answer.
+
+Model usage is divided into critical-memory, action, normal-thought, and shadow lanes under a shared rolling budget. This reserves capacity for conversation understanding and useful actions even when background thought is active. Low `thoughtFrequency` values are treated as observation-test mode and use much looser budgets/cooldowns so proactive behavior can be tested without waiting hours.
+
 ## Configuration
 
 All options have sensible defaults. Only configure what you need.
@@ -182,7 +206,7 @@ All options have sensible defaults. Only configure what you need.
 | `thoughtFrequency` | `1.0` | `openclaw config set plugins.entries.soul.config.thoughtFrequency 0.5` |
 
 - **`autonomousActions`** — Allow Soul to edit files and run commands. When `false`, Soul can still read files and run diagnostics, but cannot modify anything. When `true`, Soul can fix bugs, edit its own code, and run any command.
-- **`thoughtFrequency`** — How often Soul thinks and messages. `0.2` for testing (very chatty), `1.0` for default, `2.0` for quiet.
+- **`thoughtFrequency`** — How often Soul thinks and messages. `0.2`-`0.4` for testing and faster proactive outreach, `1.0` for default, `2.0` for quiet.
 
 Soul extracts project paths from user requests such as "optimize the project under `/path/to/project`". If a path cannot be read directly, Soul also tries common cross-platform mappings such as Git Bash `/c/work/project`, WSL `/mnt/c/work/project`, and Windows `C:\work\project`.
 
@@ -213,6 +237,10 @@ Any OpenAI-compatible or Anthropic API: Claude, GPT-4o, DeepSeek, Zhipu, Minimax
 | `action-executor.ts` | Executes thought actions (learn, search, message, reflect) |
 | `autonomous-actions.ts` | Autonomous executors (analyze-problem, run-agent-task, report-findings, observe-and-improve) |
 | `thought-service.ts` | Core thought generation & adaptive scheduling |
+| `thought-journal.ts` | Durable thought-cycle trace and restart diversity recovery |
+| `thought-lab.ts` | Read-only accelerated baseline and A/B experiments |
+| `thought-emergence.ts` | Shared remote-memory selection, prompts, and quality classification |
+| `thought-pool.ts` | Persistent private candidate incubation and attention scoring |
 | `behavior-log.ts` | Tracks action outcomes & adjusts probabilities |
 | `ego-store.ts` | Ego state persistence (JSON) |
 | `knowledge-store.ts` | Knowledge persistence & search |
@@ -222,11 +250,43 @@ Any OpenAI-compatible or Anthropic API: Claude, GPT-4o, DeepSeek, Zhipu, Minimax
 | `soul-llm.ts` | LLM provider abstraction (gateway + direct fallback) |
 | `soul-search.ts` | Multi-provider web search |
 
+## Thought Laboratory
+
+Thought Laboratory simulates many thought cycles against one read-only Ego snapshot. It never updates the Ego store, sends messages, or executes actions. Each run is written to JSONL and aggregate baseline metrics are written to a sibling `summary.json` file.
+
+Run the current detector pipeline without model calls:
+
+```bash
+npm run thought-lab -- --store /path/to/ego.json --runs 200 --mode baseline
+```
+
+Run the minimal 80/20 experiment (80% current pipeline, 20% remote-memory spontaneous path):
+
+```bash
+npm run thought-lab -- \
+  --store /path/to/ego.json \
+  --runs 200 \
+  --mode experiment \
+  --provider openai \
+  --model your-model-name
+```
+
+The provider API key is resolved from its normal environment variable. Use `--api-key-env`, `--base-url`, `--spontaneous-rate`, `--seed`, `--output`, or `--max-tokens` to override defaults. Lab model calls default to 192 output tokens. Model-backed runs make one generation call per cycle, so start with a small run before a 200-cycle comparison.
+
+Recalculate current metrics from an existing JSONL without making model calls:
+
+```bash
+npm run thought-lab -- --input /path/to/existing-run.jsonl
+```
+
+Reported metrics include opportunity, thought, action and cognitive-move distributions; no-op and repetition rates; lexical semantic diversity; source-memory age/diversity; cross-topic association rate; and explicit meta-framing, task-pressure, and truncation leakage rates. Remote pairs are chosen across coarse topic clusters before lexical distance, so two differently worded trading memories are no longer mislabeled as cross-topic. The spontaneous path records exact source memories; baseline records label source-memory matches as lexical inference because the production detector does not preserve provenance IDs. “Useful surprise” and “nonsense” remain explicit blind-review measures rather than pretending a heuristic can judge them.
+
 ## Development
 
 ```bash
-pnpm install   # Zero runtime deps — uses only Node.js built-ins
-pnpm build
+npm install    # Zero runtime deps — uses only Node.js built-ins
+npm run build
+npm test
 ```
 
 ## License

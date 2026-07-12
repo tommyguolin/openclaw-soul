@@ -22,6 +22,24 @@
       "thoughtFrequency": {
         "type": "number",
         "description": "Thought frequency multiplier. Default: 1.0. Lower = more frequent (e.g. 0.2 for testing)"
+      },
+      "shadowThoughtRate": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "description": "Private actionless shadow thought probability per eligible interval. Default: 0.1"
+      },
+      "llm": {
+        "type": "object",
+        "additionalProperties": true,
+        "description": "Optional Soul LLM override",
+        "properties": {
+          "provider": { "type": "string" },
+          "model": { "type": "string" },
+          "apiKeyEnv": { "type": "string" },
+          "baseUrl": { "type": "string" },
+          "maxTokens": { "type": "number", "minimum": 32, "maximum": 4096 }
+        }
       }
     }
   }

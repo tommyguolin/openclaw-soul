@@ -198,6 +198,10 @@ export function createDefaultEgoState(): EgoState {
     userLanguage: null,
     recentUserMessages: [],
     activeTasks: [],
+    mentalContext: {
+      foreground: [], residue: [], backgroundConcerns: [],
+      environmentalChanges: [], associativeEcho: [], updatedAt: Date.now(),
+    },
   };
 }
 
@@ -211,6 +215,9 @@ function mergeWithDefaultsV2(loaded: Partial<EgoState>): EgoState {
         result.needs[key] = { ...defaults.needs[key], ...loaded.needs[key] };
       }
     }
+  }
+  if (loaded.mentalContext) {
+    result.mentalContext = { ...defaults.mentalContext, ...loaded.mentalContext };
   }
 
   for (const key of [
