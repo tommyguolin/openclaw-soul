@@ -91,35 +91,6 @@ function successfulMessageSends(messages: unknown[]): CapturedMessageSend[] {
   return sends;
 }
 
-function finalAssistantText(messages: unknown[]): string | undefined {
-  const records = messages.filter((message): message is Record<string, unknown> =>
-    !!message && typeof message === "object" && !Array.isArray(message));
-  let lastUserIndex = -1;
-  for (let index = records.length - 1; index >= 0; index -= 1) {
-    if (records[index].role === "user") {
-      lastUserIndex = index;
-      break;
-    }
-  }
-  for (let index = records.length - 1; index > lastUserIndex; index -= 1) {
-    const message = records[index];
-    if (message.role !== "assistant") continue;
-    if (typeof message.content === "string" && message.content.trim().length >= 5) {
-      return message.content.trim();
-    }
-    if (!Array.isArray(message.content)) continue;
-    const text = message.content
-      .filter((part): part is Record<string, unknown> =>
-        !!part && typeof part === "object" && !Array.isArray(part) && part.type === "text")
-      .map((part) => typeof part.text === "string" ? part.text : "")
-      .filter(Boolean)
-      .join("\n")
-      .trim();
-    if (text.length >= 5) return text;
-  }
-  return undefined;
-}
-
 /**
  * Build a sendMessage function that delivers a proactive message directly
  * to a channel via the gateway's /tools/invoke HTTP endpoint.
@@ -782,54 +753,18 @@ const plugin = {
         : channelFromSessionKey(sessionKey);
       if (!channel || !observedInboundChannels.has(channel)) return;
       const sends = successfulMessageSends(_event.messages);
-      const fallbackText = sends.length === 0 ? finalAssistantText(_event.messages) : undefined;
-      const captures = sends.length > 0 ? sends
-        : fallbackText ? [{ text: fallbackText, toolCallId: undefined }] : [];
-      const writes = captures.map((send) =>
+      const writes = sends.map((send) =>
         persistOutboundInteraction({
           text: send.text,
-          messageId: send.toolCallId ? `tool:${send.toolCallId}`
-            : typeof _event?.runId === "string" ? `run:${_event.runId}` : undefined,
+          messageId: send.toolCallId ? `tool:${send.toolCallId}` : undefined,
           channel,
           conversationId: sessionKey,
-          source: sends.length > 0 ? "agent_end(message.send)" : "agent_end(final assistant)",
+          source: "agent_end(message.send)",
         }));
       if (writes.length > 0) return Promise.all(writes).then(() => undefined);
     });
 
-    // Some streaming adapters bypass the generic outbound lifecycle. The
-    // synchronous transcript-write hook is not a raw-conversation typed hook,
-    // so non-bundled plugins do not need allowConversationAccess. Restrict it
-    // to channel-backed assistant sessions: internal Soul/shadow model runs
-    // have no channel segment and remain private.
-    api.on("before_message_write", (_event, _ctx) => {
-      const message = _event?.message;
-      if (!thoughtService || !message || message.role !== "assistant") return;
-      const sessionKey = typeof _event?.sessionKey === "string"
-        ? _event.sessionKey
-        : typeof _ctx?.sessionKey === "string" ? _ctx.sessionKey : "";
-      const channel = channelFromSessionKey(sessionKey);
-      if (!channel || !observedInboundChannels.has(channel)) return;
-      const content = message.content;
-      const text = typeof content === "string"
-        ? content
-        : Array.isArray(content)
-          ? content.filter((part: unknown): part is { type: string; text: string } =>
-            !!part && typeof part === "object"
-            && (part as { type?: unknown }).type === "text"
-            && typeof (part as { text?: unknown }).text === "string",
-          ).map((part: { text: string }) => part.text).join("\n")
-          : "";
-      if (text.trim().length < 5) return;
-      void persistOutboundInteraction({
-        text,
-        channel,
-        conversationId: sessionKey,
-        source: "before_message_write",
-      }).catch((err) => log.warn(`before_message_write outbound capture failed: ${String(err)}`));
-    });
-
-    log.debug("Soul plugin registered (hooks: before_prompt_build, message_received, before_message_write, reply_payload_sending, message_sending, message_sent, after_tool_call, agent_end)");
+    log.debug("Soul plugin registered (hooks: before_prompt_build, message_received, reply_payload_sending, message_sending, message_sent, after_tool_call, agent_end)");
   },
 };
 

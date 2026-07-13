@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-test("reply delivery captures Codex/streamed assistant replies once and ignores private model runs", async () => {
+test("reply delivery captures confirmed assistant replies once and ignores private model runs", async () => {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-plugin-hooks-"));
   const previousStateDir = process.env.OPENCLAW_STATE_DIR;
   process.env.OPENCLAW_STATE_DIR = directory;
@@ -19,18 +19,14 @@ test("reply delivery captures Codex/streamed assistant replies once and ignores 
       },
       registerService() {},
     });
-    const write = handlers.get("before_message_write");
     const replyPayload = handlers.get("reply_payload_sending");
     const afterToolCall = handlers.get("after_tool_call");
     const agentEnd = handlers.get("agent_end");
     const received = handlers.get("message_received");
-    assert(write);
     assert(replyPayload);
     assert(afterToolCall);
     assert(agentEnd);
     assert(received);
-    await write({ message: { role: "assistant", content: "private shadow output must stay private" }, sessionKey: "agent:soul" }, {});
-    await write({ message: { role: "assistant", content: "internal OpenAI output" }, sessionKey: "agent:main:openai:internal-run" }, {});
     await received({ content: "Guten Tag", from: "user", messageId: "in-1" }, {
       channelId: "feishu",
       conversationId: "chat-1",
@@ -70,14 +66,13 @@ test("reply delivery captures Codex/streamed assistant replies once and ignores 
         { role: "toolResult", toolName: "message", toolCallId: "tool-4", isError: false },
       ],
     }, { channelId: "feishu", sessionKey: "agent:main:feishu:direct:user" });
-    // Codex app-server may expose only the final assistant text in agent_end;
-    // message.send/toolResult are mirrored into the transcript afterwards.
+    // A normal final is not proof of delivery in message_tool_only mode and
+    // must not be recorded as an outbound interaction.
     await agentEnd({
-      runId: "run-fallback",
       success: true,
       messages: [
         { role: "user", content: [{ type: "text", text: "Guten Tag" }] },
-        { role: "assistant", content: [{ type: "text", text: "Dies ist die normale gestreamte Antwort des Assistenten." }] },
+        { role: "assistant", content: [{ type: "text", text: "Private final without confirmed delivery must stay private." }] },
       ],
     }, { channelId: "feishu", sessionKey: "agent:main:feishu:direct:user" });
     await agentEnd({
@@ -115,13 +110,6 @@ test("reply delivery captures Codex/streamed assistant replies once and ignores 
       sessionKey: "agent:main:feishu:direct:user",
       runId: "run-1",
     }, { channelId: "feishu", conversationId: "chat-1" });
-    // A compatible transcript hook may observe the same final reply. Content
-    // deduplication must keep one outbound memory across both lifecycle paths.
-    await write({
-      message: { role: "assistant", content: [{ type: "text", text: "Dies ist die normale gestreamte Antwort des Assistenten." }] },
-      sessionKey: "agent:main:feishu:direct:user",
-    }, {});
-
     for (let attempt = 0; attempt < 50; attempt += 1) {
       if (fs.existsSync(egoFile) && (await fs.promises.readFile(egoFile, "utf8")).includes("normale gestreamte")) break;
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -134,6 +122,7 @@ test("reply delivery captures Codex/streamed assistant replies once and ignores 
     assert.equal(stored.ego.memories.some((memory: any) => memory.content.includes("failed send")), false);
     assert.equal(stored.ego.memories.some((memory: any) => memory.content.includes("An edit")), false);
     assert.equal(stored.ego.memories.some((memory: any) => memory.content.includes("Failed nested")), false);
+    assert.equal(stored.ego.memories.some((memory: any) => memory.content.includes("Private final")), false);
   } finally {
     if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
     else process.env.OPENCLAW_STATE_DIR = previousStateDir;
