@@ -14,6 +14,15 @@ export type SoulLLMConfig = {
 
 export type LLMGenerator = (prompt: string) => Promise<string>;
 
+function serializeGenerator(generator: LLMGenerator): LLMGenerator {
+  let tail: Promise<void> = Promise.resolve();
+  return (prompt: string) => {
+    const run = tail.then(() => generator(prompt));
+    tail = run.then(() => undefined, () => undefined);
+    return run;
+  };
+}
+
 function isProviderBackoffError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /rate limit|cooldown|No available auth profile|too many requests|429|suspending lanes/i.test(msg);
@@ -313,7 +322,7 @@ export async function createSoulLLMGenerator(
     const fallback = await buildDirectFallback(provider, model, config, openclawConfig);
 
     // Gateway expects model="openclaw" — it routes to the configured provider automatically
-    return async (prompt: string): Promise<string> => {
+    return serializeGenerator(async (prompt: string): Promise<string> => {
       try {
         return await callViaGateway(gatewayUrl, gatewayAuthToken, "openclaw", prompt, maxTokens);
       } catch (err) {
@@ -329,14 +338,14 @@ export async function createSoulLLMGenerator(
         }
         throw err;
       }
-    };
+    });
   }
 
   // --- Strategy 2: Direct provider API (no gateway available) ---
   const direct = await buildDirectFallback(provider, model, config, openclawConfig);
   if (direct) {
     log.info(`Soul LLM via direct provider API: ${provider}/${model}`);
-    return direct;
+    return serializeGenerator(direct);
   }
 
   log.info(`No LLM configured for soul — will use rule-based thought generation only`);

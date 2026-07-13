@@ -68,7 +68,7 @@ import {
   resolveThoughtJournalPath,
   type ThoughtCycleOutcome,
 } from "./thought-journal.js";
-import { ThoughtPool, resolveThoughtPoolPath } from "./thought-pool.js";
+import { ThoughtPool, inferEpistemicNature, resolveThoughtPoolPath, resolveThoughtPoolV31ShadowPath } from "./thought-pool.js";
 import {
   buildSpontaneousPrompt,
   classifyCognitiveMove,
@@ -80,9 +80,24 @@ import {
   selectRemoteMemoryPair,
   selectContextualMemoryPair,
 } from "./thought-emergence.js";
+import { ActivationStore, resolveActivationStatePath } from "./cognition/activation-store.js";
+import { CognitiveJournal, resolveCognitiveJournalPath } from "./cognition/cognitive-journal.js";
+import { CognitionRunner } from "./cognition/runner.js";
+import type { CognitionMode } from "./cognition/types.js";
+import { inferCognitiveKind } from "./cognition/kind.js";
+import { emergeFromWorkspace } from "./cognition/emergence.js";
+import { IntentionStore, resolveIntentionStorePath } from "./intention/store.js";
+import { buildUserDirectiveIntention, isExplicitUserDirective } from "./intention/formation.js";
+import { ExpressionStore, resolveExpressionStorePath } from "./expression/store.js";
+import {
+  ExpressionFeedbackStore, resolveExpressionFeedbackPath,
+  type ExpressionPolicyMode,
+} from "./expression/feedback-store.js";
+import { ThoughtEpisodeStore, resolveThoughtEpisodeStorePath } from "./cognition/thought-store.js";
 
 const log = createSoulLogger("thought-service");
 type LLMBudgetLane = "critical" | "action" | "thought" | "shadow";
+const ACTIVE_CONVERSATION_QUIET_MS = 5 * 60 * 1000;
 
 function isExplicitResolution(text: string): boolean {
   return /(?:已经|早已|昨天.*(?:连上|成功)|连接成功|可以访问|能够访问|已解决|修复好了|不再有问题|authenticated|connected successfully|works now|already (?:works|connected)|resolved|fixed)/i.test(text);
@@ -298,6 +313,10 @@ export type ThoughtServiceOptions = {
   thoughtFrequency?: number;
   /** Probability of private shadow emergence when the shadow interval elapses. Default: 0.1. */
   shadowThoughtRate?: number;
+  /** Cognitive activation path. Default: legacy. */
+  cognitionMode?: CognitionMode;
+  /** Expression feedback policy. Disabled by default and independent of cognition. */
+  expressionPolicy?: ExpressionPolicyMode;
 };
 
 export class ThoughtService {
@@ -331,7 +350,15 @@ export class ThoughtService {
   private recentActionHistory: string[] = [];
   private thoughtJournal: ThoughtCycleJournal;
   private thoughtPool: ThoughtPool;
+  private cognitionShadowPool?: ThoughtPool;
   private shadowThoughtRate: number;
+  private cognitionMode: CognitionMode;
+  private cognitionRunner?: CognitionRunner;
+  private intentionStore?: IntentionStore;
+  private expressionStore?: ExpressionStore;
+  private expressionFeedbackStore?: ExpressionFeedbackStore;
+  private expressionPolicy: ExpressionPolicyMode;
+  private thoughtEpisodeStore?: ThoughtEpisodeStore;
   private lastShadowThoughtAt = 0;
   private lastPoolAttentionAt = 0;
   private noProgressActionBackoff: Record<string, { count: number; until: number }> = {};
@@ -357,7 +384,20 @@ export class ThoughtService {
     this.checkIntervalMs = options.checkIntervalMs ?? 60 * 1000;
     this.onThought = options.onThought;
     this.onMetricsUpdate = options.onMetricsUpdate;
-    this.sendMessage = options.sendMessage;
+    this.sendMessage = options.sendMessage
+      ? async (params) => {
+          await options.sendMessage!(params);
+          if (params.content.trim().length >= 5) {
+            await this.recordInteractionWithText({
+              type: "outbound",
+              text: params.content.trim(),
+              channel: params.channel ?? this.proactiveChannel,
+            });
+          } else {
+            await this.recordInteraction({ type: "outbound" });
+          }
+        }
+      : undefined;
     this.proactiveChannel = options.proactiveChannel;
     this.proactiveTarget = options.proactiveTarget;
     this.openclawConfig = options.openclawConfig;
@@ -369,6 +409,42 @@ export class ThoughtService {
     this.workspaceFiles = options.workspaceFiles ?? ["SOUL.md", "AGENTS.md", "MEMORY.md", "USER.md"];
     this.thoughtFrequency = Math.max(0.1, Math.min(5, options.thoughtFrequency ?? 1.0));
     this.shadowThoughtRate = Math.max(0, Math.min(1, options.shadowThoughtRate ?? 0.1));
+    this.cognitionMode = options.cognitionMode === "observe" || options.cognitionMode === "shadow" || options.cognitionMode === "primary"
+      ? options.cognitionMode : "legacy";
+    this.expressionPolicy = options.expressionPolicy === "observe" || options.expressionPolicy === "adaptive"
+      ? options.expressionPolicy : "legacy";
+    if (options.cognitionMode && !["legacy", "observe", "shadow", "primary"].includes(options.cognitionMode)) {
+      log.warn(`Cognition mode ${options.cognitionMode} is not implemented; falling back to legacy`);
+    }
+    if (this.cognitionMode !== "legacy") {
+      this.cognitionRunner = new CognitionRunner({
+        store: new ActivationStore(resolveActivationStatePath(this.storePath)),
+        journal: new CognitiveJournal(resolveCognitiveJournalPath(this.storePath)),
+      });
+      if (this.cognitionMode === "shadow") {
+        this.cognitionShadowPool = new ThoughtPool(resolveThoughtPoolV31ShadowPath(this.storePath));
+      }
+      if (this.cognitionMode === "primary") {
+        this.intentionStore = new IntentionStore(resolveIntentionStorePath(this.storePath));
+        this.expressionStore = new ExpressionStore(resolveExpressionStorePath(this.storePath));
+        this.thoughtEpisodeStore = new ThoughtEpisodeStore(resolveThoughtEpisodeStorePath(this.storePath));
+        if (this.expressionPolicy !== "legacy") {
+          this.expressionFeedbackStore = new ExpressionFeedbackStore(
+            resolveExpressionFeedbackPath(this.storePath), this.expressionPolicy,
+          );
+          log.info(`Expression feedback policy enabled: ${this.expressionPolicy}`);
+        }
+      }
+      log.info(this.cognitionMode === "primary"
+        ? "Cognition Primary enabled for private thoughts; operational opportunities and all safety gates remain active"
+        : this.cognitionMode === "shadow"
+          ? "Cognition Workspace Shadow enabled (private LLM journal only; no action, message, or real Thought Pool writes)"
+          : "Cognition Activation Observer enabled (no LLM, action, message, or Thought Pool writes)");
+    }
+    if (this.expressionPolicy !== "legacy" && this.cognitionMode !== "primary") {
+      log.warn(`Expression policy ${this.expressionPolicy} requires cognitionMode=primary; falling back to legacy`);
+      this.expressionPolicy = "legacy";
+    }
     if (this.thoughtFrequency !== 1.0) {
       log.info(`Thought frequency: ${this.thoughtFrequency}x (all intervals ×${this.thoughtFrequency})`);
     }
@@ -756,6 +832,9 @@ export class ThoughtService {
     };
   }): Promise<void> {
     try {
+      if (params.thought && !params.thought.cognitiveKind) {
+        params.thought.cognitiveKind = inferCognitiveKind(params.thought);
+      }
       await this.thoughtJournal.append({
         version: 1,
         cycleId: params.cycleId,
@@ -885,6 +964,17 @@ export class ThoughtService {
 
   private getOpportunityAction(opportunity: DetectedThoughtOpportunity, ego: EgoState): ActionType | undefined {
     return getActionForOpportunity(opportunity, ego).actionType ?? opportunity.suggestedAction;
+  }
+
+  private filterCognitionPrimaryOpportunities(
+    opportunities: DetectedThoughtOpportunity[],
+    ego: EgoState,
+  ): DetectedThoughtOpportunity[] {
+    if (this.cognitionMode !== "primary") return opportunities;
+    return opportunities.filter((opportunity) => {
+      const action = this.getOpportunityAction(opportunity, ego);
+      return Boolean(action && action !== "none" && action !== "self-reflect" && action !== "recall-memory");
+    });
   }
 
   private isOpportunityActionReady(opportunity: DetectedThoughtOpportunity, ego: EgoState): boolean {
@@ -1025,6 +1115,14 @@ export class ThoughtService {
       await this.applyDecay();
       await this.runExpiryIfDue();
       await this.resolveStalePendingEntries();
+      const quietRemainingMs = await this.activeConversationQuietRemainingMs();
+      if (quietRemainingMs > 0) {
+        log.debug(
+          `Soul background cycle deferred during active conversation ` +
+          `(${Math.ceil(quietRemainingMs / 1000)}s remaining)`,
+        );
+        return;
+      }
       await this.syncSelfImprovementGoal();
       await this.maybePromptForAutonomousActions();
       await this.maybeRefreshWorkspaceContext();
@@ -1034,12 +1132,118 @@ export class ThoughtService {
       if (!maintenanceRan) {
         await this.checkAndGenerateThought();
       }
-      await this.maybeGenerateShadowThought();
+      await this.runCognitionObserverIfEnabled();
+      if (this.cognitionMode !== "primary") await this.maybeGenerateShadowThought();
       await this.maybeAttendThoughtPoolCandidate();
       await this.maybeExpressMatureThought();
     } catch (err) {
       log.error("Error in thought service tick", String(err));
     }
+  }
+
+  private async runCognitionObserverIfEnabled(): Promise<void> {
+    if (!this.cognitionRunner) return;
+    try {
+      const ego = (await loadEgoStore(this.storePath)).ego;
+      const pool = await this.thoughtPool.load();
+      const cycle = await this.cognitionRunner.run(ego, {
+        resolvedTexts: pool.resolutions
+          .filter((resolution) => resolution.status === "resolved")
+          .map((resolution) => resolution.resolutionText),
+        mode: this.cognitionMode === "shadow" || this.cognitionMode === "primary" ? this.cognitionMode : "observe",
+        ...((this.cognitionMode === "shadow" || this.cognitionMode === "primary") && this.shadowLLMGenerator
+          ? { emerge: (workspace: import("./cognition/types.js").CognitiveWorkspace) =>
+            emergeFromWorkspace(workspace, this.shadowLLMGenerator!, ego.userLanguage ?? undefined) }
+          : {}),
+      });
+      if (cycle && (this.cognitionMode === "shadow" || this.cognitionMode === "primary")) {
+        const targetPool = this.cognitionMode === "primary" ? this.thoughtPool : this.cognitionShadowPool;
+        if (targetPool) await this.processCognitionWorkspaceCycle(cycle, targetPool, this.cognitionMode === "shadow");
+      }
+    } catch (err) {
+      log.warn(`Cognition observer cycle failed without affecting legacy behavior: ${String(err)}`);
+    }
+  }
+
+  private async activeConversationQuietRemainingMs(now = Date.now()): Promise<number> {
+    const ego = (await loadEgoStore(this.storePath)).ego;
+    const latestInboundAt = ego.memories.reduce((latest, memory) =>
+      memory.type === "interaction" && memory.tags.includes("inbound")
+        ? Math.max(latest, memory.timestamp)
+        : latest, 0);
+    return latestInboundAt > 0
+      ? Math.max(0, ACTIVE_CONVERSATION_QUIET_MS - (now - latestInboundAt))
+      : 0;
+  }
+
+  private async processCognitionWorkspaceCycle(
+    cycle: import("./cognition/runner.js").CognitionCycleResult,
+    targetPool: ThoughtPool,
+    experimental: boolean,
+  ): Promise<void> {
+    const emergence = cycle.record.emergence;
+    if (emergence.outcome !== "thought" || !emergence.thought) {
+      await targetPool.recordObservation(
+        emergence.outcome === "pre-generation-silence" || emergence.outcome === "model-no-thought",
+      );
+      return;
+    }
+    const contradiction = await this.thoughtPool.findContradictingResolution(emergence.thought);
+    if (contradiction) {
+      log.info(`Cognition shadow thought rejected by resolution: ${contradiction.topicKey}`);
+      await targetPool.recordObservation(true);
+      return;
+    }
+    const sourceItems = cycle.workspace.items;
+    const grounded = sourceItems.filter((item) => ["user", "tool", "web"].includes(item.trace.provenance));
+    const cognitiveMove = emergence.cognitiveMove ?? classifyCognitiveMove(emergence.thought);
+    const epistemicNature = inferEpistemicNature(emergence.thought, cognitiveMove);
+    const episode = !experimental && this.thoughtEpisodeStore
+      ? await this.thoughtEpisodeStore.integrate({
+        workspaceId: cycle.workspace.id,
+        content: emergence.thought,
+        epistemicNature,
+        causalTraceIds: sourceItems.map((item) => item.trace.id),
+        stimulusId: cycle.workspace.stimulusId,
+        evidence: sourceItems.map((item) => ({
+          sourceId: item.trace.sourceId,
+          relation: "context" as const,
+          grounded: ["user", "tool", "web"].includes(item.trace.provenance),
+          strength: item.activation,
+          observedAt: cycle.record.timestamp,
+        })),
+      })
+      : undefined;
+    const candidate = await targetPool.addCandidate({
+      content: emergence.thought,
+      sourceMemoryIds: sourceItems.map((item) => item.trace.sourceId),
+      sourceClusters: [...new Set(sourceItems.flatMap((item) => item.trace.topicClusters))],
+      sourceMemoryTimestamps: sourceItems.map((item) => item.trace.timestamp),
+      evidenceMemoryIds: grounded.map((item) => item.trace.sourceId),
+      evidenceTimestamps: grounded.map((item) => item.trace.timestamp),
+      stimulusKey: `workspace:${cycle.workspace.distribution}:${cycle.workspace.items.map((item) => item.trace.id).join(",")}`,
+      stimulusId: cycle.workspace.stimulusId,
+      originWorkspaceId: cycle.workspace.id,
+      causalTraceIds: sourceItems.map((item) => item.trace.id),
+      cognitiveMove,
+      epistemicNature,
+      thoughtEpisodeId: episode?.episode.id,
+      qualityFlags: emergence.qualityFlags ?? classifyThoughtQualityFlags(emergence.thought),
+      scores: {
+        novelty: 0.7,
+        coherence: Math.max(0.2, 0.9 - (emergence.qualityFlags?.length ?? 0) * 0.2),
+        resonance: Math.min(1, cycle.workspace.aggregateActivation),
+        userRelevance: sourceItems.some((item) => item.trace.provenance === "user") ? 0.75 : 0.4,
+      },
+    });
+    await targetPool.recordObservation(false);
+    const eligible = experimental ? (await targetPool.getAttentionCandidatesV31(0.65, 1))[0] : undefined;
+    if (eligible) await targetPool.markAttended(eligible.id);
+    log.info(
+      `Cognition ${experimental ? "shadow" : "primary"} candidate ${candidate.merged ? "reactivated" : "created"}: `
+      + `id=${candidate.candidate.id}, nature=${candidate.candidate.epistemicNature ?? "uncertain"}, `
+      + `attention=${eligible?.id === candidate.candidate.id ? "private" : "pending"}`,
+    );
   }
 
   /**
@@ -1465,7 +1669,9 @@ export class ThoughtService {
   /** Promote at most one mature candidate into private, actionless attention. */
   private async maybeAttendThoughtPoolCandidate(): Promise<void> {
     if (Date.now() - this.lastPoolAttentionAt < 30 * 60 * 1000) return;
-    const selected = (await this.thoughtPool.getAttentionCandidates(0.65, 1))[0];
+    const selected = (this.cognitionMode === "primary"
+      ? await this.thoughtPool.getAttentionCandidatesV31(0.65, 1)
+      : await this.thoughtPool.getAttentionCandidates(0.65, 1))[0];
     if (!selected) return;
     const attended = await this.thoughtPool.markAttended(selected.id);
     if (!attended) return;
@@ -1548,11 +1754,36 @@ export class ThoughtService {
    * factuality, deduplication and rate-limit gates.
    */
   private async maybeExpressMatureThought(): Promise<void> {
+    await this.observeExpiredExpressionWindows();
     if (!this.sendMessage || !this.proactiveChannel || !this.proactiveTarget) return;
     if (!isGoodTimeForMessage()) return;
-    const minAgeMs = this.thoughtFrequency < 0.5 ? 60_000 : 5 * 60_000;
-    const candidate = (await this.thoughtPool.getExpressionCandidates(minAgeMs, 1))[0];
+    const feedbackState = this.expressionFeedbackStore ? await this.expressionFeedbackStore.load() : undefined;
+    const ageMultiplier = this.expressionPolicy === "adaptive"
+      ? feedbackState?.policy.minimumAgeMultiplier ?? 1 : 1;
+    const minAgeMs = (this.thoughtFrequency < 0.5 ? 60_000 : 5 * 60_000) * ageMultiplier;
+    if (this.cognitionMode === "primary") {
+      const pool = await this.thoughtPool.load();
+      const sentRecently = pool.candidates.some((item) => item.originWorkspaceId && item.expressedAt
+        && Date.now() - item.expressedAt < 24 * 60 * 60 * 1000);
+      if (sentRecently) return;
+    }
+    const candidate = (this.cognitionMode === "primary"
+      ? await this.thoughtPool.getExpressionCandidatesV31(minAgeMs, 1)
+      : await this.thoughtPool.getExpressionCandidates(minAgeMs, 1))[0];
     if (!candidate) return;
+
+    const expressionProposal = this.cognitionMode === "primary" && this.expressionStore
+      ? await this.expressionStore.propose({
+        sourceType: "thought", sourceId: candidate.thoughtEpisodeId ?? candidate.id,
+        content: candidate.content, reason: "A mature private thought reached expression review.",
+      }) : undefined;
+    const adaptiveThreshold = 0.65 + (this.expressionPolicy === "adaptive"
+      ? feedbackState?.policy.valueThresholdDelta ?? 0 : 0);
+    if (expressionProposal && candidate.attentionScore < adaptiveThreshold) {
+      await this.expressionStore?.resolve(expressionProposal.id, false, "low-value");
+      await this.thoughtPool.markExpressionEvaluated(candidate.id, false);
+      return;
+    }
 
     const ego = (await loadEgoStore(this.storePath)).ego;
     const now = Date.now();
@@ -1573,21 +1804,34 @@ export class ThoughtService {
       actionType: "send-message",
     };
 
-    const result = await executeThoughtAction(thought, ego, {
-      channel: this.proactiveChannel,
-      target: this.proactiveTarget,
-      sendMessage: this.sendMessage,
-      llmGenerator: this.actionLLMGenerator,
-      openclawConfig: this.openclawConfig,
-      autonomousActions: this.autonomousActions,
-      gatewayPort: this.gatewayPort,
-      authToken: this.authToken,
-      hooksToken: this.hooksToken,
-      workspaceContext: this.workspaceContext || undefined,
-      thoughtFrequency: this.thoughtFrequency,
-    });
+    let result: Awaited<ReturnType<typeof executeThoughtAction>> | undefined;
+    try {
+      result = await executeThoughtAction(thought, ego, {
+        channel: this.proactiveChannel,
+        target: this.proactiveTarget,
+        sendMessage: this.sendMessage,
+        llmGenerator: this.actionLLMGenerator,
+        openclawConfig: this.openclawConfig,
+        autonomousActions: this.autonomousActions,
+        gatewayPort: this.gatewayPort,
+        authToken: this.authToken,
+        hooksToken: this.hooksToken,
+        workspaceContext: this.workspaceContext || undefined,
+        thoughtFrequency: this.thoughtFrequency,
+      });
+    } catch (error) {
+      if (expressionProposal) await this.expressionStore?.resolve(expressionProposal.id, false, "unsafe");
+      await this.thoughtPool.markExpressionEvaluated(candidate.id, false);
+      log.warn(`Mature thought expression adapter failed: ${String(error)}`);
+      return;
+    }
+    if (!result) return;
     const output = typeof result.result.result === "string" ? result.result.result : "";
     const expressed = result.result.success && Boolean(output) && !/^(?:skipped-|cooldown$)/.test(output);
+    if (expressionProposal) {
+      await this.expressionStore?.resolve(expressionProposal.id, expressed,
+        expressed ? undefined : this.expressionWithheldReason(result));
+    }
     await this.thoughtPool.markExpressionEvaluated(candidate.id, expressed);
     log.info(
       `Mature thought expression ${expressed ? "sent" : "withheld"}: ` +
@@ -1653,6 +1897,16 @@ export class ThoughtService {
     let ego = store.ego;
 
     if (this.hasUndeliveredAutonomousTaskResult(ego)) {
+      const pendingTask = (ego.activeTasks ?? []).find((task) =>
+        (task.status === "completed" || task.status === "failed") && !task.resultDelivered && Boolean(task.result));
+      const expressionProposal = this.cognitionMode === "primary" && pendingTask && this.expressionStore
+        ? await this.expressionStore.propose({
+          sourceType: "task-result",
+          sourceId: pendingTask.id,
+          content: (pendingTask.result ?? "").slice(0, 4000),
+          reason: "A completed user-facing task result is awaiting delivery.",
+        })
+        : undefined;
       const thought: Thought = {
         id: "report-findings-" + Date.now(),
         type: "opportunity-detected",
@@ -1672,17 +1926,24 @@ export class ThoughtService {
         relatedNeeds: ["connection", "meaning"],
         expectedOutcome: "Send detailed task results to the user.",
         actionType: "report-findings",
+        cognitiveKind: "task-continuation",
+        ...(expressionProposal ? { actionParams: { expressionProposalId: expressionProposal.id } } : {}),
       };
       log.info("Autonomous task result pending: forcing report-findings");
       if (this.onThought) {
-        const updatedEgo = await updateEgoStore(this.storePath, (e) => {
+        const updatedEgo = this.cognitionMode === "primary" ? ego : await updateEgoStore(this.storePath, (e) => {
           e.lastThoughtTime = Date.now();
           e.totalThoughts += 1;
           return e;
         });
         const result = await this.onThought(thought, updatedEgo);
         await this.applyThoughtResult(result);
-        await this.executeThoughtAction(thought, updatedEgo);
+        const actionResult = await this.executeThoughtAction(thought, updatedEgo);
+        if (expressionProposal) {
+          const sent = this.actionResultWasExpressed(actionResult);
+          await this.expressionStore?.resolve(expressionProposal.id, sent,
+            sent ? undefined : this.expressionWithheldReason(actionResult));
+        }
       }
       return;
     }
@@ -1822,13 +2083,14 @@ export class ThoughtService {
             return;
           }
           await this.waitForLLMRateLimit(signal);
-          cycleOpportunities = detectThoughtOpportunities(ctx);
+          cycleOpportunities = this.filterCognitionPrimaryOpportunities(detectThoughtOpportunities(ctx), ego);
 
           // No opportunities at all — nothing worth thinking about (no conversations,
           // no problems, no interests). Skip instead of generating a generic fallback.
           if (cycleOpportunities.length === 0) {
-            this.applySkipBackoff("no opportunities (idle — no conversations or problems)");
-            await recordCycle("skipped", "no opportunities");
+            if (this.cognitionMode !== "primary") this.applySkipBackoff("no opportunities (idle — no conversations or problems)");
+            await recordCycle("skipped", this.cognitionMode === "primary"
+              ? "private thought delegated to activation primary" : "no opportunities");
             return;
           }
 
@@ -1938,10 +2200,11 @@ export class ThoughtService {
           await recordCycle("skipped", "aborted before opportunity detection");
           return;
         }
-        cycleOpportunities = detectThoughtOpportunities(ctx);
+        cycleOpportunities = this.filterCognitionPrimaryOpportunities(detectThoughtOpportunities(ctx), ego);
         if (cycleOpportunities.length === 0) {
-          this.applySkipBackoff("no opportunities (idle — no conversations or problems)");
-          await recordCycle("skipped", "no opportunities");
+          if (this.cognitionMode !== "primary") this.applySkipBackoff("no opportunities (idle — no conversations or problems)");
+          await recordCycle("skipped", this.cognitionMode === "primary"
+            ? "private thought delegated to activation primary" : "no opportunities");
           return;
         }
         const unsuppressedOpportunities = this.filterSuppressedOpportunities(cycleOpportunities);
@@ -2073,7 +2336,72 @@ export class ThoughtService {
     }
   }
 
-  private async executeThoughtAction(thought: Thought, ego: EgoState): Promise<void> {
+  private actionResultWasExpressed(
+    actionResult: Awaited<ReturnType<typeof executeThoughtAction>> | undefined,
+  ): boolean {
+    if (!actionResult?.result.success) return false;
+    const output = typeof actionResult.result.result === "string" ? actionResult.result.result : "";
+    return Boolean(output) && !/^(?:skipped-|cooldown$)/.test(output);
+  }
+
+  private async observeExpiredExpressionWindows(): Promise<void> {
+    if (!this.expressionFeedbackStore || !this.expressionStore) return;
+    const [expressions, feedback] = await Promise.all([
+      this.expressionStore.load(), this.expressionFeedbackStore.load(),
+    ]);
+    const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+    const observed = new Set(feedback.events.map((event) => event.proposalId));
+    for (const proposal of expressions.proposals) {
+      if (proposal.status === "sent" && (proposal.evaluatedAt ?? proposal.createdAt) <= cutoff
+        && !observed.has(proposal.id)) {
+        await this.expressionFeedbackStore.observeNoReply(proposal);
+      }
+    }
+  }
+
+  private expressionWithheldReason(
+    actionResult: Awaited<ReturnType<typeof executeThoughtAction>> | undefined,
+  ): "bad-timing" | "low-value" | "insufficient-evidence" | "unsafe" | "duplicate" | "not-user-relevant" | "channel-unavailable" {
+    const detail = `${actionResult?.result.error ?? ""} ${typeof actionResult?.result.result === "string" ? actionResult.result.result : ""}`;
+    if (/duplicate/i.test(detail)) return "duplicate";
+    if (/cooldown|timing/i.test(detail)) return "bad-timing";
+    if (/channel|target|sender/i.test(detail)) return "channel-unavailable";
+    if (/evidence|ground/i.test(detail)) return "insufficient-evidence";
+    if (/unsafe|permission|blocked/i.test(detail)) return "unsafe";
+    return "low-value";
+  }
+
+  private async attachIntentionToOperationalWork(thought: Thought): Promise<void> {
+    if (!this.intentionStore || !["analyze-problem", "run-agent-task", "observe-and-improve"].includes(thought.actionType ?? "")) {
+      return;
+    }
+    if (typeof thought.actionParams?.intentionId === "string") return;
+    const intentions = await this.intentionStore.load();
+    const thoughtTokens = contentTokens(`${thought.content} ${thought.motivation}`);
+    const userIntention = intentions.intentions
+      .filter((item) => item.origin === "user-directive" && item.status === "active"
+        && Date.now() - item.updatedAt < 24 * 60 * 60 * 1000)
+      .map((item) => ({ item, overlap: jaccard(thoughtTokens, contentTokens(item.desiredState)) }))
+      .filter((entry) => entry.overlap >= 0.05 || thought.cognitiveKind === "task-continuation")
+      .sort((a, b) => b.overlap - a.overlap || b.item.updatedAt - a.item.updatedAt)[0]?.item;
+    const intention = userIntention ?? (await this.intentionStore.add({
+      desiredState: thought.motivation.slice(0, 500),
+      origin: thought.actionType === "observe-and-improve" ? "maintenance" : "thought",
+      originId: thought.id,
+      commitment: Math.max(0, Math.min(1, thought.priority / 100)),
+      urgency: thought.priority >= 90 ? 0.9 : 0.6,
+      confidence: 0.75,
+      evidenceNeeded: [],
+      constraints: ["respect configured permissions", "preserve action safety gates"],
+      status: "active",
+    })).intention;
+    thought.actionParams = { ...(thought.actionParams ?? {}), intentionId: intention.id };
+  }
+
+  private async executeThoughtAction(
+    thought: Thought, ego: EgoState,
+  ): Promise<Awaited<ReturnType<typeof executeThoughtAction>> | undefined> {
+    await this.attachIntentionToOperationalWork(thought);
     log.info(`Executing thought action: ${thought.actionType}`, thought.content.slice(0, 50));
 
     let actionResult: Awaited<ReturnType<typeof executeThoughtAction>>;
@@ -2093,7 +2421,7 @@ export class ThoughtService {
       });
     } catch (err) {
       log.error(`executeThoughtAction threw unhandled error: ${String(err)}`);
-      return;
+      return undefined;
     }
 
     if (actionResult.result.success) {
@@ -2140,6 +2468,7 @@ export class ThoughtService {
       );
       log.info(`Thought action not completed: ${thought.actionType} ${resultStr ?? ""}`.trim());
     }
+    return actionResult;
   }
 
   /**
@@ -2415,6 +2744,7 @@ export class ThoughtService {
     const { type, text, quality = 0.5, messageId, channel, conversationId } = params;
     const explicitResolution = type === "inbound" && isExplicitResolution(text);
     const resolvedSshAccess = explicitResolution && isSshAccessTopic(text);
+    let createdInteractionMemoryId: string | undefined;
 
     if (type === "inbound") {
       for (const key of this.suppressedThoughtOpportunities.keys()) {
@@ -2527,6 +2857,7 @@ export class ThoughtService {
           ...(channel ? { sourceChannel: channel } : {}),
           ...(conversationId ? { sourceConversationId: conversationId } : {}),
         };
+        createdInteractionMemoryId = interactionMemory.id;
         ego.memories.push(interactionMemory);
 
         if (type === "inbound") {
@@ -2622,6 +2953,30 @@ export class ThoughtService {
       log.debug(`Ignored duplicate ${type} interaction messageId=${messageId}`);
     } else {
       log.info(`Interaction recorded: type=${type}, text=${text.length} chars, memories=${updatedEgo.memories.length}`);
+    }
+    if (type === "inbound" && !duplicate && createdInteractionMemoryId) {
+      this.cognitionRunner?.enqueueStimulus({
+        type: "interaction",
+        sourceId: createdInteractionMemoryId,
+        timestamp: Date.now(),
+      });
+      if (this.cognitionMode === "primary" && this.intentionStore && isExplicitUserDirective(text)) {
+        const originId = messageId || createdInteractionMemoryId;
+        const result = await this.intentionStore.add(buildUserDirectiveIntention(text, originId));
+        if (result.created) log.info(`User directive recorded as Intention: id=${result.intention.id}`);
+      }
+      if (this.expressionFeedbackStore && this.expressionStore) {
+        const expressions = await this.expressionStore.load();
+        const proposal = expressions.proposals.find((item) => item.status === "sent"
+          && Date.now() - (item.evaluatedAt ?? item.createdAt) < 24 * 60 * 60 * 1000);
+        if (proposal) {
+          await this.expressionFeedbackStore.observeReply(proposal, text, messageId || createdInteractionMemoryId);
+        }
+      }
+      if (explicitResolution && this.thoughtEpisodeStore) {
+        const superseded = await this.thoughtEpisodeStore.supersedeRelated(text, createdInteractionMemoryId);
+        if (superseded.length > 0) log.info(`Superseded ${superseded.length} ThoughtEpisode(s) after resolution`);
+      }
     }
 
     return {

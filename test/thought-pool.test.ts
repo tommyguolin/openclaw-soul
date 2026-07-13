@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { calculateAttentionScore, calculateThoughtPoolMetrics, ThoughtPool } from "../src/thought-pool.js";
+import { calculateAttentionScore, calculateThoughtPoolMetrics, inferEpistemicNature, ThoughtPool } from "../src/thought-pool.js";
 import { ThoughtCycleJournal } from "../src/thought-journal.js";
 import { ThoughtService } from "../src/thought-service.js";
 
@@ -56,6 +56,59 @@ test("Thought Pool persists private candidates and incubates repeated thoughts",
   } finally {
     await fs.promises.rm(directory, { recursive: true, force: true });
   }
+});
+
+test("v3.1 classifies epistemic nature and lets a grounded workspace question mature by reactivation", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-thought-pool-v31-question-"));
+  try {
+    const pool = new ThoughtPool(path.join(directory, "thought-pool.json"));
+    const base = {
+      content: "Could the timeout boundary be input length rather than retry timing?",
+      sourceMemoryIds: ["m1"], sourceClusters: ["software"], cognitiveMove: "question",
+      qualityFlags: [], originWorkspaceId: "workspace-1", causalTraceIds: ["memory:m1"],
+      scores: { novelty: 0.8, coherence: 0.85, resonance: 0.7, userRelevance: 0.8 },
+    };
+    const first = await pool.addCandidate({ ...base, stimulusId: "stimulus-1", evidenceMemoryIds: ["m1"] });
+    assert.equal(first.candidate.epistemicNature, "question");
+    assert.equal(first.candidate.state, "new");
+    const second = await pool.addCandidate({
+      ...base, sourceMemoryIds: ["m2"], causalTraceIds: ["memory:m2"],
+      stimulusId: "stimulus-2", evidenceMemoryIds: ["m2"],
+    });
+    assert.equal(second.candidate.state, "incubating");
+    assert.equal(second.candidate.stimulusIds?.length, 2);
+    const eligible = await pool.getAttentionCandidatesV31();
+    assert.equal(eligible[0]?.id, first.candidate.id);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("v3.1 keeps claims on the strict grounded evidence path", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-thought-pool-v31-claim-"));
+  try {
+    const pool = new ThoughtPool(path.join(directory, "thought-pool.json"));
+    const base = {
+      content: "The embedding service has a fixed token limit.", sourceClusters: ["software"],
+      cognitiveMove: "reflection", epistemicNature: "claim" as const, qualityFlags: [],
+      originWorkspaceId: "workspace-claim", causalTraceIds: ["memory:m1"],
+      scores: { novelty: 0.8, coherence: 0.9, resonance: 0.8, userRelevance: 0.8 },
+    };
+    await pool.addCandidate({ ...base, sourceMemoryIds: ["m1"], evidenceMemoryIds: ["m1"], stimulusId: "s1" });
+    await pool.addCandidate({ ...base, sourceMemoryIds: ["m2"], evidenceMemoryIds: ["m2"], stimulusId: "s2" });
+    assert.equal((await pool.getAttentionCandidatesV31()).length, 0);
+    const third = await pool.addCandidate({ ...base, sourceMemoryIds: ["m3"], evidenceMemoryIds: ["m3"], stimulusId: "s3" });
+    assert.equal(third.candidate.distinctActivationCount, 3);
+    assert.equal((await pool.getAttentionCandidatesV31())[0]?.id, third.candidate.id);
+    assert.equal((await pool.load()).candidateSchemaVersion, "3.1");
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("v3.1 migration marks legacy candidates uncertain without auto-attending them", () => {
+  assert.equal(inferEpistemicNature("Why does this remain unresolved?", "question"), "question");
+  assert.equal(inferEpistemicNature("These two failures follow the same pattern.", "analogy"), "association");
 });
 
 test("same stimulus merges paraphrased seeds without treating unchanged evidence as maturity", async () => {

@@ -716,6 +716,8 @@ export async function executeAnalyzeProblem(
     createdAt: Date.now(),
     updatedAt: Date.now(),
     sourceThoughtId: thought.id,
+    ...(typeof thought.actionParams?.intentionId === "string"
+      ? { intentionId: thought.actionParams?.intentionId as string } : {}),
     steps: [],
     requiresWritePermission: false,
     resultDelivered: false,
@@ -887,6 +889,8 @@ async function executeBoundedLocalAgentTask(
     createdAt: Date.now(),
     updatedAt: Date.now(),
     sourceThoughtId: thought.id,
+    ...(typeof thought.actionParams?.intentionId === "string"
+      ? { intentionId: thought.actionParams?.intentionId as string } : {}),
     steps,
     resultFilePath,
     requiresWritePermission: false,
@@ -1109,6 +1113,8 @@ If you hit a blocker, timeout risk, provider issue, missing dependency, or a lon
     createdAt: Date.now(),
     updatedAt: Date.now(),
     sourceThoughtId: thought.id,
+    ...(typeof thought.actionParams?.intentionId === "string"
+      ? { intentionId: thought.actionParams?.intentionId as string } : {}),
     steps: [{ id: randomBytes(4).toString("hex"), timestamp: Date.now(), action: "fire-agent", input: agentMessage.slice(0, 200), success: true }],
     resultFilePath,
     requiresWritePermission: options.autonomousActions,
@@ -1668,6 +1674,8 @@ export async function executeObserveAndImprove(
     createdAt: Date.now(),
     updatedAt: Date.now(),
     sourceThoughtId: thought.id,
+    ...(typeof thought.actionParams?.intentionId === "string"
+      ? { intentionId: thought.actionParams?.intentionId as string } : {}),
     steps: [],
     requiresWritePermission: false,
     resultDelivered: false,

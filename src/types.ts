@@ -49,6 +49,13 @@ export type ThoughtSource =
   | "environmental-change"
   | "scheduled";
 
+/** Transitional observation label while Thought, Intention and Task are separated. */
+export type CognitiveKind =
+  | "task-continuation"
+  | "proactive-intention"
+  | "private-thought"
+  | "legacy-unknown";
+
 export type MemoryType =
   | "interaction"
   | "thought"
@@ -248,6 +255,8 @@ export interface Thought {
   expectedOutcome?: string;
   actionType?: ActionType;
   actionParams?: Record<string, unknown>;
+  /** Observation-only migration label; it must not affect routing or permissions. */
+  cognitiveKind?: CognitiveKind;
 }
 
 export interface MetricDelta {
@@ -305,6 +314,8 @@ export interface AutonomousTask {
   resultFilePath?: string;
   requiresWritePermission: boolean;
   resultDelivered: boolean;
+  /** Owning future-state commitment after Intention/Task separation. */
+  intentionId?: string;
 }
 
 export interface EgoState {

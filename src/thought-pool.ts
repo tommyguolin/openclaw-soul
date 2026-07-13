@@ -4,6 +4,14 @@ import path from "node:path";
 import { classifyThoughtQualityFlags, contentTokens, jaccard } from "./thought-emergence.js";
 
 export type ThoughtCandidateState = "new" | "incubating" | "attended" | "faded";
+export type EpistemicNature =
+  | "claim"
+  | "question"
+  | "association"
+  | "tension"
+  | "observation"
+  | "reframing"
+  | "uncertain";
 
 export interface ThoughtCandidateScores {
   novelty: number;
@@ -44,6 +52,13 @@ export interface ThoughtCandidate {
   contradictedPremise?: boolean;
   /** Shadow candidates are private and can never directly execute an action. */
   shadow: true;
+  /** v3.1 fields: causal origin and cognition-specific attention policy. */
+  epistemicNature?: EpistemicNature;
+  originWorkspaceId?: string;
+  causalTraceIds?: string[];
+  groundedEvidenceIds?: string[];
+  stimulusIds?: string[];
+  thoughtEpisodeId?: string;
 }
 
 export interface ResolutionRecord {
@@ -59,6 +74,7 @@ export interface ResolutionRecord {
 
 export interface ThoughtPoolFile {
   version: 3;
+  candidateSchemaVersion: "3.1";
   candidates: ThoughtCandidate[];
   resolutions: ResolutionRecord[];
   observationCycles: number;
@@ -106,6 +122,11 @@ export interface NewThoughtCandidate {
   /** Only independently grounded evidence may mature a candidate. */
   evidenceMemoryIds?: string[];
   evidenceTimestamps?: number[];
+  epistemicNature?: EpistemicNature;
+  originWorkspaceId?: string;
+  causalTraceIds?: string[];
+  stimulusId?: string;
+  thoughtEpisodeId?: string;
 }
 
 const MAX_CANDIDATES = 500;
@@ -117,6 +138,37 @@ function activationFingerprint(input: Pick<NewThoughtCandidate, "sourceMemoryIds
 
 function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
+}
+
+export function inferEpistemicNature(content: string, cognitiveMove: string): EpistemicNature {
+  if (cognitiveMove === "question" || /[?？]\s*$/.test(content.trim())) return "question";
+  if (cognitiveMove === "analogy") return "association";
+  if (cognitiveMove === "confusion" || /矛盾|张力|冲突|tension|conflict|doesn't fit/i.test(content)) return "tension";
+  if (/重新理解|换个角度|并不是.*而是|reframe|rather than|not .* but/i.test(content)) return "reframing";
+  if (cognitiveMove === "reflection") return "observation";
+  if (/[.!。！]\s*$/.test(content.trim())) return "claim";
+  return "uncertain";
+}
+
+export function isAttentionEligibleV31(
+  candidate: ThoughtCandidate,
+  minScore = 0.65,
+): boolean {
+  if (!(["new", "incubating"] as ThoughtCandidateState[]).includes(candidate.state) || candidate.qualityFlags.length > 0
+    || candidate.contradictedPremise || candidate.scores.coherence < 0.65) return false;
+  const nature = candidate.epistemicNature ?? "uncertain";
+  if (nature === "claim" || nature === "uncertain") {
+    return candidate.state === "incubating"
+      && candidate.distinctActivationCount >= 3
+      && candidate.maturity >= 0.4
+      && (candidate.groundedEvidenceIds?.length ?? 0) >= 1
+      && candidate.attentionScore >= minScore;
+  }
+  if (!candidate.originWorkspaceId || candidate.scores.userRelevance < 0.6) return false;
+  const specificObservation = ["observation", "reframing"].includes(nature)
+    && contentTokens(candidate.content).length >= 6
+    && candidate.scores.coherence >= 0.75;
+  return (candidate.activations >= 2 && (candidate.stimulusIds?.length ?? 0) >= 2) || specificObservation;
 }
 
 export function calculateAttentionScore(
@@ -140,6 +192,10 @@ export function calculateAttentionScore(
 
 export function resolveThoughtPoolPath(storePath: string): string {
   return path.join(path.dirname(path.resolve(storePath)), "thought-pool.json");
+}
+
+export function resolveThoughtPoolV31ShadowPath(storePath: string): string {
+  return path.join(path.dirname(path.resolve(storePath)), "thought-pool-v31-shadow.json");
 }
 
 export function calculateThoughtPoolMetrics(candidates: ThoughtCandidate[], now = Date.now()): ThoughtPoolMetrics {
@@ -233,6 +289,7 @@ export class ThoughtPool {
         metrics.naturalSilenceRate = observationCycles > 0 ? silenceCycles / observationCycles : 0;
         return {
           version: 3,
+          candidateSchemaVersion: "3.1",
           candidates,
           resolutions: Array.isArray(parsed.resolutions) ? parsed.resolutions : [],
           observationCycles,
@@ -244,7 +301,7 @@ export class ThoughtPool {
     } catch (err) {
       if ((err as { code?: string }).code !== "ENOENT") throw err;
     }
-    return { version: 3, candidates: [], resolutions: [], observationCycles: 0, silenceCycles: 0, updatedAt: Date.now(), metrics: calculateThoughtPoolMetrics([]) };
+    return { version: 3, candidateSchemaVersion: "3.1", candidates: [], resolutions: [], observationCycles: 0, silenceCycles: 0, updatedAt: Date.now(), metrics: calculateThoughtPoolMetrics([]) };
   }
 
   async initialize(): Promise<ThoughtPoolFile> {
@@ -278,12 +335,17 @@ export class ThoughtPool {
         ? candidate.cleanActivationStreak
         : qualityFlags.length === 0 ? 1 : 0,
       attentionScore: calculateAttentionScore(candidate.scores, candidate.maturity, qualityFlags),
+      epistemicNature: candidate.epistemicNature ?? "uncertain",
+      causalTraceIds: Array.isArray(candidate.causalTraceIds) ? candidate.causalTraceIds : [],
+      groundedEvidenceIds: Array.isArray(candidate.groundedEvidenceIds) ? candidate.groundedEvidenceIds : [],
+      stimulusIds: Array.isArray(candidate.stimulusIds) ? candidate.stimulusIds : [],
     };
   }
 
   private save(store: ThoughtPoolFile): Promise<void> {
     const write = async () => {
       store.version = 3;
+      store.candidateSchemaVersion = "3.1";
       store.metrics = calculateThoughtPoolMetrics(store.candidates);
       store.metrics.naturalSilenceRate = store.observationCycles > 0 ? store.silenceCycles / store.observationCycles : 0;
       const directory = path.dirname(this.filePath);
@@ -348,6 +410,20 @@ export class ThoughtPool {
       if (normalizedStimulusKey) {
         candidate.stimulusKeys = [...new Set([...candidate.stimulusKeys, normalizedStimulusKey])].slice(-20);
       }
+      candidate.epistemicNature = candidate.epistemicNature === "uncertain"
+        ? (input.epistemicNature ?? inferEpistemicNature(input.content, input.cognitiveMove))
+        : candidate.epistemicNature;
+      candidate.originWorkspaceId ??= input.originWorkspaceId;
+      candidate.thoughtEpisodeId ??= input.thoughtEpisodeId;
+      candidate.causalTraceIds = [...new Set([...(candidate.causalTraceIds ?? []), ...(input.causalTraceIds ?? [])])];
+      candidate.groundedEvidenceIds = [...new Set([...(candidate.groundedEvidenceIds ?? []), ...(input.evidenceMemoryIds ?? [])])];
+      if (input.stimulusId) candidate.stimulusIds = [...new Set([...(candidate.stimulusIds ?? []), input.stimulusId])];
+      const nature = candidate.epistemicNature ?? "uncertain";
+      if (!["claim", "uncertain"].includes(nature)
+        && candidate.originWorkspaceId
+        && (candidate.stimulusIds?.length ?? 0) >= 2) {
+        candidate.state = "incubating";
+      }
       if (input.qualityFlags.length === 0) {
         candidate.cleanActivationStreak += 1;
         if (candidate.cleanActivationStreak >= 2) {
@@ -408,6 +484,12 @@ export class ThoughtPool {
       updatedAt: now,
       lastActivatedAt: now,
       shadow: true,
+      epistemicNature: input.epistemicNature ?? inferEpistemicNature(input.content, input.cognitiveMove),
+      ...(input.originWorkspaceId ? { originWorkspaceId: input.originWorkspaceId } : {}),
+      ...(input.thoughtEpisodeId ? { thoughtEpisodeId: input.thoughtEpisodeId } : {}),
+      causalTraceIds: [...new Set(input.causalTraceIds ?? [])],
+      groundedEvidenceIds: [...new Set(input.evidenceMemoryIds ?? [])],
+      stimulusIds: input.stimulusId ? [input.stimulusId] : [],
     };
     candidate.attentionScore = calculateAttentionScore(candidate.scores, maturity, candidate.qualityFlags);
     store.candidates.push(candidate);
@@ -555,6 +637,19 @@ export class ThoughtPool {
       .slice(0, limit);
   }
 
+  async getAttentionCandidatesV31(minScore = 0.65, limit = 20): Promise<ThoughtCandidate[]> {
+    const store = await this.load();
+    const changed = this.applyDecay(store.candidates, Date.now());
+    if (changed) {
+      store.updatedAt = Date.now();
+      await this.save(store);
+    }
+    return store.candidates
+      .filter((candidate) => isAttentionEligibleV31(candidate, minScore))
+      .sort((a, b) => b.attentionScore - a.attentionScore)
+      .slice(0, limit);
+  }
+
   async markAttended(candidateId: string): Promise<ThoughtCandidate | undefined> {
     const store = await this.load();
     const candidate = store.candidates.find((item) => item.id === candidateId);
@@ -580,6 +675,22 @@ export class ThoughtPool {
         && candidate.scores.userRelevance >= 0.6
         && candidate.qualityFlags.length === 0
         && ["question", "analogy", "speculation", "confusion", "reflection"].includes(candidate.cognitiveMove))
+      .sort((a, b) => b.attentionScore - a.attentionScore)
+      .slice(0, limit);
+  }
+
+  async getExpressionCandidatesV31(minAgeMs = 5 * 60 * 1000, limit = 5): Promise<ThoughtCandidate[]> {
+    const now = Date.now();
+    const store = await this.load();
+    return store.candidates
+      .filter((candidate) => candidate.state === "attended"
+        && candidate.originWorkspaceId
+        && !candidate.expressionEvaluatedAt
+        && !candidate.expressedAt
+        && now - (candidate.attendedAt ?? candidate.updatedAt) >= minAgeMs
+        && candidate.scores.coherence >= 0.7
+        && candidate.scores.userRelevance >= 0.6
+        && candidate.qualityFlags.length === 0)
       .sort((a, b) => b.attentionScore - a.attentionScore)
       .slice(0, limit);
   }

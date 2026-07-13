@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ActionType, Thought, ThoughtType } from "./types.js";
+import type { ActionType, CognitiveKind, Thought, ThoughtType } from "./types.js";
 import type { DetectedThoughtOpportunity } from "./intelligent-thought.js";
 
 export type ThoughtCycleOutcome = "generated" | "skipped" | "failed";
@@ -39,6 +39,7 @@ export interface ThoughtCycleJournalRecord {
     trigger: string;
     motivation: string;
     actionType?: ActionType;
+    cognitiveKind?: CognitiveKind;
   };
   recentStateBefore: {
     thoughtTypes: string[];
@@ -83,6 +84,7 @@ export function compactJournalThought(thought: Thought): NonNullable<ThoughtCycl
     trigger: thought.trigger,
     motivation: compactText(thought.motivation, 300),
     ...(thought.actionType ? { actionType: thought.actionType } : {}),
+    ...(thought.cognitiveKind ? { cognitiveKind: thought.cognitiveKind } : {}),
   };
 }
 

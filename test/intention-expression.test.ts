@@ -1,0 +1,135 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { buildUserDirectiveIntention, isExplicitUserDirective } from "../src/intention/formation.js";
+import { IntentionStore } from "../src/intention/store.js";
+import { ExpressionStore } from "../src/expression/store.js";
+import { ExpressionFeedbackStore } from "../src/expression/feedback-store.js";
+import { inferExpressionFeedback, inferNoReplyFeedback } from "../src/expression/feedback.js";
+import { ThoughtService } from "../src/thought-service.js";
+
+test("directive formation separates requested work from explanation questions", () => {
+  assert.equal(isExplicitUserDirective("请检查部署日志并定位 timeout"), true);
+  assert.equal(isExplicitUserDirective("Please inspect the deployment logs"), true);
+  assert.equal(isExplicitUserDirective("如何检查部署日志？"), false);
+  assert.equal(isExplicitUserDirective("Why does the timeout happen?"), false);
+});
+
+test("IntentionStore persists and deduplicates a user directive by origin", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-intentions-"));
+  const store = new IntentionStore(path.join(dir, "intentions.json"));
+  const input = buildUserDirectiveIntention("请检查部署日志", "message-1");
+  const first = await store.add(input);
+  const second = await store.add(input);
+  assert.equal(first.created, true);
+  assert.equal(second.created, false);
+  assert.equal(first.intention.id, second.intention.id);
+  assert.equal((await store.load()).intentions.length, 1);
+});
+
+test("ExpressionStore separates proposal creation from sent/withheld resolution", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-expressions-"));
+  const store = new ExpressionStore(path.join(dir, "expression-proposals.json"));
+  const proposal = await store.propose({
+    sourceType: "task-result", sourceId: "task-1", content: "Root cause found", reason: "result ready",
+  });
+  assert.equal(proposal.status, "pending");
+  const withheld = await store.resolve(proposal.id, false, "bad-timing");
+  assert.equal(withheld?.status, "withheld");
+  assert.equal(withheld?.withheldReason, "bad-timing");
+});
+
+test("expression feedback keeps observations separate and no-reply neutral", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-expression-feedback-"));
+  const store = new ExpressionFeedbackStore(path.join(dir, "feedback.json"), "adaptive");
+  const proposal = {
+    id: "proposal-1", sourceType: "thought" as const, sourceId: "thought-1",
+    content: "The timeout may be caused by long embedding input", reason: "mature thought",
+    status: "sent" as const, createdAt: Date.now(), evaluatedAt: Date.now(),
+  };
+  const noReply = await store.observeNoReply(proposal);
+  assert.deepEqual(noReply.observations, ["no-reply-window"]);
+  assert.equal(noReply.inference.label, "unclear");
+  assert.equal((await store.load()).policy.samples, 0);
+
+  const reply = await store.observeReply(proposal, "这个提醒时机不对，请稍后再说", "reply-1");
+  assert.equal(reply.observations.includes("explicit-negative"), true);
+  assert.equal(reply.inference.label, "bad-timing");
+  const adapted = await store.load();
+  assert.equal(adapted.policy.samples, 1);
+  assert.equal(adapted.policy.minimumAgeMultiplier > 1, true);
+});
+
+test("observe expression policy records explicit feedback without adapting thresholds", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-expression-observe-"));
+  const store = new ExpressionFeedbackStore(path.join(dir, "feedback.json"), "observe");
+  const proposal = {
+    id: "proposal-observe", sourceType: "thought" as const, sourceId: "thought-observe",
+    content: "The timeout may be caused by long embedding input", reason: "mature thought",
+    status: "sent" as const, createdAt: Date.now(), evaluatedAt: Date.now(),
+  };
+  const event = await store.observeReply(proposal, "这个提醒时机不对，请稍后再说", "reply-observe");
+  assert.equal(event.inference.label, "bad-timing");
+  const state = await store.load();
+  assert.equal(state.events.length, 1);
+  assert.deepEqual(state.policy, {
+    minimumAgeMultiplier: 1, valueThresholdDelta: 0, interruptionCost: 0.5, samples: 0,
+  });
+});
+
+test("non-primary cognition falls back to legacy expression policy", () => {
+  const service = new ThoughtService({ cognitionMode: "observe", expressionPolicy: "adaptive" });
+  const internals = service as unknown as {
+    expressionPolicy: string;
+    expressionFeedbackStore?: ExpressionFeedbackStore;
+  };
+  assert.equal(internals.expressionPolicy, "legacy");
+  assert.equal(internals.expressionFeedbackStore, undefined);
+});
+
+test("feedback inference does not turn an unrelated reply into negative feedback", () => {
+  const inferred = inferExpressionFeedback("今天午饭吃什么？", "Embedding timeout may depend on input length");
+  assert.deepEqual(inferred.observations, ["reply-unrelated"]);
+  assert.equal(inferred.label, "unclear");
+  assert.equal(inferNoReplyFeedback().label, "unclear");
+});
+
+test("operational work receives a traceable Intention before task execution", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-task-intention-"));
+  const egoPath = path.join(dir, "ego.json");
+  const service = new ThoughtService({ storePath: egoPath, cognitionMode: "primary" });
+  await service.recordInteractionWithText({
+    type: "inbound", text: "请检查部署日志并定位 timeout", messageId: "directive-task-1",
+  });
+  const thought = {
+    id: "operational-1", type: "opportunity-detected", content: "Inspect deployment logs for timeout",
+    trigger: "opportunity", source: "system-monitor", triggerDetail: "directive", motivation: "Locate timeout",
+    targetMetrics: [], priority: 90, createdAt: Date.now(), expiresAt: Date.now() + 1000,
+    executed: false, relatedNeeds: [], actionType: "analyze-problem", cognitiveKind: "task-continuation",
+  } as const;
+  const internals = service as unknown as { attachIntentionToOperationalWork(item: object): Promise<void> };
+  await internals.attachIntentionToOperationalWork(thought);
+  const intentionId = (thought as unknown as { actionParams: { intentionId: string } }).actionParams.intentionId;
+  const intentions = JSON.parse(await fs.promises.readFile(path.join(dir, "intentions.json"), "utf8"));
+  assert.equal(intentions.intentions[0].id, intentionId);
+  assert.equal(intentions.intentions[0].origin, "user-directive");
+});
+
+test("primary ingestion records an Intention without duplicating the host task or creating a private Thought", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-primary-intention-"));
+  const service = new ThoughtService({ storePath: path.join(dir, "ego.json"), cognitionMode: "primary" });
+  await service.recordInteractionWithText({
+    type: "inbound", text: "请检查部署日志并定位 timeout", messageId: "directive-1",
+  });
+  await service.recordInteractionWithText({
+    type: "inbound", text: "请检查部署日志并定位 timeout", messageId: "directive-1",
+  });
+  const file = JSON.parse(await fs.promises.readFile(path.join(dir, "intentions.json"), "utf8"));
+  assert.equal(file.intentions.length, 1);
+  assert.equal(file.intentions[0].origin, "user-directive");
+  const ego = await service.getEgoState();
+  assert.equal(ego.totalThoughts, 0);
+  assert.equal(ego.activeTasks.length, 0);
+});

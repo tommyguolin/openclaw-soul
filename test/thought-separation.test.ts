@@ -125,6 +125,60 @@ test("low thoughtFrequency startup greeting uses observation-mode cooldown", asy
   }
 });
 
+test("active inbound conversation defers the Soul background cycle for five minutes", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-conversation-quiet-"));
+  try {
+    const storePath = path.join(directory, "ego.json");
+    const service = new ThoughtService({ storePath });
+    await service.recordInteractionWithText({
+      type: "inbound",
+      text: "Please inspect this project while we are actively talking.",
+      messageId: "quiet-1",
+      channel: "feishu",
+    });
+    type QuietInternals = { activeConversationQuietRemainingMs(now?: number): Promise<number> };
+    const remaining = await (service as unknown as QuietInternals).activeConversationQuietRemainingMs();
+    assert(remaining > 4 * 60 * 1000);
+    assert(remaining <= 5 * 60 * 1000);
+
+    const ego = await service.getEgoState();
+    const inbound = ego.memories.find((memory) => memory.sourceMessageId === "quiet-1");
+    assert(inbound);
+    const afterWindow = inbound.timestamp + 5 * 60 * 1000 + 1;
+    assert.equal(
+      await (service as unknown as QuietInternals).activeConversationQuietRemainingMs(afterWindow),
+      0,
+    );
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a successfully delivered proactive message records outbound memory directly", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-proactive-outbound-"));
+  try {
+    const storePath = path.join(directory, "ego.json");
+    const service = new ThoughtService({
+      storePath,
+      proactiveChannel: "feishu",
+      proactiveTarget: "ou_test",
+      sendMessage: async () => undefined,
+    });
+    type SenderInternals = { sendMessage?: (params: { to: string; content: string; channel: string }) => Promise<void> };
+    await (service as unknown as SenderInternals).sendMessage?.({
+      to: "ou_test",
+      channel: "feishu",
+      content: "A grounded proactive update was delivered.",
+    });
+    const ego = await service.getEgoState();
+    const outbound = ego.memories.filter((memory) => memory.tags.includes("outbound"));
+    assert.equal(outbound.length, 1);
+    assert.equal(outbound[0].content, "A grounded proactive update was delivered.");
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("a repeated non-execution opportunity is suppressed without blocking execution work", () => {
   const service = new ThoughtService();
   const repeated = {

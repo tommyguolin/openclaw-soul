@@ -33,6 +33,93 @@ function normalizeTarget(channel: string, target: string): string {
   return target;
 }
 
+function hasExplicitPreferenceSignal(text: string): boolean {
+  return /(?:我(?:更)?(?:喜欢|偏好|希望|想要)|请(?:尽量|不要|别)|最好|更倾向|不喜欢|讨厌|\b(?:i\s+(?:prefer|like|want)|please\s+(?:do|don't|avoid)|my\s+preference)\b)/i.test(text);
+}
+
+type CapturedMessageSend = { text: string; toolCallId?: string };
+
+function parseToolArguments(value: unknown): Record<string, unknown> | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== "string") return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function successfulMessageSends(messages: unknown[]): CapturedMessageSend[] {
+  const records = messages.filter((message): message is Record<string, unknown> =>
+    !!message && typeof message === "object" && !Array.isArray(message));
+  let lastUserIndex = -1;
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    if (records[index].role === "user") {
+      lastUserIndex = index;
+      break;
+    }
+  }
+  const currentTurn = records.slice(lastUserIndex >= 0 ? lastUserIndex + 1 : 0);
+  const successfulResults = new Set<string>();
+  for (const message of currentTurn) {
+    if (message.role !== "toolResult" || message.isError === true) continue;
+    const id = typeof message.toolCallId === "string" ? message.toolCallId : undefined;
+    const name = typeof message.toolName === "string" ? message.toolName : undefined;
+    if (id && name === "message") successfulResults.add(id);
+  }
+  const sends: CapturedMessageSend[] = [];
+  for (const message of currentTurn) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (!part || typeof part !== "object" || Array.isArray(part)) continue;
+      const call = part as Record<string, unknown>;
+      if (call.type !== "toolCall" || call.name !== "message") continue;
+      const id = typeof call.id === "string" ? call.id : undefined;
+      if (!id || !successfulResults.has(id)) continue;
+      const args = parseToolArguments(call.arguments ?? call.input);
+      const action = typeof args?.action === "string" ? args.action : "";
+      if (action !== "send" && action !== "thread-reply") continue;
+      const text = typeof args?.message === "string" ? args.message.trim()
+        : typeof args?.content === "string" ? args.content.trim() : "";
+      if (text.length >= 5) sends.push({ text, toolCallId: id });
+    }
+  }
+  return sends;
+}
+
+function finalAssistantText(messages: unknown[]): string | undefined {
+  const records = messages.filter((message): message is Record<string, unknown> =>
+    !!message && typeof message === "object" && !Array.isArray(message));
+  let lastUserIndex = -1;
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    if (records[index].role === "user") {
+      lastUserIndex = index;
+      break;
+    }
+  }
+  for (let index = records.length - 1; index > lastUserIndex; index -= 1) {
+    const message = records[index];
+    if (message.role !== "assistant") continue;
+    if (typeof message.content === "string" && message.content.trim().length >= 5) {
+      return message.content.trim();
+    }
+    if (!Array.isArray(message.content)) continue;
+    const text = message.content
+      .filter((part): part is Record<string, unknown> =>
+        !!part && typeof part === "object" && !Array.isArray(part) && part.type === "text")
+      .map((part) => typeof part.text === "string" ? part.text : "")
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+    if (text.length >= 5) return text;
+  }
+  return undefined;
+}
+
 /**
  * Build a sendMessage function that delivers a proactive message directly
  * to a channel via the gateway's /tools/invoke HTTP endpoint.
@@ -199,6 +286,10 @@ type PluginConfig = {
   thoughtFrequency?: number;
   /** Private shadow emergence probability per eligible interval. Default: 0.1. */
   shadowThoughtRate?: number;
+  /** Cognitive activation mode. "observe" records activation/workspace only. */
+  cognitionMode?: "legacy" | "observe" | "shadow" | "primary";
+  /** Expression feedback policy. Requires cognitionMode=primary when non-legacy. */
+  expressionPolicy?: "legacy" | "observe" | "adaptive";
 };
 // Note: `enabled` in PluginConfig is the inner service toggle (default: true).
 // The outer `plugins.entries.soul.enabled` (in openclaw.json) controls plugin loading.
@@ -297,6 +388,8 @@ const plugin = {
       autonomousActions: { type: "boolean", description: "Enable autonomous write operations (editing files, running commands). Read operations always allowed. Default: false" },
       thoughtFrequency: { type: "number", description: "Thought frequency multiplier. Default: 1.0. Lower = more frequent (e.g. 0.2 for testing), higher = less frequent" },
       shadowThoughtRate: { type: "number", minimum: 0, maximum: 1, description: "Private actionless shadow thought probability. Default: 0.1" },
+      cognitionMode: { type: "string", enum: ["legacy", "observe", "shadow", "primary"], description: "Cognitive activation mode. primary routes private thoughts through Activation while preserving operational detectors and all safety gates" },
+      expressionPolicy: { type: "string", enum: ["legacy", "observe", "adaptive"], description: "Expression feedback policy. observe records feedback; adaptive adjusts expression timing/value only. Requires cognitionMode=primary" },
       llm: {
         type: "object",
         additionalProperties: true,
@@ -408,6 +501,8 @@ const plugin = {
         workspaceFiles,
         thoughtFrequency: config.thoughtFrequency ?? 1.0,
         shadowThoughtRate: config.shadowThoughtRate ?? 0.1,
+        cognitionMode: config.cognitionMode ?? "legacy",
+        expressionPolicy: config.expressionPolicy ?? "legacy",
       });
 
       api.registerService({
@@ -531,7 +626,9 @@ const plugin = {
             .catch((err) => log.warn(`Record interaction failed: ${String(err)}`));
           setTimeout(() => {
             service.extractUserFacts(text, messageId || undefined)
-              .then(() => service.extractUserPreferences(text))
+              .then(() => hasExplicitPreferenceSignal(text)
+                ? service.extractUserPreferences(text)
+                : undefined)
               .catch((err) => log.warn(`Background message processing failed: ${String(err)}`));
           }, delayMs);
         } else if (text.length >= 5) {
@@ -553,28 +650,70 @@ const plugin = {
       }
     });
 
-    const recordOutboundInteraction = async (_event: PluginEvent, _ctx?: PluginContext): Promise<void> => {
-      if (!thoughtService) return;
-      try {
-        const text = typeof _event?.content === "string" ? _event.content : "";
-        const messageId = typeof _event?.messageId === "string" ? _event.messageId : undefined;
-        const channel = typeof _ctx?.channelId === "string" ? _ctx.channelId : undefined;
-        const conversationId = typeof _ctx?.conversationId === "string" ? _ctx.conversationId : undefined;
-        if (!channel || !observedInboundChannels.has(channel)) return;
-        if (text.length >= 5) {
-          await thoughtService.recordInteractionWithText({
-            type: "outbound",
-            text,
-            messageId,
-            channel,
-            conversationId,
-          });
-        } else {
-          await thoughtService.recordInteraction({ type: "outbound" });
-        }
-      } catch (err) {
-        log.warn(`outbound message hook failed: ${String(err)}`);
+    const channelFromSessionKey = (sessionKey: string | undefined): string | undefined => {
+      if (!sessionKey) return undefined;
+      const parts = sessionKey.split(":");
+      return parts[0] === "agent" && parts.length >= 4 ? parts[2] : undefined;
+    };
+
+    let outboundWriteChain: Promise<void> = Promise.resolve();
+    const recentOutboundCaptures = new Map<string, number>();
+    const persistOutboundInteraction = (params: {
+      text: string;
+      messageId?: string;
+      channel?: string;
+      conversationId?: string;
+      source: string;
+    }): Promise<void> => {
+      const signature = params.channel && params.text
+        ? `${params.channel}\u0000${params.conversationId ?? ""}\u0000${params.text.trim()}` : "";
+      const now = Date.now();
+      if (signature && now - (recentOutboundCaptures.get(signature) ?? 0) < 30_000) {
+        return Promise.resolve();
       }
+      if (signature) {
+        recentOutboundCaptures.set(signature, now);
+        if (recentOutboundCaptures.size > 100) {
+          for (const [key, timestamp] of recentOutboundCaptures) {
+            if (now - timestamp >= 30_000) recentOutboundCaptures.delete(key);
+          }
+        }
+      }
+      const pending = outboundWriteChain.then(async () => {
+        if (!thoughtService) return;
+        try {
+          const { text, messageId, channel, conversationId } = params;
+          if (!channel || !observedInboundChannels.has(channel)) return;
+          if (text.length >= 5) {
+            await thoughtService.recordInteractionWithText({
+              type: "outbound",
+              text,
+              messageId,
+              channel,
+              conversationId,
+            });
+          } else {
+            await thoughtService.recordInteraction({ type: "outbound" });
+          }
+        } catch (err) {
+          log.warn(`${params.source} outbound capture failed: ${String(err)}`);
+        }
+      });
+      outboundWriteChain = pending.catch(() => undefined);
+      return pending;
+    };
+
+    const recordOutboundInteraction = async (_event: PluginEvent, _ctx?: PluginContext): Promise<void> => {
+      const sessionKey = typeof _event?.sessionKey === "string" ? _event.sessionKey
+        : typeof _ctx?.sessionKey === "string" ? _ctx.sessionKey : undefined;
+      await persistOutboundInteraction({
+        text: typeof _event?.content === "string" ? _event.content : "",
+        messageId: typeof _event?.messageId === "string" ? _event.messageId : undefined,
+        channel: typeof _event?.channel === "string" ? _event.channel
+          : typeof _ctx?.channelId === "string" ? _ctx.channelId : channelFromSessionKey(sessionKey),
+        conversationId: sessionKey ?? (typeof _ctx?.conversationId === "string" ? _ctx.conversationId : undefined),
+        source: "message lifecycle",
+      });
     };
 
     // Some channel adapters (including Feishu streaming replies) emit
@@ -582,6 +721,81 @@ const plugin = {
     // message provenance/content idempotency to avoid duplicate memories.
     api.on("message_sending", recordOutboundInteraction);
     api.on("message_sent", recordOutboundInteraction);
+
+    // OpenClaw 2026.6+ routes Codex-harness and streaming channel replies
+    // through reply_payload_sending even when the generic message lifecycle
+    // and transcript hooks are bypassed. Capture only the final user-visible
+    // payload; tool/block payloads can be partial stream fragments.
+    api.on("reply_payload_sending", (_event, _ctx) => {
+      if (_event?.kind !== "final") return;
+      const text = typeof _event?.payload?.text === "string" ? _event.payload.text.trim() : "";
+      if (text.length < 5) return;
+      const sessionKey = typeof _event?.sessionKey === "string" ? _event.sessionKey
+        : typeof _ctx?.sessionKey === "string" ? _ctx.sessionKey : undefined;
+      const channel = typeof _event?.channel === "string" ? _event.channel
+        : typeof _ctx?.channelId === "string" ? _ctx.channelId : channelFromSessionKey(sessionKey);
+      return persistOutboundInteraction({
+        text,
+        messageId: typeof _ctx?.messageId === "string" ? _ctx.messageId
+          : typeof _event?.runId === "string" ? `run:${_event.runId}` : undefined,
+        channel,
+        conversationId: sessionKey ?? (typeof _ctx?.conversationId === "string" ? _ctx.conversationId : undefined),
+        source: "reply_payload_sending",
+      });
+    });
+
+    // Codex can deliver its user-visible answer by calling the message tool
+    // directly. In that path the channel dispatcher reports replies=0, so no
+    // reply_payload_sending/message_sent event exists. Capture the requested
+    // text only after a successful send tool call; failed sends and edits do
+    // not represent a delivered assistant utterance.
+    api.on("after_tool_call", (_event, _ctx) => {
+      if (_event?.toolName !== "message" || _event?.error) return;
+      const action = typeof _event?.params?.action === "string" ? _event.params.action : "";
+      if (action !== "send" && action !== "thread-reply") return;
+      if (_event?.result?.isError === true || _event?.result?.error) return;
+      const text = typeof _event?.params?.message === "string" ? _event.params.message.trim()
+        : typeof _event?.params?.content === "string" ? _event.params.content.trim() : "";
+      if (text.length < 5) return;
+      const sessionKey = typeof _ctx?.sessionKey === "string" ? _ctx.sessionKey
+        : typeof _event?.sessionKey === "string" ? _event.sessionKey : undefined;
+      const channel = typeof _event?.params?.channel === "string" ? _event.params.channel
+        : typeof _ctx?.channelId === "string" ? _ctx.channelId : channelFromSessionKey(sessionKey);
+      return persistOutboundInteraction({
+        text,
+        messageId: typeof _event?.toolCallId === "string" ? `tool:${_event.toolCallId}`
+          : typeof _event?.runId === "string" ? `run:${_event.runId}` : undefined,
+        channel,
+        conversationId: sessionKey ?? (typeof _ctx?.conversationId === "string" ? _ctx.conversationId : undefined),
+        source: "after_tool_call(message.send)",
+      });
+    });
+
+    // Codex app-server tools execute inside the harness and therefore do not
+    // always emit the host's after_tool_call hook. agent_end exposes the
+    // completed turn snapshot. Only accept message.send calls that have a
+    // matching non-error tool result after the last user message.
+    api.on("agent_end", (_event, _ctx) => {
+      if (_event?.success !== true || !Array.isArray(_event?.messages)) return;
+      const sessionKey = typeof _ctx?.sessionKey === "string" ? _ctx.sessionKey : undefined;
+      const channel = typeof _ctx?.channelId === "string" ? _ctx.channelId
+        : channelFromSessionKey(sessionKey);
+      if (!channel || !observedInboundChannels.has(channel)) return;
+      const sends = successfulMessageSends(_event.messages);
+      const fallbackText = sends.length === 0 ? finalAssistantText(_event.messages) : undefined;
+      const captures = sends.length > 0 ? sends
+        : fallbackText ? [{ text: fallbackText, toolCallId: undefined }] : [];
+      const writes = captures.map((send) =>
+        persistOutboundInteraction({
+          text: send.text,
+          messageId: send.toolCallId ? `tool:${send.toolCallId}`
+            : typeof _event?.runId === "string" ? `run:${_event.runId}` : undefined,
+          channel,
+          conversationId: sessionKey,
+          source: sends.length > 0 ? "agent_end(message.send)" : "agent_end(final assistant)",
+        }));
+      if (writes.length > 0) return Promise.all(writes).then(() => undefined);
+    });
 
     // Some streaming adapters bypass the generic outbound lifecycle. The
     // synchronous transcript-write hook is not a raw-conversation typed hook,
@@ -594,8 +808,7 @@ const plugin = {
       const sessionKey = typeof _event?.sessionKey === "string"
         ? _event.sessionKey
         : typeof _ctx?.sessionKey === "string" ? _ctx.sessionKey : "";
-      const parts = sessionKey.split(":");
-      const channel = parts[0] === "agent" && parts.length >= 4 ? parts[2] : undefined;
+      const channel = channelFromSessionKey(sessionKey);
       if (!channel || !observedInboundChannels.has(channel)) return;
       const content = message.content;
       const text = typeof content === "string"
@@ -608,15 +821,15 @@ const plugin = {
           ).map((part: { text: string }) => part.text).join("\n")
           : "";
       if (text.trim().length < 5) return;
-      void thoughtService.recordInteractionWithText({
-        type: "outbound",
+      void persistOutboundInteraction({
         text,
         channel,
         conversationId: sessionKey,
+        source: "before_message_write",
       }).catch((err) => log.warn(`before_message_write outbound capture failed: ${String(err)}`));
     });
 
-    log.debug("Soul plugin registered (hooks: before_prompt_build, message_received, before_message_write, message_sending, message_sent)");
+    log.debug("Soul plugin registered (hooks: before_prompt_build, message_received, before_message_write, reply_payload_sending, message_sending, message_sent, after_tool_call, agent_end)");
   },
 };
 

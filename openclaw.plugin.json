@@ -29,6 +29,16 @@
         "maximum": 1,
         "description": "Private actionless shadow thought probability per eligible interval. Default: 0.1"
       },
+      "cognitionMode": {
+        "type": "string",
+        "enum": ["legacy", "observe", "shadow", "primary"],
+        "description": "Cognitive activation mode. primary routes private thoughts through Activation while preserving operational detectors and all expression/action safety gates"
+      },
+      "expressionPolicy": {
+        "type": "string",
+        "enum": ["legacy", "observe", "adaptive"],
+        "description": "Expression feedback policy. observe records feedback; adaptive adjusts expression timing/value only. Requires cognitionMode=primary"
+      },
       "llm": {
         "type": "object",
         "additionalProperties": true,
