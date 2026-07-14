@@ -232,6 +232,37 @@ test("autonomous improvement reports concrete verified changes and never complet
     assert.match(analysisTask.result, /acceptance-criteria-not-met/);
     assert.match(analysisTask.result, /concrete changed files/);
     assert.match(analysisTask.result, /verification command passes/);
+
+    // This mirrors a fresh Soul state: no host-agent project handoff is
+    // available, only an explicit reference to the linked Soul project.
+    ego.projectContexts = [];
+    ego.activeProjectRoot = null;
+    let namedSoulPrompt = "";
+    const namedSoulThought = {
+      ...thought,
+      id: "named-soul-project-test",
+      content: "Improve openclaw-soul after reviewing /src and K:\\test_code",
+      actionParams: {
+        objective: "Continue improving the openclaw-soul project and verify one bounded change.",
+      },
+    };
+    const namedSoul = await executeObserveAndImprove(namedSoulThought, ego, {
+      autonomousActions: false,
+      gatewayPort: 18789,
+      llmGenerator: async (prompt: string) => {
+        namedSoulPrompt = prompt;
+        return JSON.stringify({
+          problem: "No grounded issue found.",
+          file: "",
+          oldCode: "",
+          newCode: "",
+          explanation: "No safe recommendation.",
+        });
+      },
+    });
+    assert.equal(namedSoul.result.success, true);
+    assert.match(namedSoulPrompt, /This is the Soul plugin itself/);
+    assert.doesNotMatch(namedSoulPrompt, /This is project at K:\\test_code/);
   } finally {
     if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
     else process.env.OPENCLAW_STATE_DIR = previousStateDir;

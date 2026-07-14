@@ -1595,12 +1595,18 @@ function isUnsafeProjectRoot(dir: string): boolean {
 }
 
 function extractPathCandidates(text: string): string[] {
-  const pathChars = String.raw`[A-Za-z0-9._~@%+=:,(){}\[\]\-\/\\]+`;
+  // A path segment deliberately excludes separators. The previous pattern
+  // accepted any single `/x` prefix, so ordinary prose such as `/src` or
+  // `/memory` was converted into fake Git-Bash drive roots (`/s`, `/m`).
+  // Keep this parser structural and conservative: a POSIX/Git-Bash path
+  // needs at least two real segments, while Windows paths need a segment
+  // after the drive separator.
+  const pathSegment = String.raw`[A-Za-z0-9._~@%+=,(){}\[\]\-]+`;
   const patterns = [
-    new RegExp(`([A-Za-z]:[\\\\/]${pathChars})`, "g"),
-    new RegExp(`(/mnt/[A-Za-z](?:/${pathChars})*)`, "g"),
-    new RegExp(`(/[A-Za-z](?:/${pathChars})*)`, "g"),
-    new RegExp(`(~[\\\\/]${pathChars})`, "g"),
+    new RegExp(`([A-Za-z]:[\\\\/]${pathSegment}(?:[\\\\/]${pathSegment})*)`, "g"),
+    new RegExp(`(/mnt/[A-Za-z](?:/${pathSegment})+)`, "g"),
+    new RegExp(`(/(?!mnt/)[A-Za-z0-9._~-]+(?:/${pathSegment})+)`, "g"),
+    new RegExp(`(~[\\\\/]${pathSegment}(?:[\\\\/]${pathSegment})*)`, "g"),
   ];
 
   const candidates = new Set<string>();
@@ -1672,6 +1678,24 @@ function gatherTargetCandidates(
   return candidates;
 }
 
+function explicitlyNamesSoulProject(
+  ego: EgoState,
+  thought?: Thought,
+  workspaceContext?: string,
+): boolean {
+  const params = thought?.actionParams ?? {};
+  const texts = [
+    thought?.content,
+    thought?.triggerDetail,
+    thought?.motivation,
+    typeof params.objective === "string" ? params.objective : undefined,
+    typeof params.reason === "string" ? params.reason : undefined,
+    ...(ego.recentUserMessages ?? []).slice(-6),
+    workspaceContext,
+  ].filter((value): value is string => Boolean(value));
+  return texts.some((text) => /(?:^|[^a-z0-9])openclaw[-_ ]soul(?:$|[^a-z0-9])/i.test(text));
+}
+
 function resolveTargetProject(
   ego: EgoState,
   thought?: Thought,
@@ -1695,6 +1719,15 @@ function resolveTargetProject(
         log.info(`Skipping container directory that is not a source project: ${dir}`);
       }
     }
+  }
+
+  // "openclaw-soul" is the one project name that can be resolved without a
+  // user-supplied filesystem path: this running plugin knows its own linked
+  // checkout. Do this only for that explicit name, after every concrete path
+  // has been checked, so it cannot redirect an arbitrary project request.
+  if (explicitlyNamesSoulProject(ego, thought, workspaceContext) && isProjectDirectory(SOUL_PROJECT_DIR)) {
+    log.info(`Resolved explicit openclaw-soul reference to linked plugin root: ${SOUL_PROJECT_DIR}`);
+    return { dir: SOUL_PROJECT_DIR, name: "openclaw-soul", isSelf: true };
   }
 
   if (candidates.length > 0) {
