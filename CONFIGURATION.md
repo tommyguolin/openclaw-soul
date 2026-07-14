@@ -72,6 +72,39 @@ How often (in milliseconds) Soul checks whether to generate a new thought. This 
 
 Probability of attempting a private, spontaneous association when its five-minute eligibility window opens. Most attempts follow recent mental context; roughly 30% of accepted shadow attempts sample a distant memory pair. These candidates are stored in `~/.openclaw/soul/thought-pool.json` and can never directly execute actions. Maturity requires semantically relevant independent user/tool/web evidence; model repetition does not count. Set to `0` to disable this path (ordinary non-operational thoughts can still enter the pool).
 
+### `cognitionMode`
+
+| | |
+|---|---|
+| **Type** | `"legacy" \| "observe" \| "shadow" \| "primary"` |
+| **Default** | `"legacy"` |
+| **Command** | `openclaw config set plugins.entries.soul.config.cognitionMode observe` |
+
+Controls the gradual Activation Layer rollout.
+
+- `legacy` keeps current production behavior and creates no Activation Observer files.
+- `observe` additionally records which memories become active and which enter a cognitive workspace. It makes no LLM calls, writes no Thought Pool candidates, sends no messages, executes no actions, and does not change Ego thought metrics.
+- `shadow` lets eligible workspaces call the private shadow LLM lane. Generated thoughts are written to the cognitive journal and the isolated `thought-pool-v31-shadow.json` experiment store; they do not enter the real Thought Pool, normal Attention/Expression, messages, actions, or Ego thought metrics. Workspaces that fail the pre-generation activation test make no model call.
+- `primary` makes Activation/Workspace the source of ordinary private thoughts. The Opportunity Detector remains responsible for explicit tasks and actionable intentions. Activation candidates use the real Thought Pool v3.1 path; Attention remains private, expression still passes all existing value/factuality/deduplication/timing/channel gates, and Activation-origin proactive expression is additionally limited to at most one sent item per 24 hours.
+
+Observer state is stored in `~/.openclaw/soul/activation-state.json`; compact cycle traces are appended to `~/.openclaw/soul/cognitive-cycles.jsonl`. Return the option to `legacy` to disable the new path immediately.
+
+### `expressionPolicy`
+
+| | |
+|---|---|
+| **Type** | `"legacy" \| "observe" \| "adaptive"` |
+| **Default** | `"legacy"` |
+| **Command** | `openclaw config set plugins.entries.soul.config.expressionPolicy observe` |
+
+Controls feedback for proactive Expression Proposals and requires `cognitionMode=primary`.
+
+- `legacy` creates no feedback state and preserves the existing expression policy.
+- `observe` records objective observations separately from inferred feedback, but does not alter expression decisions.
+- `adaptive` applies only high-confidence explicit feedback to the minimum expression age, interruption cost, and value threshold. It cannot alter memory activation, private thought emergence, factual evidence requirements, or action permissions.
+
+A missing reply window is stored as `no-reply-window` with an `unclear` inference and does not count as negative feedback. Feedback state is stored in `~/.openclaw/soul/expression-feedback.json`. Set the option back to `legacy` for an immediate policy rollback.
+
 ### `proactiveMessaging`
 
 | | |
@@ -81,6 +114,24 @@ Probability of attempting a private, spontaneous association when its five-minut
 | **Command** | `openclaw config set plugins.entries.soul.config.proactiveMessaging false` |
 
 Whether Soul can send you messages proactively. When `false`, Soul still thinks, learns, and remembers — it just doesn't send messages. Useful if you want Soul's memory and context injection without the proactive outreach.
+
+After every inbound message, Soul enforces a five-minute active-conversation
+quiet period. During this window its background cycle, private LLM calls, and
+proactive messages are deferred; normal assistant replies are unaffected.
+
+### Codex outbound memory permission
+
+Codex may send channel replies from inside its app-server harness, bypassing
+the ordinary outbound hooks. To let Soul remember only successful
+`message.send` calls from those completed turns, enable the conversation hook:
+
+```bash
+openclaw config set plugins.entries.soul.hooks.allowConversationAccess true --strict-json
+```
+
+The handler remains restricted to channel-backed sessions already observed by
+`message_received`. Failed sends, internal Soul model sessions, edits, and
+historical tool calls before the latest user message are ignored.
 
 ### `proactiveChannel`
 

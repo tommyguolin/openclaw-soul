@@ -731,14 +731,15 @@ export class ThoughtService {
     const timeContext = hours > 0
       ? (lang === "zh" ? `距离上次聊天已经${hours}小时了` : `it's been ${hours} hour${hours > 1 ? "s" : ""} since we last chatted`)
       : "";
+    const focusLine = this.buildStartupFocusLine(ego, lang);
 
     const greeting = lang === "zh"
       ? (this.thoughtFrequency < 0.5
-        ? `Soul已进入测试观察模式，接下来我会更频繁地产生和筛选主动想法；${timeContext ? timeContext + "，" : ""}只有判断有具体价值时才会打扰你。`
-        : `嗨，Soul刚刚醒来了，准备开始思考。${timeContext ? timeContext + "，" : ""}有什么想法随时找我聊！`)
+        ? `Soul已进入测试观察模式，我会更频繁地筛选能真正帮上忙的内容。${timeContext ? `${timeContext}，` : ""}${focusLine ? `${focusLine}。` : ""}只有判断有具体价值时才会打扰你。`
+        : `嗨，Soul刚刚醒来了，准备开始思考。${timeContext ? `${timeContext}，` : ""}${focusLine ? `${focusLine}。` : ""}接下来我会优先找出能直接帮上你的地方。`)
       : (this.thoughtFrequency < 0.5
-        ? `Soul is running in observation test mode. ${timeContext ? timeContext + ". " : ""}I'll think and filter more often, and only reach out when there is concrete value.`
-        : `Hey, Soul just woke up and is ready to think. ${timeContext ? timeContext + "." : ""} Feel free to chat anytime!`);
+        ? `Soul is running in observation test mode. ${timeContext ? `${timeContext}. ` : ""}${focusLine ? `${focusLine}. ` : ""}I'll think and filter more often, and only reach out when there is concrete value.`
+        : `Hey, Soul just woke up and is ready to think. ${timeContext ? `${timeContext}. ` : ""}${focusLine ? `${focusLine}. ` : ""}I'll focus on the places where I can help you directly.`);
 
     try {
       await this.sendMessage({
@@ -1337,6 +1338,47 @@ export class ThoughtService {
     } catch (err) {
       log.warn(`Failed to prompt for autonomousActions: ${String(err)}`);
     }
+  }
+
+  private summarizeGreetingText(text: string, maxLength = 48): string {
+    const compact = text.replace(/\s+/g, " ").trim();
+    if (compact.length <= maxLength) return compact;
+    return `${compact.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+  }
+
+  private buildStartupFocusLine(ego: EgoState, lang: "zh" | "en"): string {
+    const recentUserMessage = [...(ego.recentUserMessages ?? [])]
+      .reverse()
+      .find((message) => message.trim().length >= 8);
+    const activeGoal = [...ego.goals]
+      .filter((goal) => {
+        if (goal.status !== "active") return false;
+        const goalText = `${goal.id} ${goal.title} ${goal.description}`;
+        return !/(?:self.?improv|maintenance|observe|know the user|build trust|了解用户|建立信任)/i.test(goalText);
+      })
+      .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+    const activeFact = [...(ego.userFacts ?? [])]
+      .filter((fact) => fact.validity !== "superseded" && fact.confidence >= 0.7)
+      .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+
+    const items: string[] = [];
+    if (recentUserMessage) {
+      items.push(lang === "zh"
+        ? `我记得你最近在关注「${this.summarizeGreetingText(recentUserMessage)}」`
+        : `I remember your recent focus: “${this.summarizeGreetingText(recentUserMessage)}”`);
+    }
+    if (activeGoal) {
+      items.push(lang === "zh"
+        ? `我会优先盯住「${this.summarizeGreetingText(activeGoal.title)}」`
+        : `I’ll keep an eye on “${this.summarizeGreetingText(activeGoal.title)}”`);
+    }
+    if (activeFact) {
+      items.push(lang === "zh"
+        ? `我也会沿着「${this.summarizeGreetingText(activeFact.content)}」继续找具体帮助`
+        : `I’ll keep following “${this.summarizeGreetingText(activeFact.content)}” for concrete help`);
+    }
+
+    return items.slice(0, 2).join(lang === "zh" ? "；" : " ");
   }
 
   private hasAutonomousWorkDirective(ego: EgoState): boolean {

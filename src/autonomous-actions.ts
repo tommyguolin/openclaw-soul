@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { dirname, join, normalize, parse as parsePath, resolve } from "node:path";
+import { dirname, join, normalize, parse as parsePath, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
 import { createSoulLogger } from "./logger.js";
@@ -103,7 +103,8 @@ function recentAutonomousFailureBackoff(ego: EgoState): { count: number; remaini
   const failures = (ego.activeTasks ?? [])
     .filter((task) => {
       const ts = task.completedAt ?? task.updatedAt ?? task.createdAt;
-      return ts >= cutoff && isLowValueAutonomousFailure(task);
+      return ts >= cutoff && (isLowValueAutonomousFailure(task)
+        || /No source files found|does not resolve to a source project/i.test(task.result ?? ""));
     })
     .sort((a, b) => (b.completedAt ?? b.updatedAt ?? b.createdAt) - (a.completedAt ?? a.updatedAt ?? a.createdAt));
 
@@ -1401,25 +1402,33 @@ Output ONLY the message, nothing else.`;
 // executeObserveAndImprove — analyze and fix code in any project
 // ---------------------------------------------------------------------------
 
-function resolveSoulSourceDir(): string {
+function resolveSoulProjectDir(): string {
   const moduleDir = dirname(fileURLToPath(import.meta.url));
-  const repoSrc = resolve(moduleDir, "..", "..", "src");
-  try {
-    if (statSync(repoSrc).isDirectory()) {
-      return repoSrc;
+  const candidates = [resolve(moduleDir, ".."), resolve(moduleDir, "..", "..")];
+  for (const candidate of candidates) {
+    try {
+      if (statSync(join(candidate, "package.json")).isFile()) return candidate;
+    } catch {
+      // Try the next layout (source checkout versus compiled dist/src).
     }
-  } catch {
-    // Fall back to the runtime module directory in packaged installs.
   }
   return moduleDir;
 }
 
-const SOUL_SRC_DIR = resolveSoulSourceDir();
+const SOUL_PROJECT_DIR = resolveSoulProjectDir();
 
 // Files that must NOT be auto-modified (entry points, type definitions)
 const PROTECTED_FILES = new Set(["index.ts", "types.ts", "paths.ts", "logger.ts"]);
 
 const SOURCE_EXTENSIONS = [".ts", ".js", ".py", ".go", ".rs", ".java", ".c", ".cpp", ".rb"];
+const PROJECT_MARKERS = new Set([
+  "package.json", "pyproject.toml", "setup.py", "requirements.txt", "pom.xml",
+  "build.gradle", "build.gradle.kts", "cargo.toml", "go.mod", "makefile", ".git",
+]);
+const IGNORED_SOURCE_DIRS = new Set([
+  ".git", ".tmp", "node_modules", "dist", "build", "coverage", "target", "vendor",
+]);
+const MAX_IMPROVEMENT_SOURCE_FILES = 80;
 
 type ImprovementProposal = {
   problem: string;
@@ -1613,13 +1622,12 @@ function resolveTargetProject(
         log.warn(`Ignoring unsafe target project root candidate: ${dir} (from ${candidate.raw})`);
         continue;
       }
+      if (pathExists(dir) && isProjectDirectory(dir)) {
+        const projectName = parsePath(resolve(dir)).base || candidate.raw;
+        return { dir, name: projectName, isSelf: false };
+      }
       if (pathExists(dir)) {
-        const name = candidate.source === "goal"
-          ? `goal path: ${candidate.raw}`
-          : candidate.source === "thought" || candidate.source === "recentMessage"
-            ? `current directive: ${candidate.raw.slice(0, 60)}`
-            : `${candidate.source} path: ${candidate.raw.slice(0, 60)}`;
-        return { dir, name, isSelf: false };
+        log.info(`Skipping container directory that is not a source project: ${dir}`);
       }
     }
   }
@@ -1628,15 +1636,50 @@ function resolveTargetProject(
     log.warn(`Target project path not found or unsafe; tried: ${tried.join(", ")}. Falling back to Soul self-improvement.`);
   }
 
-  return { dir: SOUL_SRC_DIR, name: "Soul plugin (self-improvement)", isSelf: true };
+  return { dir: SOUL_PROJECT_DIR, name: "Soul plugin (self-improvement)", isSelf: true };
 }
 
-/** Get all source files in a directory (excluding protected files). */
-function getSourceFiles(dir: string): string[] {
+function isProjectDirectory(dir: string): boolean {
   try {
-    return readdirSync(dir)
-      .filter((f) => SOURCE_EXTENSIONS.some((ext) => f.endsWith(ext)) && !PROTECTED_FILES.has(f))
-      .sort();
+    return readdirSync(dir, { withFileTypes: true }).some((entry) => {
+      const lower = entry.name.toLowerCase();
+      return PROJECT_MARKERS.has(lower)
+        || (entry.isFile() && SOURCE_EXTENSIONS.some((ext) => lower.endsWith(ext)));
+    });
+  } catch {
+    return false;
+  }
+}
+
+/** Get bounded recursive source paths relative to a project root. */
+function getSourceFiles(dir: string): string[] {
+  const files: string[] = [];
+  const visit = (current: string, depth: number): void => {
+    if (depth > 5 || files.length >= MAX_IMPROVEMENT_SOURCE_FILES) return;
+    let entries;
+    try {
+      entries = readdirSync(current, { withFileTypes: true })
+        .sort((a, b) => a.name.localeCompare(b.name));
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (files.length >= MAX_IMPROVEMENT_SOURCE_FILES) break;
+      const lower = entry.name.toLowerCase();
+      const fullPath = join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (!IGNORED_SOURCE_DIRS.has(lower)) visit(fullPath, depth + 1);
+        continue;
+      }
+      if (!entry.isFile() || PROTECTED_FILES.has(entry.name)) continue;
+      if (SOURCE_EXTENSIONS.some((ext) => lower.endsWith(ext))) {
+        files.push(relative(dir, fullPath).replace(/\\/g, "/"));
+      }
+    }
+  };
+  try {
+    visit(dir, 0);
+    return files;
   } catch {
     return [];
   }
@@ -1651,6 +1694,7 @@ export async function executeObserveAndImprove(
     return { result: { type: "observe-and-improve", success: false, error: "No LLM generator" }, metricsChanged: [] };
   }
   const readOnlyMode = !options.autonomousActions;
+  const reportZh = wantsChineseReport(ego);
 
   // Only 1 concurrent improvement task
   const activeImprove = (ego.activeTasks ?? []).filter(
@@ -1709,7 +1753,33 @@ export async function executeObserveAndImprove(
   log.info(`Improvement: read ${fileContents.length}/${allFiles.length} source files from ${target.dir}`);
 
   if (fileContents.length === 0) {
-    await completeTask(taskId, `No source files found in ${target.dir}`);
+    const noSourceReport = `Status: failed
+Task: ${taskId}
+Finished: ${new Date().toISOString()}
+
+## Outcome
+${reportZh
+    ? `未执行代码优化：${target.dir} 不是可读取的源码项目。`
+    : `No improvement was performed because ${target.dir} does not resolve to a readable source project.`}
+
+## Changes
+${reportZh ? "没有修改任何文件。" : "No files were changed."}
+
+## Verification
+${reportZh
+    ? "源码扫描已检查目标目录，符合条件的源码文件为 0。"
+    : "Source discovery inspected the resolved target and found 0 eligible source files."}
+
+## Metrics
+${reportZh
+    ? "检查文件：0；修改文件：0；通过验证命令：0。"
+    : "Files inspected: 0. Files modified: 0. Verification commands passed: 0."}
+
+## Next
+${reportZh
+    ? "下一次 Improvement 必须先解析到具体项目根目录，不能再把项目集合目录当成源码项目。"
+    : "Resolve the directive to a concrete project root before starting another improvement."}`;
+    await completeTask(taskId, noSourceReport, "failed");
     return { result: { type: "observe-and-improve", success: false, error: `No source files found in ${target.dir}` }, metricsChanged: [] };
   }
 
@@ -1761,6 +1831,9 @@ Rules:
   let verificationSummary = "";
   let analysisCompleted = false;
   let analysisFailure = "";
+  let proposedFile = "";
+  let proposedProblem = "";
+  let proposedExplanation = "";
 
   try {
     const llmResponse = await options.llmGenerator(analysisPrompt);
@@ -1771,6 +1844,9 @@ Rules:
     if (parsed.proposal) {
       try {
         const { file: fixFile, oldCode, newCode, problem, explanation } = parsed.proposal;
+        proposedFile = fixFile;
+        proposedProblem = problem;
+        proposedExplanation = explanation;
 
         if (!oldCode && !newCode) {
           fixDescription = explanation || problem || "No concrete fix identified after analysis";
@@ -1835,13 +1911,62 @@ Rules:
 
   log.info(`Improvement analysis done: fixApplied=${fixApplied}, ${fixDescription || "no fix"}`);
 
-  const result = fixApplied
-    ? `${fixDescription}\n\nVerification:\n${verificationSummary || "verification passed"}`
-    : `Analysis of ${target.dir}. ${fixDescription || "No concrete fix identified."} ${analysisResult.slice(0, 300)}`;
   const taskStatus: "completed" | "failed" =
-    fixApplied || (analysisCompleted && !analysisFailure)
+    fixApplied || (readOnlyMode && analysisCompleted && !analysisFailure)
       ? "completed"
       : "failed";
+  const outcomeText = reportZh
+    ? fixApplied
+      ? `已完成并验证一项明确优化：${proposedProblem || fixDescription}。`
+      : readOnlyMode && analysisCompleted && !analysisFailure
+        ? `只读分析已完成：${fixDescription || proposedProblem || "没有发现足够明确的优化项"}。`
+        : `本次没有完成代码优化：${fixDescription || analysisFailure || "没有找到可安全实施的修改"}。`
+    : fixApplied
+      ? `Applied and verified one concrete improvement: ${proposedProblem || fixDescription}.`
+      : readOnlyMode && analysisCompleted && !analysisFailure
+        ? `Completed a read-only analysis: ${fixDescription || proposedProblem || "no concrete improvement was identified"}.`
+        : `No autonomous code improvement was completed: ${fixDescription || analysisFailure || "no safe change was identified"}.`;
+  const changesText = fixApplied
+    ? reportZh
+      ? `- 修改文件：${proposedFile}\n- 修复问题：${proposedProblem || "未说明"}\n- 功能优化：${proposedExplanation || fixDescription}`
+      : `- File: ${proposedFile}\n- Problem fixed: ${proposedProblem || "not specified"}\n- Functional improvement: ${proposedExplanation || fixDescription}`
+    : reportZh
+      ? `没有修改任何文件。${proposedFile ? `候选文件：${proposedFile}。` : ""}`
+      : `No files were changed.${proposedFile ? ` Candidate file: ${proposedFile}.` : ""}`;
+  const verificationText = fixApplied
+    ? verificationSummary || (reportZh ? "配置的验证命令已通过。" : "The configured verification command passed.")
+    : readOnlyMode
+      ? reportZh ? "自主写入未启用，因此没有执行验证命令。" : "No command was run because autonomous write mode was disabled."
+      : analysisFailure || (reportZh ? "没有应用修改，因此没有执行验证。" : "No verification was run because no change was applied.");
+  const metricsText = reportZh
+    ? `发现源码文件：${allFiles.length}；读取文件：${fileContents.length}；修改文件：${fixApplied ? 1 : 0}；验证：${fixApplied ? "通过" : "未执行"}。`
+    : `Source files discovered: ${allFiles.length}. Files read: ${fileContents.length}. Files modified: ${fixApplied ? 1 : 0}. Verification: ${fixApplied ? "passed" : "not run"}.`;
+  const nextText = reportZh
+    ? fixApplied
+      ? "在正常使用中观察这项修改；只有出现不同且有证据的问题时，才启动下一次 Improvement。"
+      : "不能把本次任务汇报成已完成的代码优化；必须先收窄目标或补充证据再重试。"
+    : fixApplied
+      ? "Review the verified change in normal use and only start another improvement when there is a distinct issue."
+      : "Do not report this as a completed code improvement; refine the target or evidence before retrying.";
+  const result = `Status: ${taskStatus}
+Task: ${taskId}
+Finished: ${new Date().toISOString()}
+Target: ${target.dir}
+
+## Outcome
+${outcomeText}
+
+## Changes
+${changesText}
+
+## Verification
+${verificationText}
+
+## Metrics
+${metricsText}
+
+## Next
+${nextText}`;
 
   await completeTask(taskId, result, taskStatus);
 

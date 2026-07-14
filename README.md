@@ -156,8 +156,19 @@ Just start chatting. Soul begins thinking and building a profile immediately.
 | Hook | What Soul Does |
 |------|---------------|
 | `message_received` | Records interaction, detects language, extracts user facts |
-| `message_sending` / `message_sent` | Stores outbound conversation memory idempotently across OpenClaw hook versions |
+| `message_sending` / `message_sent` / `reply_payload_sending` | Stores ordinary outbound conversation memory idempotently across OpenClaw hook versions |
+| `agent_end` | Captures successful Codex-internal `message.send` replies that bypass the normal delivery hooks |
 | `before_prompt_build` | Injects soul context (needs, memories, knowledge, personality) |
+
+Codex `agent_end` capture requires explicit conversation access for this
+non-bundled plugin:
+
+```bash
+openclaw config set plugins.entries.soul.hooks.allowConversationAccess true --strict-json
+```
+
+Soul defers its background cycle for five minutes after an inbound message, so
+proactive outreach and private LLM work cannot compete with an active chat.
 
 ### Self-Improvement Loop
 
@@ -204,9 +215,13 @@ All options have sensible defaults. Only configure what you need.
 |--------|---------|---------|
 | `autonomousActions` | `false` | `openclaw config set plugins.entries.soul.config.autonomousActions true` |
 | `thoughtFrequency` | `1.0` | `openclaw config set plugins.entries.soul.config.thoughtFrequency 0.5` |
+| `cognitionMode` | `legacy` | `openclaw config set plugins.entries.soul.config.cognitionMode observe` |
+| `expressionPolicy` | `legacy` | `openclaw config set plugins.entries.soul.config.expressionPolicy observe` |
 
 - **`autonomousActions`** — Allow Soul to edit files and run commands. When `false`, Soul can still read files and run diagnostics, but cannot modify anything. When `true`, Soul can fix bugs, edit its own code, and run any command.
 - **`thoughtFrequency`** — How often Soul thinks and messages. `0.2`-`0.4` for testing and faster proactive outreach, `1.0` for default, `2.0` for quiet.
+- **`cognitionMode`** — `legacy` keeps current behavior. `observe` records activation without an LLM. `shadow` generates private thoughts into an isolated experiment pool. `primary` makes Activation/Workspace the ordinary private-thought source while keeping operational detectors and every existing expression/action safety gate; Activation-origin outreach is capped at one sent item per 24 hours.
+- **`expressionPolicy`** — `legacy` disables the feedback layer. With `cognitionMode=primary`, `observe` records objective reply/no-reply observations without changing behavior, while `adaptive` lets high-confidence explicit feedback adjust expression waiting time and value threshold only. No reply is recorded as uncertain, never as automatic rejection or annoyance.
 
 Soul extracts project paths from user requests such as "optimize the project under `/path/to/project`". If a path cannot be read directly, Soul also tries common cross-platform mappings such as Git Bash `/c/work/project`, WSL `/mnt/c/work/project`, and Windows `C:\work\project`.
 
@@ -241,6 +256,7 @@ Any OpenAI-compatible or Anthropic API: Claude, GPT-4o, DeepSeek, Zhipu, Minimax
 | `thought-lab.ts` | Read-only accelerated baseline and A/B experiments |
 | `thought-emergence.ts` | Shared remote-memory selection, prompts, and quality classification |
 | `thought-pool.ts` | Persistent private candidate incubation and attention scoring |
+| `cognition/` | Read-only Activation Observer: sparse memory activation, decay/fatigue, workspace, state, and journal |
 | `behavior-log.ts` | Tracks action outcomes & adjusts probabilities |
 | `ego-store.ts` | Ego state persistence (JSON) |
 | `knowledge-store.ts` | Knowledge persistence & search |
@@ -280,6 +296,8 @@ npm run thought-lab -- --input /path/to/existing-run.jsonl
 ```
 
 Reported metrics include opportunity, thought, action and cognitive-move distributions; no-op and repetition rates; lexical semantic diversity; source-memory age/diversity; cross-topic association rate; and explicit meta-framing, task-pressure, and truncation leakage rates. Remote pairs are chosen across coarse topic clusters before lexical distance, so two differently worded trading memories are no longer mislabeled as cross-topic. The spontaneous path records exact source memories; baseline records label source-memory matches as lexical inference because the production detector does not preserve provenance IDs. “Useful surprise” and “nonsense” remain explicit blind-review measures rather than pretending a heuristic can judge them.
+
+The Activation Observer also exposes `runCognitionLab()` from `src/cognition/lab.ts`. It reuses the exact production `CognitionRunner`, writes only lab-local activation state/journal files, and reports pre-generation silence, active-set/workspace size, trace diversity, and resolved suppression without modifying the Ego snapshot.
 
 ## Development
 

@@ -125,6 +125,28 @@ test("low thoughtFrequency startup greeting uses observation-mode cooldown", asy
   }
 });
 
+test("startup greeting hides Soul's internal default goals", () => {
+  const service = new ThoughtService();
+  const ego = createDefaultEgoState();
+  type StartupInternals = {
+    buildStartupFocusLine(ego: EgoState, lang: "zh" | "en"): string;
+  };
+  const internals = service as unknown as StartupInternals;
+
+  assert.equal(internals.buildStartupFocusLine(ego, "zh"), "");
+
+  ego.goals.push({
+    id: "goal-user-project",
+    title: "完成 Soul 项目优化",
+    description: "改善念头机制",
+    progress: 0.2,
+    status: "active",
+    createdAt: Date.now(),
+    updatedAt: Date.now() + 1,
+  });
+  assert.match(internals.buildStartupFocusLine(ego, "zh"), /完成 Soul 项目优化/);
+});
+
 test("active inbound conversation defers the Soul background cycle for five minutes", async () => {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-conversation-quiet-"));
   try {
