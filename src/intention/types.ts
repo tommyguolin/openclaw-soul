@@ -6,6 +6,7 @@ export interface Intention {
   desiredState: string;
   origin: IntentionOrigin;
   originId?: string;
+  conversationId?: string;
   commitment: number;
   urgency: number;
   confidence: number;

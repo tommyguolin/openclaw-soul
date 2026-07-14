@@ -88,6 +88,7 @@ import { inferCognitiveKind } from "./cognition/kind.js";
 import { emergeFromWorkspace } from "./cognition/emergence.js";
 import { IntentionStore, resolveIntentionStorePath } from "./intention/store.js";
 import { buildUserDirectiveIntention, isExplicitUserDirective } from "./intention/formation.js";
+import { WorkHandoffStore, resolveWorkHandoffStorePath } from "./handoff/store.js";
 import { ExpressionStore, resolveExpressionStorePath } from "./expression/store.js";
 import {
   ExpressionFeedbackStore, resolveExpressionFeedbackPath,
@@ -355,6 +356,7 @@ export class ThoughtService {
   private cognitionMode: CognitionMode;
   private cognitionRunner?: CognitionRunner;
   private intentionStore?: IntentionStore;
+  private workHandoffStore?: WorkHandoffStore;
   private expressionStore?: ExpressionStore;
   private expressionFeedbackStore?: ExpressionFeedbackStore;
   private expressionPolicy: ExpressionPolicyMode;
@@ -426,6 +428,7 @@ export class ThoughtService {
       }
       if (this.cognitionMode === "primary") {
         this.intentionStore = new IntentionStore(resolveIntentionStorePath(this.storePath));
+        this.workHandoffStore = new WorkHandoffStore(resolveWorkHandoffStorePath(this.storePath));
         this.expressionStore = new ExpressionStore(resolveExpressionStorePath(this.storePath));
         this.thoughtEpisodeStore = new ThoughtEpisodeStore(resolveThoughtEpisodeStorePath(this.storePath));
         if (this.expressionPolicy !== "legacy") {
@@ -2419,13 +2422,27 @@ export class ThoughtService {
     }
     if (typeof thought.actionParams?.intentionId === "string") return;
     const intentions = await this.intentionStore.load();
+    const handoffs = await this.workHandoffStore?.load();
+    const activeIds = new Set(intentions.intentions
+      .filter((item) => item.origin === "user-directive" && item.status === "active")
+      .map((item) => item.id));
+    const latestHandoffIntentionId = handoffs?.handoffs
+      .filter((handoff) => activeIds.has(handoff.intentionId))
+      .sort((a, b) => b.updatedAt - a.updatedAt)[0]?.intentionId;
     const thoughtTokens = contentTokens(`${thought.content} ${thought.motivation}`);
-    const userIntention = intentions.intentions
+    const matchedUserIntention = intentions.intentions
       .filter((item) => item.origin === "user-directive" && item.status === "active"
         && Date.now() - item.updatedAt < 24 * 60 * 60 * 1000)
       .map((item) => ({ item, overlap: jaccard(thoughtTokens, contentTokens(item.desiredState)) }))
       .filter((entry) => entry.overlap >= 0.05 || thought.cognitiveKind === "task-continuation")
-      .sort((a, b) => b.overlap - a.overlap || b.item.updatedAt - a.item.updatedAt)[0]?.item;
+      .sort((a, b) => b.overlap - a.overlap || b.item.updatedAt - a.item.updatedAt)[0];
+    const handoffIntention = latestHandoffIntentionId
+      ? intentions.intentions.find((item) => item.id === latestHandoffIntentionId)
+      : undefined;
+    const preferHandoff = thought.actionType === "observe-and-improve"
+      && handoffIntention
+      && (!matchedUserIntention || matchedUserIntention.overlap < 0.05);
+    const userIntention = preferHandoff ? handoffIntention : matchedUserIntention?.item;
     const intention = userIntention ?? (await this.intentionStore.add({
       desiredState: thought.motivation.slice(0, 500),
       origin: thought.actionType === "observe-and-improve" ? "maintenance" : "thought",
@@ -2437,7 +2454,21 @@ export class ThoughtService {
       constraints: ["respect configured permissions", "preserve action safety gates"],
       status: "active",
     })).intention;
-    thought.actionParams = { ...(thought.actionParams ?? {}), intentionId: intention.id };
+    const handoff = await this.workHandoffStore?.latestForIntention(intention.id);
+    thought.actionParams = {
+      ...(thought.actionParams ?? {}),
+      intentionId: intention.id,
+      objective: handoff?.objective ?? intention.desiredState,
+      acceptanceCriteria: handoff?.acceptanceCriteria ?? intention.evidenceNeeded,
+      ...(handoff ? {
+        workHandoffId: handoff.id,
+        projectRoot: handoff.targetProjectRoot,
+        priorWorkPhase: handoff.phase,
+        priorModifiedFiles: handoff.modifiedFiles,
+        priorVerificationCommands: handoff.verificationCommands,
+        priorFailedTools: handoff.failedTools,
+      } : {}),
+    };
   }
 
   private async executeThoughtAction(
@@ -3004,7 +3035,7 @@ export class ThoughtService {
       });
       if (this.cognitionMode === "primary" && this.intentionStore && isExplicitUserDirective(text)) {
         const originId = messageId || createdInteractionMemoryId;
-        const result = await this.intentionStore.add(buildUserDirectiveIntention(text, originId));
+        const result = await this.intentionStore.add(buildUserDirectiveIntention(text, originId, conversationId));
         if (result.created) log.info(`User directive recorded as Intention: id=${result.intention.id}`);
       }
       if (this.expressionFeedbackStore && this.expressionStore) {

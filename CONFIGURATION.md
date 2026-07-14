@@ -119,7 +119,7 @@ After every inbound message, Soul enforces a five-minute active-conversation
 quiet period. During this window its background cycle, private LLM calls, and
 proactive messages are deferred; normal assistant replies are unaffected.
 
-### Codex outbound memory permission
+### Codex conversation and project-continuity permission
 
 Codex may send channel replies from inside its app-server harness, bypassing
 the ordinary outbound hooks. To let Soul remember only successful
@@ -130,8 +130,24 @@ openclaw config set plugins.entries.soul.hooks.allowConversationAccess true --st
 ```
 
 The handler remains restricted to channel-backed sessions already observed by
-`message_received`. Failed sends, internal Soul model sessions, edits, and
-historical tool calls before the latest user message are ignored.
+`message_received`. Failed sends, internal Soul model sessions, message edits,
+and historical tool calls before the latest user message are ignored.
+
+The same permission lets Soul retain bounded project metadata from successful
+host-agent tool calls after the latest user message: project root, observed and
+modified relative file paths, and verification command names. It does not copy
+source contents into Ego state and does not grant additional write authority.
+This context prevents a later Improvement from losing the project that the main
+agent just inspected or edited. Ambiguous paths now stop the task instead of
+falling back to a different project.
+
+With `cognitionMode=primary`, an explicit user directive is additionally linked
+to the successful host-agent project activity in
+`~/.openclaw/soul/work-handoffs.json`. The handoff persists the objective,
+project root, work phase, evidence, and acceptance criteria across gateway
+restarts. It is metadata only and does not expand `autonomousActions` or any
+tool permission. Conversation provenance is used when available so an active
+directive from another chat is not selected merely because it is recent.
 
 ### `proactiveChannel`
 

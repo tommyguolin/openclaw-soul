@@ -198,6 +198,8 @@ export function createDefaultEgoState(): EgoState {
     userLanguage: null,
     recentUserMessages: [],
     activeTasks: [],
+    projectContexts: [],
+    activeProjectRoot: null,
     mentalContext: {
       foreground: [], residue: [], backgroundConcerns: [],
       environmentalChanges: [], associativeEcho: [], updatedAt: Date.now(),
@@ -232,6 +234,7 @@ function mergeWithDefaultsV2(loaded: Partial<EgoState>): EgoState {
     "awakeningThoughts",
     "establishedRoutines",
     "activeTasks",
+    "projectContexts",
     "recentUserMessages",
   ] as (keyof EgoState)[]) {
     if (loaded[key] !== undefined) {
@@ -263,6 +266,7 @@ function mergeWithDefaultsV2(loaded: Partial<EgoState>): EgoState {
     "proactiveChannel",
     "proactiveTarget",
     "userLanguage",
+    "activeProjectRoot",
   ] as (keyof EgoState)[]) {
     if (loaded[key] !== undefined) {
       (result as Record<string, unknown>)[key] = loaded[key];

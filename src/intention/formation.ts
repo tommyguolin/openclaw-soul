@@ -9,15 +9,29 @@ export function isExplicitUserDirective(text: string): boolean {
   return EXPLICIT_DIRECTIVE.test(normalized);
 }
 
-export function buildUserDirectiveIntention(text: string, originId: string): Omit<Intention, "id" | "createdAt" | "updatedAt"> {
+export function buildUserDirectiveIntention(
+  text: string,
+  originId: string,
+  conversationId?: string,
+): Omit<Intention, "id" | "createdAt" | "updatedAt"> {
+  const evidenceNeeded: string[] = [];
+  if (/(?:修复|实现|修改|优化|部署|fix|implement|modify|optimi[sz]e|deploy)/i.test(text)) {
+    evidenceNeeded.push("concrete changed files", "relevant verification command passes");
+  } else if (/(?:测试|验证|test|verify)/i.test(text)) {
+    evidenceNeeded.push("verification command and concrete result");
+  } else if (/(?:检查|查看|分析|定位|调查|inspect|check|analyze|diagnose|investigate)/i.test(text)) {
+    evidenceNeeded.push("root cause or finding supported by code, logs, or tool evidence");
+  }
+  evidenceNeeded.push("clear user-facing outcome report");
   return {
     desiredState: text.replace(/\s+/g, " ").trim().slice(0, 500),
     origin: "user-directive",
     originId,
+    conversationId,
     commitment: 1,
     urgency: /立即|马上|现在|urgent|immediately|now\b/i.test(text) ? 0.9 : 0.7,
     confidence: 0.95,
-    evidenceNeeded: [],
+    evidenceNeeded,
     constraints: ["preserve user scope", "respect configured permissions"],
     status: "active",
   };

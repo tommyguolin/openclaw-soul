@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { IntentionStore } from "../src/intention/store.js";
+import { WorkHandoffStore } from "../src/handoff/store.js";
 
 test("autonomous improvement reports concrete verified changes and never completes a no-change write run", async () => {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-improvement-"));
@@ -99,18 +101,85 @@ test("autonomous improvement reports concrete verified changes and never complet
       JSON.stringify({ name: "nested" }),
       "utf8",
     );
-    let fallbackPrompt = "";
-    const fallbackThought = {
+    let ambiguousPromptCalled = false;
+    const ambiguousThought = {
       ...thought,
-      id: "container-fallback-test",
+      id: "ambiguous-container-test",
       content: `Improve ${containerDir}`,
       createdAt: Date.now() + 2,
     };
-    const fallback = await executeObserveAndImprove(fallbackThought, ego, {
+    const ambiguous = await executeObserveAndImprove(ambiguousThought, ego, {
+      autonomousActions: false,
+      gatewayPort: 18789,
+      llmGenerator: async () => {
+        ambiguousPromptCalled = true;
+        return "{}";
+      },
+    });
+    assert.equal(ambiguous.result.success, false);
+    assert.equal(ambiguousPromptCalled, false);
+    assert.match(ambiguous.result.error ?? "", /ambiguous|does not resolve/i);
+
+    ego.projectContexts = [{
+      root: projectDir,
+      name: "sample-project",
+      source: "agent-tool",
+      confidence: 1,
+      sessionKey: "agent:main:feishu:direct:user",
+      lastObservedAt: Date.now(),
+      lastModifiedAt: Date.now(),
+      observedFiles: ["app.js"],
+      modifiedFiles: ["app.js"],
+      verificationCommands: ["npm run typecheck"],
+    }];
+    ego.activeProjectRoot = projectDir;
+    const intentionStore = new IntentionStore(path.join(stateDir, "soul", "intentions.json"));
+    const linkedIntention = (await intentionStore.add({
+      desiredState: "Improve the project and verify the change",
+      origin: "user-directive",
+      originId: "bridge-directive",
+      commitment: 1,
+      urgency: 0.8,
+      confidence: 0.95,
+      evidenceNeeded: ["concrete changed files", "relevant verification command passes"],
+      constraints: ["preserve user scope"],
+      status: "active",
+    })).intention;
+    const workHandoffStore = new WorkHandoffStore(path.join(stateDir, "soul", "work-handoffs.json"));
+    const linkedHandoff = await workHandoffStore.upsert({
+      intentionId: linkedIntention.id,
+      objective: linkedIntention.desiredState,
+      targetProjectRoot: projectDir,
+      phase: "implementing",
+      acceptanceCriteria: linkedIntention.evidenceNeeded,
+      observedFiles: ["app.js"],
+      modifiedFiles: ["app.js"],
+      verificationCommands: [],
+      failedTools: [],
+    });
+    let bridgedPrompt = "";
+    const bridgedThought = {
+      ...thought,
+      id: "project-context-bridge-test",
+      content: "Improve the project the main agent just edited",
+      createdAt: Date.now() + 3,
+      actionParams: {
+        intentionId: linkedIntention.id,
+        workHandoffId: linkedHandoff.id,
+        projectRoot: projectDir,
+        objective: "Improve the project and verify the change",
+        priorWorkPhase: "implementing",
+        acceptanceCriteria: ["concrete changed files", "relevant verification command passes"],
+        priorModifiedFiles: ["app.js"],
+        priorVerificationCommands: ["npm run typecheck"],
+        priorFailedTools: [],
+      },
+    };
+    const bridged = await executeObserveAndImprove(bridgedThought, ego, {
       autonomousActions: false,
       gatewayPort: 18789,
       llmGenerator: async (prompt: string) => {
-        fallbackPrompt = prompt;
+        bridgedPrompt = prompt;
         return JSON.stringify({
           problem: "No grounded issue found.",
           file: "",
@@ -120,9 +189,23 @@ test("autonomous improvement reports concrete verified changes and never complet
         });
       },
     });
-    assert.equal(fallback.result.success, true);
-    assert.match(fallbackPrompt, /Soul plugin itself/);
-    assert.doesNotMatch(fallback.result.error ?? "", /No source files found/);
+    assert.equal(bridged.result.success, true);
+    assert.match(bridgedPrompt, new RegExp(projectDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(bridgedPrompt, /Recently modified files: app\.js/);
+    assert.match(bridgedPrompt, /Verification commands already used: npm run typecheck/);
+    assert.match(bridgedPrompt, /Durable work handoff/);
+    assert.match(bridgedPrompt, new RegExp(`Handoff: ${linkedHandoff.id}`));
+    assert.doesNotMatch(bridgedPrompt, /Soul plugin itself/);
+    store = JSON.parse(await fs.promises.readFile(storePath, "utf8"));
+    const bridgedTask = store.ego.activeTasks.find((task: any) => task.sourceThoughtId === bridgedThought.id);
+    assert.equal(bridgedTask.intentionId, linkedIntention.id);
+    assert.equal(bridgedTask.workHandoffId, linkedHandoff.id);
+    assert.equal(bridgedTask.targetProjectRoot, projectDir);
+    assert.deepEqual(bridgedTask.acceptanceCriteria, ["concrete changed files", "relevant verification command passes"]);
+    assert.match(bridgedTask.result, /## Acceptance/);
+    assert.match(bridgedTask.result, /\[ \] concrete changed files/);
+    assert.equal((await intentionStore.load()).intentions[0].status, "blocked");
+    assert.equal((await workHandoffStore.load()).handoffs[0].phase, "blocked");
   } finally {
     if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
     else process.env.OPENCLAW_STATE_DIR = previousStateDir;

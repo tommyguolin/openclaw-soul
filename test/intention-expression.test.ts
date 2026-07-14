@@ -9,6 +9,7 @@ import { ExpressionStore } from "../src/expression/store.js";
 import { ExpressionFeedbackStore } from "../src/expression/feedback-store.js";
 import { inferExpressionFeedback, inferNoReplyFeedback } from "../src/expression/feedback.js";
 import { ThoughtService } from "../src/thought-service.js";
+import { WorkHandoffStore } from "../src/handoff/store.js";
 
 test("directive formation separates requested work from explanation questions", () => {
   assert.equal(isExplicitUserDirective("请检查部署日志并定位 timeout"), true);
@@ -27,6 +28,70 @@ test("IntentionStore persists and deduplicates a user directive by origin", asyn
   assert.equal(second.created, false);
   assert.equal(first.intention.id, second.intention.id);
   assert.equal((await store.load()).intentions.length, 1);
+  assert.match(first.intention.evidenceNeeded.join(" "), /clear user-facing outcome report/);
+});
+
+test("a persisted host-agent handoff restores project scope and acceptance criteria after restart", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-handoff-restart-"));
+  try {
+    const egoPath = path.join(dir, "ego.json");
+    const projectDir = path.join(dir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+    await fs.promises.writeFile(path.join(projectDir, "package.json"), "{}", "utf8");
+    const firstService = new ThoughtService({ storePath: egoPath, cognitionMode: "primary" });
+    await firstService.recordInteractionWithText({
+      type: "inbound",
+      text: "请实现项目修复并运行测试",
+      messageId: "handoff-directive-1",
+    });
+    const intentions = JSON.parse(await fs.promises.readFile(path.join(dir, "intentions.json"), "utf8"));
+    const intention = intentions.intentions[0];
+    const handoffStore = new WorkHandoffStore(path.join(dir, "work-handoffs.json"));
+    const handoff = await handoffStore.upsert({
+      intentionId: intention.id,
+      objective: intention.desiredState,
+      targetProjectRoot: projectDir,
+      sessionKey: "agent:main:feishu:direct:user",
+      phase: "implementing",
+      acceptanceCriteria: intention.evidenceNeeded,
+      observedFiles: ["src/app.ts"],
+      modifiedFiles: ["src/app.ts"],
+      verificationCommands: [],
+      failedTools: [],
+    });
+    const intentionStore = new IntentionStore(path.join(dir, "intentions.json"));
+    await intentionStore.add(buildUserDirectiveIntention("请分析另一个项目", "other-directive"));
+
+    const restartedService = new ThoughtService({ storePath: egoPath, cognitionMode: "primary" });
+    const thought = {
+      id: "handoff-continuation",
+      type: "self-improvement-monitor",
+      content: "Continue the current verified project work",
+      trigger: "opportunity",
+      source: "system-monitor",
+      triggerDetail: "durable handoff",
+      motivation: "Continue the user's project task",
+      targetMetrics: [],
+      priority: 90,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      executed: false,
+      relatedNeeds: [],
+      actionType: "observe-and-improve",
+      cognitiveKind: "task-continuation",
+    } as any;
+    const internals = restartedService as unknown as {
+      attachIntentionToOperationalWork(item: any): Promise<void>;
+    };
+    await internals.attachIntentionToOperationalWork(thought);
+    assert.equal(thought.actionParams.intentionId, intention.id);
+    assert.equal(thought.actionParams.workHandoffId, handoff.id);
+    assert.equal(thought.actionParams.projectRoot, projectDir);
+    assert.equal(thought.actionParams.priorWorkPhase, "implementing");
+    assert.match(thought.actionParams.acceptanceCriteria.join(" "), /concrete changed files/);
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("ExpressionStore separates proposal creation from sent/withheld resolution", async () => {

@@ -157,7 +157,7 @@ Just start chatting. Soul begins thinking and building a profile immediately.
 |------|---------------|
 | `message_received` | Records interaction, detects language, extracts user facts |
 | `message_sending` / `message_sent` / `reply_payload_sending` | Stores ordinary outbound conversation memory idempotently across OpenClaw hook versions |
-| `agent_end` | Captures successful Codex-internal `message.send` replies that bypass the normal delivery hooks |
+| `agent_end` | Captures successful Codex-internal replies and current-turn project tool evidence for task continuity |
 | `before_prompt_build` | Injects soul context (needs, memories, knowledge, personality) |
 
 Codex `agent_end` capture requires explicit conversation access for this
@@ -169,6 +169,29 @@ openclaw config set plugins.entries.soul.hooks.allowConversationAccess true --st
 
 Soul defers its background cycle for five minutes after an inbound message, so
 proactive outreach and private LLM work cannot compete with an active chat.
+
+### Host-agent project continuity
+
+With conversation access enabled, Soul records project evidence from successful
+current-turn host-agent tool calls. It resolves file paths and command working
+directories to a project root, then keeps a bounded history of observed files,
+modified files, and verification commands in Ego state. Source contents and
+failed tool calls are not copied into this bridge.
+
+An autonomous Improvement first honors an explicit path in the current
+directive, then uses the latest high-confidence host-agent project context. If
+the available path is only a container, drive root, missing directory, or
+otherwise ambiguous, the task fails before calling the LLM or changing files;
+it no longer falls back to modifying an unrelated project.
+
+For explicit work directives in `primary` mode, Soul also writes a durable
+`work-handoffs.json` record. The handoff binds the user Intention to the project
+root, current phase, changed/observed files, verification commands, failed
+tools, and concrete acceptance criteria. A later operational cycle restores
+that handoff into its Thought and `AutonomousTask`, including after a gateway
+restart. Task completion updates the linked Intention to `fulfilled` only when
+its required change and verification evidence is present; otherwise it becomes
+`blocked` and the unmet criteria are shown in the task report.
 
 ### Self-Improvement Loop
 

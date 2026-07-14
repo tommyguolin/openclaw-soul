@@ -6,6 +6,8 @@ import { dirname, join, normalize, parse as parsePath, relative, resolve } from 
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
 import { createSoulLogger } from "./logger.js";
+import { IntentionStore, resolveIntentionStorePath } from "./intention/store.js";
+import { WorkHandoffStore, resolveWorkHandoffStorePath } from "./handoff/store.js";
 import { invokeGatewayTool, fireAgentTask, isWriteTool } from "./gateway-client.js";
 import { isGoodTimeForMessage } from "./action-executor.js";
 import type { LLMGenerator } from "./soul-llm.js";
@@ -461,6 +463,19 @@ export type AutonomousActionOptions = {
   workspaceContext?: string;
 };
 
+function taskContinuityFields(thought: Thought): Pick<AutonomousTask,
+  "intentionId" | "workHandoffId" | "targetProjectRoot" | "acceptanceCriteria"> {
+  const params = thought.actionParams ?? {};
+  return {
+    ...(typeof params.intentionId === "string" ? { intentionId: params.intentionId } : {}),
+    ...(typeof params.workHandoffId === "string" ? { workHandoffId: params.workHandoffId } : {}),
+    ...(typeof params.projectRoot === "string" ? { targetProjectRoot: params.projectRoot } : {}),
+    ...(Array.isArray(params.acceptanceCriteria)
+      ? { acceptanceCriteria: params.acceptanceCriteria.filter((item): item is string => typeof item === "string") }
+      : {}),
+  };
+}
+
 /**
  * Main dispatch for autonomous action types.
  * Called from action-executor.ts switch statement.
@@ -717,8 +732,7 @@ export async function executeAnalyzeProblem(
     createdAt: Date.now(),
     updatedAt: Date.now(),
     sourceThoughtId: thought.id,
-    ...(typeof thought.actionParams?.intentionId === "string"
-      ? { intentionId: thought.actionParams?.intentionId as string } : {}),
+    ...taskContinuityFields(thought),
     steps: [],
     requiresWritePermission: false,
     resultDelivered: false,
@@ -855,6 +869,12 @@ async function executeBoundedLocalAgentTask(
   options: AutonomousActionOptions,
 ): Promise<{ result: ActionResult; metricsChanged: MetricDelta[] }> {
   const target = resolveTargetProject(ego, thought, options.workspaceContext);
+  if (target.resolutionError) {
+    return {
+      result: { type: "run-agent-task", success: false, error: target.resolutionError },
+      metricsChanged: [],
+    };
+  }
   const userContext = ego.userFacts.slice(0, 5).map((f) => `[${f.category}] ${f.content}`).join("\n");
   const recentUserMessages = (ego.recentUserMessages ?? [])
     .slice(-5)
@@ -890,8 +910,7 @@ async function executeBoundedLocalAgentTask(
     createdAt: Date.now(),
     updatedAt: Date.now(),
     sourceThoughtId: thought.id,
-    ...(typeof thought.actionParams?.intentionId === "string"
-      ? { intentionId: thought.actionParams?.intentionId as string } : {}),
+    ...taskContinuityFields(thought),
     steps,
     resultFilePath,
     requiresWritePermission: false,
@@ -1114,8 +1133,7 @@ If you hit a blocker, timeout risk, provider issue, missing dependency, or a lon
     createdAt: Date.now(),
     updatedAt: Date.now(),
     sourceThoughtId: thought.id,
-    ...(typeof thought.actionParams?.intentionId === "string"
-      ? { intentionId: thought.actionParams?.intentionId as string } : {}),
+    ...taskContinuityFields(thought),
     steps: [{ id: randomBytes(4).toString("hex"), timestamp: Date.now(), action: "fire-agent", input: agentMessage.slice(0, 200), success: true }],
     resultFilePath,
     requiresWritePermission: options.autonomousActions,
@@ -1557,7 +1575,7 @@ function extractPathCandidates(text: string): string[] {
   return [...candidates];
 }
 
-type TargetCandidateSource = "thought" | "recentMessage" | "userFact" | "goal" | "workspace";
+type TargetCandidateSource = "thought" | "recentMessage" | "projectContext" | "userFact" | "goal" | "workspace";
 
 function gatherTargetCandidates(
   ego: EgoState,
@@ -1567,6 +1585,7 @@ function gatherTargetCandidates(
   const candidates: Array<{ raw: string; source: TargetCandidateSource }> = [];
 
   const thoughtTexts = [
+    typeof thought?.actionParams?.projectRoot === "string" ? thought.actionParams.projectRoot : undefined,
     thought?.content,
     thought?.triggerDetail,
     thought?.motivation,
@@ -1583,6 +1602,15 @@ function gatherTargetCandidates(
     for (const raw of extractPathCandidates(message)) {
       candidates.push({ raw, source: "recentMessage" });
     }
+  }
+
+  const projectContexts = [...(ego.projectContexts ?? [])].sort((a, b) => {
+    if (a.root === ego.activeProjectRoot) return -1;
+    if (b.root === ego.activeProjectRoot) return 1;
+    return b.lastObservedAt - a.lastObservedAt;
+  });
+  for (const context of projectContexts) {
+    if (context.confidence >= 0.8) candidates.push({ raw: context.root, source: "projectContext" });
   }
 
   for (const goal of ego.goals ?? []) {
@@ -1611,7 +1639,7 @@ function resolveTargetProject(
   ego: EgoState,
   thought?: Thought,
   workspaceContext?: string,
-): { dir: string; name: string; isSelf: boolean } {
+): { dir: string; name: string; isSelf: boolean; resolutionError?: string } {
   const candidates = gatherTargetCandidates(ego, thought, workspaceContext);
   const tried: string[] = [];
 
@@ -1633,7 +1661,9 @@ function resolveTargetProject(
   }
 
   if (candidates.length > 0) {
-    log.warn(`Target project path not found or unsafe; tried: ${tried.join(", ")}. Falling back to Soul self-improvement.`);
+    const resolutionError = `Project target is ambiguous or does not resolve to a source project; tried: ${tried.join(", ")}`;
+    log.warn(`${resolutionError}. Autonomous work will stop instead of changing an unrelated project.`);
+    return { dir: "", name: "unresolved project", isSelf: false, resolutionError };
   }
 
   return { dir: SOUL_PROJECT_DIR, name: "Soul plugin (self-improvement)", isSelf: true };
@@ -1718,13 +1748,42 @@ export async function executeObserveAndImprove(
     createdAt: Date.now(),
     updatedAt: Date.now(),
     sourceThoughtId: thought.id,
-    ...(typeof thought.actionParams?.intentionId === "string"
-      ? { intentionId: thought.actionParams?.intentionId as string } : {}),
+    ...taskContinuityFields(thought),
     steps: [],
     requiresWritePermission: false,
     resultDelivered: false,
   };
   await persistTask(task);
+
+  if (target.resolutionError) {
+    const result = `Status: failed
+Task: ${taskId}
+Finished: ${new Date().toISOString()}
+
+## Outcome
+${reportZh
+    ? `未启动代码优化：${target.resolutionError}。`
+    : `No code improvement was started: ${target.resolutionError}.`}
+
+## Changes
+${reportZh ? "没有修改任何文件。" : "No files were changed."}
+
+## Verification
+${reportZh ? "目标解析失败，因此没有读取源码或运行验证命令。" : "No source or verification command was run because target resolution failed."}
+
+## Metrics
+${reportZh ? "读取文件：0；修改文件：0；验证：未执行。" : "Files read: 0. Files modified: 0. Verification: not run."}
+
+## Next
+${reportZh
+    ? "需要从用户明确路径或主 Agent 的成功工具轨迹获得可信项目根目录后才能重试。"
+    : "Retry only after a trusted project root is available from an explicit user path or successful host-agent tool evidence."}`;
+    await completeTask(taskId, result, "failed");
+    return {
+      result: { type: "observe-and-improve", success: false, error: target.resolutionError },
+      metricsChanged: [],
+    };
+  }
 
   log.info(`Improvement task targeting: ${target.dir} (${target.name})`);
   if (readOnlyMode) {
@@ -1739,9 +1798,43 @@ export async function executeObserveAndImprove(
   const actionStatsText = target.isSelf
     ? `**Behavior stats** (last ${totalActions} actions): ${expiredCount} expired, ${successCount} success (${Math.round(expiredCount / Math.max(totalActions, 1) * 100)}% failure rate).`
     : "";
+  const projectContext = (ego.projectContexts ?? []).find((context) =>
+    context.root.toLowerCase() === target.dir.toLowerCase());
+  const contextFiles = [...(projectContext?.modifiedFiles ?? []), ...(projectContext?.observedFiles ?? [])]
+    .filter((file, index, items) => items.indexOf(file) === index)
+    .filter((file) => {
+      const fullPath = resolve(target.dir, file);
+      const withinTarget = !relative(target.dir, fullPath).startsWith("..");
+      const supported = SOURCE_EXTENSIONS.some((extension) => file.toLowerCase().endsWith(extension));
+      const protectedFile = PROTECTED_FILES.has(parsePath(file).base);
+      try {
+        return withinTarget && supported && !protectedFile && statSync(fullPath).isFile();
+      } catch {
+        return false;
+      }
+    });
+  const projectContinuityText = projectContext
+    ? `**Host-agent project continuity**:
+- Last observed: ${new Date(projectContext.lastObservedAt).toISOString()}
+- Recently modified files: ${projectContext.modifiedFiles.join(", ") || "none recorded"}
+- Recently observed files: ${projectContext.observedFiles.join(", ") || "none recorded"}
+- Verification commands already used: ${projectContext.verificationCommands.join(" | ") || "none recorded"}`
+    : "";
+  const handoffText = typeof thought.actionParams?.workHandoffId === "string"
+    ? `**Durable work handoff**:
+- Handoff: ${thought.actionParams.workHandoffId}
+- Intention: ${thought.actionParams.intentionId ?? "unknown"}
+- Objective: ${String(thought.actionParams.objective ?? thought.motivation)}
+- Prior phase: ${String(thought.actionParams.priorWorkPhase ?? "unknown")}
+- Acceptance criteria: ${Array.isArray(thought.actionParams.acceptanceCriteria) ? thought.actionParams.acceptanceCriteria.join("; ") : "not recorded"}
+- Prior modified files: ${Array.isArray(thought.actionParams.priorModifiedFiles) ? thought.actionParams.priorModifiedFiles.join(", ") : "none recorded"}
+- Prior verification: ${Array.isArray(thought.actionParams.priorVerificationCommands) ? thought.actionParams.priorVerificationCommands.join(" | ") : "none recorded"}
+- Prior failed tools: ${Array.isArray(thought.actionParams.priorFailedTools) ? thought.actionParams.priorFailedTools.join(", ") : "none"}`
+    : "";
 
   // --- Read source files ---
-  const allFiles = getSourceFiles(target.dir);
+  const allFiles = [...new Set([...contextFiles, ...getSourceFiles(target.dir)])]
+    .slice(0, MAX_IMPROVEMENT_SOURCE_FILES);
   const fileContents: string[] = [];
   for (const fname of allFiles) {
     const step = await readLocalFile("read-source", `${target.dir}/${fname}`);
@@ -1802,6 +1895,10 @@ ${reportZh
 ${projectDesc}
 
 ${actionStatsText}
+
+${projectContinuityText}
+
+${handoffText}
 
 **User context**:
 ${userContext || "Limited user info."}
@@ -1941,6 +2038,14 @@ Rules:
   const metricsText = reportZh
     ? `发现源码文件：${allFiles.length}；读取文件：${fileContents.length}；修改文件：${fixApplied ? 1 : 0}；验证：${fixApplied ? "通过" : "未执行"}。`
     : `Source files discovered: ${allFiles.length}. Files read: ${fileContents.length}. Files modified: ${fixApplied ? 1 : 0}. Verification: ${fixApplied ? "passed" : "not run"}.`;
+  const acceptanceText = (task.acceptanceCriteria ?? []).length > 0
+    ? (task.acceptanceCriteria ?? []).map((criterion) => {
+      const requiresChange = /changed files/i.test(criterion);
+      const requiresVerification = /verification command/i.test(criterion);
+      const met = requiresChange ? fixApplied : requiresVerification ? fixApplied : /outcome report/i.test(criterion);
+      return `- [${met ? "x" : " "}] ${criterion}`;
+    }).join("\n")
+    : reportZh ? "没有记录独立的验收条件。" : "No explicit acceptance criteria were recorded.";
   const nextText = reportZh
     ? fixApplied
       ? "在正常使用中观察这项修改；只有出现不同且有证据的问题时，才启动下一次 Improvement。"
@@ -1964,6 +2069,9 @@ ${verificationText}
 
 ## Metrics
 ${metricsText}
+
+## Acceptance
+${acceptanceText}
 
 ## Next
 ${nextText}`;
@@ -1992,9 +2100,11 @@ async function completeTask(
   status: "completed" | "failed" = "completed",
   resultDelivered = false,
 ): Promise<void> {
+  let linkedIntentionId: string | undefined;
   await updateEgoStore(resolveEgoStorePath(), (e) => {
     const t = (e.activeTasks ?? []).find((at) => at.id === taskId);
     if (t) {
+      linkedIntentionId = t.intentionId;
       const finalResult = isFinalTaskReport(result)
         ? result
         : `Status: ${status}
@@ -2023,6 +2133,26 @@ Run a focused verification command or a smaller follow-up improvement if the res
     }
     return e;
   });
+  if (linkedIntentionId) {
+    const intentionStore = new IntentionStore(resolveIntentionStorePath(resolveEgoStorePath()));
+    let intentionFulfilled = false;
+    await intentionStore.update(linkedIntentionId, (intention) => {
+      const requiresChange = intention.evidenceNeeded.includes("concrete changed files");
+      const requiresVerification = intention.evidenceNeeded.some((item) => /verification command/i.test(item));
+      const reportsNoChange = /No files were changed|没有修改任何文件|Files modified:\s*0|修改文件：0/i.test(result);
+      const reportsNoVerification = /Verification:\s*not run|验证：未执行|没有执行验证|No verification was run/i.test(result);
+      intention.status = status === "failed"
+        || (requiresChange && reportsNoChange)
+        || (requiresVerification && reportsNoVerification)
+        ? "blocked"
+        : "fulfilled";
+      intentionFulfilled = intention.status === "fulfilled";
+    });
+    const handoffStore = new WorkHandoffStore(resolveWorkHandoffStorePath(resolveEgoStorePath()));
+    await handoffStore.updateForIntention(linkedIntentionId, (handoff) => {
+      handoff.phase = intentionFulfilled ? "verified" : "blocked";
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -316,6 +316,24 @@ export interface AutonomousTask {
   resultDelivered: boolean;
   /** Owning future-state commitment after Intention/Task separation. */
   intentionId?: string;
+  /** Host-agent work handoff and concrete project scope inherited by this task. */
+  workHandoffId?: string;
+  targetProjectRoot?: string;
+  acceptanceCriteria?: string[];
+}
+
+/** Durable evidence connecting a host-agent work turn to a local project. */
+export interface ProjectContext {
+  root: string;
+  name: string;
+  source: "agent-tool" | "user-path";
+  confidence: number;
+  sessionKey?: string;
+  lastObservedAt: number;
+  lastModifiedAt?: number;
+  observedFiles: string[];
+  modifiedFiles: string[];
+  verificationCommands: string[];
 }
 
 export interface EgoState {
@@ -355,6 +373,8 @@ export interface EgoState {
   userLanguage: string | null;
   recentUserMessages: string[];
   activeTasks: AutonomousTask[];
+  projectContexts: ProjectContext[];
+  activeProjectRoot: string | null;
   mentalContext: MentalContext;
 }
 

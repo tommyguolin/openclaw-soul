@@ -16,6 +16,8 @@ import { resolveLLMConfigFromOpenClaw, type SoulLLMConfig } from "./src/soul-llm
 import { getGatewayPort } from "./src/env.js";
 import { loadWorkspaceContext } from "./src/paths.js";
 import { resolveEgoStorePath, updateEgoStore } from "./src/ego-store.js";
+import { recordAgentProjectActivity } from "./src/project-context.js";
+import { recordAgentWorkHandoffs } from "./src/handoff/bridge.js";
 
 const log = createSoulLogger("plugin");
 
@@ -761,7 +763,16 @@ const plugin = {
           conversationId: sessionKey,
           source: "agent_end(message.send)",
         }));
-      if (writes.length > 0) return Promise.all(writes).then(() => undefined);
+      writes.push(recordAgentProjectActivity(_event.messages, sessionKey, _ctx)
+        .then((contexts) => recordAgentWorkHandoffs(
+          _event.messages,
+          contexts,
+          sessionKey,
+          typeof _ctx?.conversationId === "string" ? _ctx.conversationId : undefined,
+        ))
+        .then(() => undefined)
+        .catch((error) => log.warn(`agent_end project context capture failed: ${String(error)}`)));
+      return Promise.all(writes).then(() => undefined);
     });
 
     log.debug("Soul plugin registered (hooks: before_prompt_build, message_received, reply_payload_sending, message_sending, message_sent, after_tool_call, agent_end)");
