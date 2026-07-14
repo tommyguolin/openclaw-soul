@@ -34,6 +34,11 @@
         "enum": ["legacy", "observe", "shadow", "primary"],
         "description": "Cognitive activation mode. primary routes private thoughts through Activation while preserving operational detectors and all expression/action safety gates"
       },
+      "cognitiveTemperament": {
+        "type": "string",
+        "enum": ["focused", "balanced", "expansive"],
+        "description": "Associative expansion style. balanced is the safe default; active troubleshooting always narrows automatically"
+      },
       "expressionPolicy": {
         "type": "string",
         "enum": ["legacy", "observe", "adaptive"],

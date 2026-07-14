@@ -10,6 +10,7 @@ import type { EgoState, SoulMemory } from "../src/types.js";
 import { ThoughtService } from "../src/thought-service.js";
 import { inferCognitiveKind } from "../src/cognition/kind.js";
 import { runCognitionLab } from "../src/cognition/lab.js";
+import { emergeFromWorkspace } from "../src/cognition/emergence.js";
 
 function memory(id: string, content: string, timestamp = 1): SoulMemory {
   return { id, type: "interaction", content, emotion: 0, valence: "neutral", importance: 0.8,
@@ -48,6 +49,16 @@ test("corrupt activation state is isolated and recovers empty", async () => {
   assert.deepEqual(loaded.states, []);
   const entries = await fs.promises.readdir(dir);
   assert.ok(entries.some((name) => name.startsWith("activation-state.json.corrupt-")));
+});
+
+test("activation store retains a future refractory record even after activation and fatigue reach zero", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-cognition-refractory-store-"));
+  const file = path.join(dir, "activation-state.json");
+  const store = new ActivationStore(file);
+  await store.save([{ traceId: "memory:a", activation: 0, fatigue: 0, lastUpdatedAt: 100,
+    activationCount: 1, consumedCount: 1, lastConsumedAt: 100, refractoryUntil: 10_000 }], 100);
+  const loaded = await store.load(200);
+  assert.equal(loaded.states[0]?.refractoryUntil, 10_000);
 });
 
 test("ThoughtService observe mode queues only persisted inbound interactions", async () => {
@@ -99,6 +110,27 @@ test("resolved premises are suppressed before workspace selection", async () => 
   assert.equal(result.workspace.items.some((item) => item.trace.sourceId === "stale"), false);
 });
 
+test("multilingual model semantics suppress a resolved premise without translated keyword tables", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-cognition-multilingual-resolution-"));
+  const runner = new CognitionRunner({
+    store: new ActivationStore(path.join(dir, "activation-state.json")),
+    journal: new CognitiveJournal(path.join(dir, "cognitive-cycles.jsonl")),
+    now: () => 2000,
+    random: () => 1,
+  });
+  const stale = memory("stale-pl", "Usługa zatrzymuje się podczas synchronizacji", 100);
+  stale.semanticSignals = ["problem"];
+  const current = memory("current-ar", "تمت معالجة الحالة وأصبح الاتصال مستقراً", 200);
+  current.semanticSignals = ["closure"];
+  stale.tags.push("topic:connection-stability");
+  current.tags.push("topic:connection-stability");
+  const state = { memories: [stale, current] } as EgoState;
+  runner.enqueueStimulus({ type: "interaction", sourceId: stale.id, timestamp: stale.timestamp });
+  const result = await runner.run(state);
+  assert.ok(result);
+  assert.equal(result.record.activations.find((item) => item.sourceId === stale.id)?.resolvedSuppressed, true);
+});
+
 test("cognition lab reuses the production runner without mutating its Ego snapshot", async () => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-cognition-lab-"));
   const snapshot = { memories: [
@@ -114,8 +146,70 @@ test("cognition lab reuses the production runner without mutating its Ego snapsh
   });
   assert.equal(result.records.length, 2);
   assert.equal(result.metrics.cycles, 2);
+  assert.ok(result.metrics.associativeExpansionRate >= 0 && result.metrics.associativeExpansionRate <= 1);
+  assert.ok(result.metrics.averageAssociativeItems >= 0);
+  assert.equal(result.metrics.generatedThoughts, 0);
   assert.equal(JSON.stringify(snapshot), before);
   assert.equal(fs.existsSync(path.join(dir, "activation-lab-state.json")), true);
+});
+
+test("cognition lab measures generated thought diversity, continuity, and associative safety", async () => {
+  const snapshot = { memories: [
+    memory("one", "A hidden boundary keeps recurring in the session state", 300),
+    memory("two", "An invisible dialog retained stale interface state", 200),
+    memory("three", "A quota threshold constrained queue capacity", 100),
+  ] } as EgoState;
+  const baseDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-cognition-output-base-"));
+  const broadDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-cognition-output-broad-"));
+  const generator = (item: import("../src/cognition/types.js").CognitiveWorkspace) => emergeFromWorkspace(item, async () => {
+    const association = item.items.find((entry) => entry.role === "associative");
+    return association
+      ? `Could ${association.trace.sourceId} reveal another hidden boundary?`
+      : "Could the same hidden boundary be recurring?";
+  });
+  const baseline = await runCognitionLab(snapshot, {
+    outputDirectory: baseDir, stimulusIds: ["one", "two", "three"], startTime: 10_000,
+    random: () => 1, config: { maxAssociativeItems: 0, refractoryMs: 0 }, emerge: generator,
+  });
+  const broad = await runCognitionLab(snapshot, {
+    outputDirectory: broadDir, stimulusIds: ["one", "two", "three"], startTime: 10_000,
+    random: () => 1, config: { associativeBreadth: 1, noveltySeeking: 1, inhibition: 0,
+      convergencePressure: 0, maxAssociativeItems: 3, refractoryMs: 0 }, emerge: generator,
+  });
+  assert.ok(broad.metrics.associativeThoughtRate > baseline.metrics.associativeThoughtRate);
+  assert.ok(broad.metrics.thoughtLexicalDiversity >= baseline.metrics.thoughtLexicalDiversity);
+  assert.equal(broad.metrics.unverifiedAssociativeAssertionRate, 0);
+  assert.ok(broad.metrics.thoughtWorkspaceLexicalContinuityRate > 0);
+  assert.ok(broad.metrics.usefulAssociativeThoughtRate > 0);
+});
+
+test("idle unresolved tension eventually forms one private thought and then respects refractory silence", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-cognition-idle-emergence-"));
+  let now = 0;
+  const runner = new CognitionRunner({
+    store: new ActivationStore(path.join(dir, "activation-state.json")),
+    journal: new CognitiveJournal(path.join(dir, "cognitive-cycles.jsonl")),
+    now: () => now,
+    random: () => 1,
+    config: { maxTemporalInput: 0, endogenousGlobalCooldownMs: 0 },
+  });
+  const snapshot = { memories: [memory("blocked", "The deployment remains blocked by a timeout error", -1)] } as EgoState;
+  const outcomes: string[] = [];
+  const origins: Array<string | undefined> = [];
+  for (let minute = 0; minute < 45; minute += 1) {
+    now = minute * 60_000;
+    const result = await runner.run(snapshot, { mode: "shadow", emerge: async () => ({
+      outcome: "thought", content: "Could the timeout be a boundary rather than a transient failure?",
+      cognitiveMove: "question", qualityFlags: [],
+    }) });
+    if (result) {
+      outcomes.push(result.record.emergence.outcome);
+      if (result.workspace.allowEmergence) origins.push(result.workspace.origin);
+    }
+  }
+  assert.equal(outcomes.filter((outcome) => outcome === "thought").length, 1);
+  assert.ok(outcomes.filter((outcome) => outcome === "pre-generation-silence").length >= 40);
+  assert.deepEqual(origins, ["endogenous"]);
 });
 
 test("ThoughtService shadow mode writes only the v3.1 experimental pool", async () => {

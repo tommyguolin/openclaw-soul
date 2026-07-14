@@ -52,6 +52,18 @@ test("interaction ingestion stores inbound and outbound text with provenance and
   }
 });
 
+test("short non-Latin messages are retained for model semantic classification", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-short-language-"));
+  try {
+    const service = new ThoughtService({ storePath: path.join(directory, "ego.json") });
+    await service.recordInteractionWithText({ type: "inbound", text: "修正", messageId: "ja-short" });
+    const ego = await service.getEgoState();
+    assert.equal(ego.memories.at(-1)?.content, "修正");
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("startup migration removes internal OpenAI transcripts but preserves real outbound messages", async () => {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-interaction-migration-"));
   const storePath = path.join(directory, "ego.json");

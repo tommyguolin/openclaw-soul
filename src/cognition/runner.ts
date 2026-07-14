@@ -3,6 +3,7 @@ import type { EgoState } from "../types.js";
 import { contentTokens, jaccard } from "../thought-emergence.js";
 import { buildActiveSet } from "./active-set.js";
 import { updateActivations } from "./activation-engine.js";
+import { expandCognitiveWorkspace } from "./associative-expansion.js";
 import { ActivationStore } from "./activation-store.js";
 import { CognitiveJournal } from "./cognitive-journal.js";
 import { buildCognitiveWorkspace, consumeWorkspace } from "./workspace.js";
@@ -15,6 +16,11 @@ import type {
   TraceActivationState,
   EmergenceResult,
 } from "./types.js";
+
+function sharesModelTopic(left: string[], right: string[]): boolean {
+  const rightTopics = new Set(right.filter((topic) => topic.startsWith("topic:")));
+  return left.some((topic) => topic.startsWith("topic:") && rightTopics.has(topic));
+}
 
 export interface CognitionRunnerOptions {
   store: ActivationStore;
@@ -60,10 +66,25 @@ export class CognitionRunner {
         maxSize: this.options.config?.maxActiveSetSize,
       });
       if (traces.length === 0) return null;
+      const newerResolutions = traces.filter((trace) => {
+        if (!trace.memory) return false;
+        const signals = trace.memory.semanticSignals;
+        if (signals && signals.length > 0) return signals.includes("closure");
+        return /\b(?:fixed|resolved|succeeded|successful|completed|working now|connected successfully)\b|已修复|解决了|成功|已完成|恢复正常|已经好了/i.test(trace.content);
+      });
       const resolvedTraceIds = new Set(traces
-        .filter((trace) => /(?:fail|failed|failing|unable|cannot|can't|broken|problem|issue|still|不确定|失败|无法|不能|连不上|有问题|仍然|是否)/i.test(trace.content))
+        .filter((trace) => {
+          const signals = trace.memory?.semanticSignals;
+          if (signals && signals.length > 0) return signals.includes("problem");
+          return /(?:fail|failed|failing|unable|cannot|can't|broken|problem|issue|still|不确定|失败|无法|不能|连不上|有问题|仍然|是否)/i.test(trace.content);
+        })
         .filter((trace) => context.resolvedTexts?.some((resolution) =>
-          jaccard(contentTokens(trace.content), contentTokens(resolution)) >= 0.12))
+          jaccard(contentTokens(trace.content), contentTokens(resolution)) >= 0.12)
+          || newerResolutions.some((resolution) => resolution.timestamp >= trace.timestamp
+            && (jaccard(contentTokens(trace.content), contentTokens(resolution.content)) >= 0.1
+              || sharesModelTopic(trace.topicClusters, resolution.topicClusters)
+              || (jaccard(trace.topicClusters, resolution.topicClusters) > 0
+                && jaccard(contentTokens(trace.content), contentTokens(resolution.content)) >= 0.04))))
         .map((trace) => trace.id));
       const stimulusTraceId = stimulus ? `memory:${stimulus.sourceId}` : undefined;
       const results = updateActivations({
@@ -75,7 +96,8 @@ export class CognitionRunner {
         resolvedTraceIds,
         config: this.options.config,
       });
-      const workspace = buildCognitiveWorkspace(results, now, stimulus?.sourceId, this.options.config);
+      const coreWorkspace = buildCognitiveWorkspace(results, now, stimulus?.sourceId, this.options.config);
+      const workspace = expandCognitiveWorkspace(coreWorkspace, results, this.options.config);
       consumeWorkspace(workspace, results, now, this.options.config);
       for (const result of results) states.set(result.trace.id, result.state);
       await this.options.store.save(states.values(), now);
@@ -119,6 +141,8 @@ export class CognitionRunner {
           aggregateActivation: workspace.aggregateActivation,
           allowEmergence: workspace.allowEmergence,
           ...(workspace.silenceReason ? { silenceReason: workspace.silenceReason } : {}),
+          ...(workspace.expansion ? { expansion: workspace.expansion } : {}),
+          ...(workspace.origin ? { origin: workspace.origin } : {}),
         },
         emergence,
       };

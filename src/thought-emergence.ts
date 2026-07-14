@@ -43,14 +43,18 @@ const TOPIC_CLUSTERS: Record<string, RegExp> = {
 
 export function memoryTopicClusters(memory: Pick<SoulMemory, "content" | "tags">): string[] {
   const text = `${memory.content} ${memory.tags.join(" ")}`;
-  return Object.entries(TOPIC_CLUSTERS)
+  const lexical = Object.entries(TOPIC_CLUSTERS)
     .filter(([, pattern]) => pattern.test(text))
     .map(([cluster]) => cluster);
+  const semantic = memory.tags
+    .filter((tag) => tag.startsWith("topic:"))
+    .map((tag) => tag.toLocaleLowerCase());
+  return [...new Set([...semantic, ...lexical])];
 }
 
 export function classifyCognitiveMove(content: string): string {
   if (!content.trim()) return "none";
-  if (/[?？]|是否|会不会|为什么|what if|wonder|why\b/i.test(content)) return "question";
+  if (/[?？]|是否|会不会|为什么|(?:是|更像).{0,30}还是|what if|wonder|why\b/i.test(content)) return "question";
   if (/像是|类似|共同|结构|映射|analog|parallel|pattern|remind/i.test(content)) return "analogy";
   if (/也许|可能|猜|假设|perhaps|maybe|hypothesi|speculat/i.test(content)) return "speculation";
   if (/确认|弄清|搞清|查明|拿到|缺少|缺乏|才能给出|verify|confirm|missing|need (?:the )?(?:data|number|result)/i.test(content)) return "research";

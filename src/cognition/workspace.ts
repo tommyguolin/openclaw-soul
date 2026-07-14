@@ -63,12 +63,15 @@ export function buildCognitiveWorkspace(
       selectionReason: result.trace.id === dominant?.trace.id
         ? "highest activation"
         : "above dynamic threshold and coherent with dominant trace",
+      role: "core",
     })),
     distribution,
     relations: selected.length > 1 ? ["association"] : [],
     aggregateActivation,
     allowEmergence: selected.length > 0,
     ...(selected.length === 0 ? { silenceReason: "insufficient-activation-structure" } : {}),
+    ...(selected.length > 0 ? { origin: selected.some((result) => result.contributions.some((item) =>
+      item.channel === "external-stimulus")) ? "external" as const : "endogenous" as const } : {}),
   };
 }
 
@@ -79,12 +82,29 @@ export function consumeWorkspace(
   partialConfig: Partial<ActivationConfig> = {},
 ): void {
   const config = { ...DEFAULT_ACTIVATION_CONFIG, ...partialConfig };
-  const selected = new Set(workspace.items.map((item) => item.trace.id));
+  const selected = new Map(workspace.items.map((item) => [item.trace.id, item.role ?? "core"]));
+  const endogenousWorkspace = workspace.origin === "endogenous";
+  if (endogenousWorkspace) {
+    // Already-activated alternatives must cool down too; otherwise several
+    // accumulated traces can form workspaces in consecutive minutes.
+    for (const result of results) {
+      result.state.refractoryUntil = Math.max(result.state.refractoryUntil ?? 0,
+        now + config.endogenousGlobalCooldownMs);
+    }
+  }
   for (const result of results) {
-    if (!selected.has(result.trace.id)) continue;
-    result.state.fatigue = Math.min(1, result.state.fatigue + config.fatigueIncrement);
+    const role = selected.get(result.trace.id);
+    if (!role) continue;
+    result.state.fatigue = Math.min(1, result.state.fatigue
+      + config.fatigueIncrement * (role === "associative" ? 0.25 : 1));
     result.state.consumedCount += 1;
     result.state.lastConsumedAt = now;
-    result.state.refractoryUntil = now + config.refractoryMs;
+    // Briefly noticing an analogy should not make that memory unavailable when
+    // it later becomes the actual subject of a conversation.
+    if (role !== "associative") {
+      const endogenous = endogenousWorkspace;
+      result.state.refractoryUntil = Math.max(result.state.refractoryUntil ?? 0,
+        now + (endogenous ? config.endogenousRefractoryMs : config.refractoryMs));
+    }
   }
 }

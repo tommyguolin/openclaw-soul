@@ -22,9 +22,11 @@ export async function searchExternalMemories(
     const supplements = listMemoryCorpusSupplements();
     if (supplements.length === 0) return [];
 
-    // Extract keywords for more reliable matching across different search engines
+    // The complete natural-language query is primary because embedding-backed
+    // memory engines are multilingual. Keyword extraction is only a legacy
+    // lexical fallback and must not decide which languages are searchable.
     const keywords = extractKeywords(query, 3);
-    const candidates = keywords.length > 0 ? keywords : [query.slice(0, 40)];
+    const candidates = [...new Set([query.slice(0, 200), ...keywords])];
 
     const results: { snippet: string; source: string }[] = [];
     const seen = new Set<string>();

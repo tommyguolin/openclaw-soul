@@ -1,4 +1,5 @@
 import { contentTokens, jaccard } from "../thought-emergence.js";
+import type { InteractionSemanticSignal } from "../types.js";
 
 export type FeedbackObservation =
   | "explicit-positive"
@@ -10,7 +11,7 @@ export type FeedbackObservation =
 
 export type ProactiveFeedback =
   | "engaged" | "useful" | "adopted" | "already-known" | "ignored"
-  | "corrected" | "annoying" | "bad-timing" | "unclear";
+  | "corrected" | "annoying" | "bad-timing" | "not-useful" | "unclear";
 
 export interface FeedbackInference {
   label: ProactiveFeedback;
@@ -35,9 +36,36 @@ export interface AdaptiveExpressionPolicyState {
   samples: number;
 }
 
-export function inferExpressionFeedback(reply: string, proposalContent: string): FeedbackInference {
+export function inferExpressionFeedback(
+  reply: string,
+  proposalContent: string,
+  semanticSignals: InteractionSemanticSignal[] = [],
+): FeedbackInference {
   const related = jaccard(contentTokens(reply), contentTokens(proposalContent)) >= 0.08;
   const observations: FeedbackObservation[] = [related ? "reply-related" : "reply-unrelated"];
+  if (semanticSignals.length > 0) {
+    if (semanticSignals.includes("correction") || semanticSignals.includes("already-known")) {
+      observations.unshift("explicit-correction");
+      return { label: semanticSignals.includes("already-known") ? "already-known" : "corrected",
+        confidence: 0.92, observations };
+    }
+    if (semanticSignals.includes("bad-timing")) {
+      observations.unshift("explicit-negative");
+      return { label: "bad-timing", confidence: 0.92, observations };
+    }
+    if (semanticSignals.includes("negative-feedback")) {
+      observations.unshift("explicit-negative");
+      return { label: "not-useful", confidence: 0.88, observations };
+    }
+    if (semanticSignals.includes("adopted") || semanticSignals.includes("positive-feedback")) {
+      observations.unshift("explicit-positive");
+      return { label: semanticSignals.includes("adopted") ? "adopted" : "useful",
+        confidence: 0.9, observations };
+    }
+    // A model classification with no feedback label overrides keyword guesses.
+    return { label: related ? "engaged" : "unclear", confidence: related ? 0.65 : 0.35, observations };
+  }
+  // Legacy/offline fallback for messages that have not received model semantics.
   const negative = /(?:别再|不要再|烦|打扰|时机不对|稍后再说|没用|stop sending|don'?t send|annoying|bad timing|not useful)/i.test(reply);
   const correction = !/(?:时机不对|bad timing)/i.test(reply)
     && /(?:不对|错了|并不是|不是.*而是|纠正|已经知道|早就知道|incorrect|wrong|actually|already knew|already know)/i.test(reply);

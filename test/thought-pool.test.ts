@@ -106,6 +106,29 @@ test("v3.1 keeps claims on the strict grounded evidence path", async () => {
   }
 });
 
+test("an unverified associative assertion remains private even after repeated activation", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-thought-pool-association-hold-"));
+  try {
+    const pool = new ThoughtPool(path.join(directory, "thought-pool.json"));
+    const base = {
+      content: "Productization is mainly a continuity mechanism.", sourceClusters: ["software"],
+      cognitiveMove: "reflection", epistemicNature: "claim" as const,
+      qualityFlags: ["association-unverified"], originWorkspaceId: "workspace-association",
+      scores: { novelty: 0.9, coherence: 0.9, resonance: 0.9, userRelevance: 0.9 },
+    };
+    for (let index = 1; index <= 3; index += 1) {
+      await pool.addCandidate({ ...base, sourceMemoryIds: [`m${index}`], evidenceMemoryIds: [`m${index}`],
+        stimulusId: `s${index}`, causalTraceIds: [`memory:m${index}`] });
+    }
+    const candidate = (await pool.load()).candidates[0];
+    assert.equal(candidate.state, "incubating");
+    assert.ok(candidate.maturity >= 0.4);
+    assert.equal((await pool.getAttentionCandidatesV31()).length, 0);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("v3.1 migration marks legacy candidates uncertain without auto-attending them", () => {
   assert.equal(inferEpistemicNature("Why does this remain unresolved?", "question"), "question");
   assert.equal(inferEpistemicNature("These two failures follow the same pattern.", "analogy"), "association");
@@ -398,6 +421,7 @@ test("metrics expose lifecycle, cognition, quality, association, and source-age 
   assert.equal(metrics.contextContinuityRate, 0);
   assert.equal(metrics.thoughtSpecificityRate, 0);
   assert.equal(metrics.unsupportedUncertaintyRate, 0);
+  assert.equal(metrics.unverifiedAssociationRate, 0);
   assert.equal(metrics.cognitiveMoveDistribution.question, 1);
   assert.equal(metrics.meanSourceMemoryAgeDays, 10);
   assert.equal(metrics.sourceMemoryAgeBuckets.sevenTo30d, 1);

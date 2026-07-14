@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { ExpressionProposal } from "./types.js";
+import type { InteractionSemanticSignal } from "../types.js";
 import {
   inferExpressionFeedback, inferNoReplyFeedback,
   type AdaptiveExpressionPolicyState, type ExpressionFeedbackEvent,
@@ -41,8 +42,9 @@ export class ExpressionFeedbackStore {
     return { version: 1, updatedAt: Date.now(), events: [], policy: { ...DEFAULT_POLICY } };
   }
 
-  async observeReply(proposal: ExpressionProposal, replyText: string, replySourceId?: string): Promise<ExpressionFeedbackEvent> {
-    return this.append(proposal.id, inferExpressionFeedback(replyText, proposal.content), replySourceId, replyText);
+  async observeReply(proposal: ExpressionProposal, replyText: string, replySourceId?: string,
+    semanticSignals: InteractionSemanticSignal[] = []): Promise<ExpressionFeedbackEvent> {
+    return this.append(proposal.id, inferExpressionFeedback(replyText, proposal.content, semanticSignals), replySourceId, replyText);
   }
 
   async observeNoReply(proposal: ExpressionProposal): Promise<ExpressionFeedbackEvent> {
@@ -54,7 +56,16 @@ export class ExpressionFeedbackStore {
     const file = await this.load();
     const existing = file.events.find((event) => event.proposalId === proposalId
       && (replySourceId ? event.replySourceId === replySourceId : event.observations.includes("no-reply-window")));
-    if (existing) return existing;
+    if (existing) {
+      if (inference.confidence > existing.inference.confidence) {
+        existing.inference = inference;
+        existing.observations = inference.observations;
+        if (this.mode === "adaptive" && inference.confidence >= 0.7) this.adapt(file.policy, inference.label);
+        file.updatedAt = Date.now();
+        await this.save(file);
+      }
+      return existing;
+    }
     const event: ExpressionFeedbackEvent = {
       id: randomBytes(8).toString("hex"), proposalId, ...(replySourceId ? { replySourceId } : {}),
       ...(replyText ? { replyText: replyText.slice(0, 1000) } : {}), observedAt: Date.now(),
@@ -69,7 +80,7 @@ export class ExpressionFeedbackStore {
   }
 
   private adapt(policy: AdaptiveExpressionPolicyState, label: ExpressionFeedbackEvent["inference"]["label"]): void {
-    const negative = ["annoying", "bad-timing", "already-known", "corrected"].includes(label);
+    const negative = ["annoying", "bad-timing", "not-useful", "already-known", "corrected"].includes(label);
     const positive = ["useful", "adopted"].includes(label);
     if (!negative && !positive) return;
     policy.samples += 1;

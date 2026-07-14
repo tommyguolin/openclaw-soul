@@ -103,11 +103,13 @@ function buildTopicFocusProfile(ego: EgoState): TopicFocusProfile {
     .sort((a, b) => b.updatedAt - a.updatedAt);
   const deprioritized = uniqueTopics(
     topicPrefs
-      .filter((p) => isDeprioritizedTopicPreference(p.preference))
+      .filter((p) => p.direction === "avoid"
+        || (!p.direction && isDeprioritizedTopicPreference(p.preference)))
       .map((p) => p.preference),
   );
   const positivePrefs = topicPrefs
-    .filter((p) => !isDeprioritizedTopicPreference(p.preference))
+    .filter((p) => p.direction === "prefer"
+      || (!p.direction && !isDeprioritizedTopicPreference(p.preference)))
     .map((p) => p.preference);
   const factTopics = [...activeUserFacts(ego)]
     .filter((f) => ["interest", "project", "tech_stack"].includes(f.category) && f.confidence >= 0.4)
@@ -739,9 +741,24 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
 
   for (const mem of directiveMemories.slice(0, 2)) {
     const content = mem.content.slice(0, 160);
-    const needsLocalEvidence = isLocalProjectEvidenceQuestion(mem.content);
-    const useAgent = !needsLocalEvidence && shouldUseAgentForDirective(mem.content);
-    const useImprove = !needsLocalEvidence && shouldUseObserveAndImproveForDirective(mem.content);
+    const semanticSignals = mem.semanticSignals ?? [];
+    const hasRoutingSemantics = semanticSignals.some((signal) =>
+      signal === "local-evidence"
+      || signal === "self-improvement"
+      || signal === "code-change"
+      || signal === "verification"
+    );
+    const needsLocalEvidence = semanticSignals.includes("local-evidence")
+      || (!hasRoutingSemantics && isLocalProjectEvidenceQuestion(mem.content));
+    const useImprove = !needsLocalEvidence && (
+      semanticSignals.includes("self-improvement")
+      || (!hasRoutingSemantics && shouldUseObserveAndImproveForDirective(mem.content))
+    );
+    const useAgent = !needsLocalEvidence && !useImprove && (
+      semanticSignals.includes("code-change")
+      || semanticSignals.includes("verification")
+      || (!hasRoutingSemantics && shouldUseAgentForDirective(mem.content))
+    );
     const hoursSince = (now - mem.timestamp) / (1000 * 60 * 60);
     const priority = Math.max(72, (useAgent || useImprove ? 94 : 86) - hoursSince * 3);
     opportunities.push({
@@ -752,7 +769,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
       source: "user-interaction",
       relatedNeeds: ["growth", "meaning"],
       motivation: `User gave an execution-oriented directive; act on it instead of researching it: "${content}"`,
-      suggestedAction: useAgent ? "run-agent-task" : useImprove ? "observe-and-improve" : "analyze-problem",
+      suggestedAction: useImprove ? "observe-and-improve" : useAgent ? "run-agent-task" : "analyze-problem",
       actionParams: useAgent || useImprove
         ? { reason: mem.content.slice(0, 300) }
         : {
@@ -1123,28 +1140,13 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
       ].join("; ");
       const prefsSummary = topicPrefs.map((p) => p.preference).join("; ") || "";
 
-      // Infer country/region from language for content source hints
       const lang = ego.userLanguage;
       const userSamples = ego.recentUserMessages ?? [];
-      let contentRegionHint = "";
-      if (lang === "zh-CN") {
-        contentRegionHint = "Chinese sources: 知乎, B站(bilibili), 小红书, 微信公众号";
-      } else if (lang === "ja") {
-        contentRegionHint = "Japanese sources: note.com, Hatena, YouTube Japan";
-      } else if (lang === "ko") {
-        contentRegionHint = "Korean sources: Naver Blog, Brunch, YouTube Korea";
-      } else if (userSamples.length > 0) {
-        // Detect European language from samples for region hint
-        const sample = userSamples[0].toLowerCase();
-        if (/[æøå]/.test(sample)) contentRegionHint = "Danish sources: DR, Berlingske, Ingeniøren";
-        else if (/[äöüß]/.test(sample)) contentRegionHint = "German sources: Spiegel, Zeit, Heise";
-        else if (/[àâéèêëîïôùûüç]/.test(sample)) contentRegionHint = "French sources: Le Monde, Framablog";
-        else if (/[ñ¿¡]/.test(sample)) contentRegionHint = "Spanish sources: El País, Xataka";
-        else if (/[åäö]/.test(sample)) contentRegionHint = "Swedish sources: SvD, Expressen";
-        else contentRegionHint = "international sources: Hacker News, Dev.to, Medium, Ars Technica";
-      } else {
-        contentRegionHint = "international sources: Hacker News, Dev.to, Medium";
-      }
+      const contentRegionHint = lang
+        ? `Prefer credible sources appropriate for the user's BCP-47 language ${lang}; include international primary sources when stronger.`
+        : userSamples.length > 0
+          ? `Infer the user's language/region from this sample and prefer credible local-language plus international primary sources: ${userSamples[0].slice(0, 120)}`
+          : "Prefer credible international primary sources.";
 
       opportunities.push({
         type: "opportunity-detected",

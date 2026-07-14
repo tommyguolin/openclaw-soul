@@ -8,6 +8,7 @@ import { createDefaultEgoState, saveEgoStore } from "../src/ego-store.js";
 import { collectKnownLocalEvidenceTargets, detectMaintenanceOpportunities, detectThoughtOpportunities, generateIntelligentThought, getActionForOpportunity, type DetectedThoughtOpportunity } from "../src/intelligent-thought.js";
 import { ThoughtService } from "../src/thought-service.js";
 import { ThoughtPool } from "../src/thought-pool.js";
+import { buildUserLanguageInstruction, supportsLocalMessageTemplate } from "../src/language-context.js";
 import type { EgoState, SoulMemory, ThoughtGenerationContext } from "../src/types.js";
 
 function context(inputEgo?: ReturnType<typeof createDefaultEgoState>): ThoughtGenerationContext {
@@ -375,17 +376,50 @@ test("semantic intent classification supports languages without keyword tables",
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-semantics-"));
   const storePath = path.join(directory, "ego.json");
   try {
-    const service = new ThoughtService({ storePath });
-    const german = "Bitte untersuche den Verbindungsabbruch und führe anschließend den Test erneut aus.";
+    const service = new ThoughtService({ storePath, cognitionMode: "primary" });
+    const german = "Bitte untersuche den Verbindungsabbruch und führe anschließend die Prüfung erneut aus.";
     await service.recordInteractionWithText({ type: "inbound", text: german, messageId: "de-1" });
     type SemanticInternals = { llmGenerator?: (prompt: string) => Promise<string> };
     (service as unknown as SemanticInternals).llmGenerator = async () =>
-      '{"facts":[],"semanticSignals":["problem","execution-directive","topic-shift"],"topicTags":["connection reliability","integration test"]}';
+      '{"facts":[],"semanticSignals":["problem","execution-directive","topic-shift"],"topicTags":["connection reliability","integration test"],"languageCode":"de"}';
     await service.extractUserFacts(german, "de-1");
     const signals = ["problem", "execution-directive", "topic-shift"];
     const ego = await service.getEgoState();
     assert.deepEqual(ego.memories.at(-1)?.semanticSignals, signals);
     assert(ego.memories.at(-1)?.tags.includes("topic:connection-reliability"));
+    assert.equal(ego.userLanguage, "de");
+    const intentions = JSON.parse(await fs.promises.readFile(path.join(directory, "intentions.json"), "utf8"));
+    assert.equal(intentions.intentions.length, 1);
+    assert.equal(intentions.intentions[0].desiredState, german);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("language context follows arbitrary model language codes without translation tables", () => {
+  const ego = createDefaultEgoState();
+  ego.userLanguage = "ar";
+  ego.recentUserMessages = ["أفضل الردود المختصرة والمباشرة"];
+  assert.equal(supportsLocalMessageTemplate(ego), null);
+  const instruction = buildUserLanguageInstruction(ego);
+  assert.match(instruction, /BCP-47 ar/);
+  assert.doesNotMatch(instruction, /otherwise English/);
+});
+
+test("multilingual preference direction is model-structured rather than keyword-matched", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-preference-direction-"));
+  try {
+    const service = new ThoughtService({ storePath: path.join(directory, "ego.json") });
+    type SemanticInternals = { llmGenerator?: (prompt: string) => Promise<string> };
+    (service as unknown as SemanticInternals).llmGenerator = async () => JSON.stringify([{
+      aspect: "topic_preference",
+      preference: "لا أريد المزيد من رسائل التسويق",
+      direction: "avoid",
+      confidence: 0.95,
+      source: "explicit",
+    }]);
+    const result = await service.extractUserPreferences("لا أريد المزيد من رسائل التسويق");
+    assert.equal(result.preferences[0]?.direction, "avoid");
   } finally {
     await fs.promises.rm(directory, { recursive: true, force: true });
   }
@@ -410,6 +444,22 @@ test("conversation replay follows the latest semantic turn instead of reviving a
   const opportunities = detectThoughtOpportunities(context(ego));
   assert.equal(opportunities.some((item) => item.triggerDetail.includes("frühere Kontingent")), false);
   assert(opportunities.some((item) => item.triggerDetail.includes("Handelsstrategie")));
+});
+
+test("structured semantics route a non-English code-change directive to the agent", () => {
+  const ego = createDefaultEgoState();
+  const now = Date.now();
+  ego.lastInteractionTime = now - 10 * 60 * 1000;
+  ego.memories = [{
+    id: "arabic-code-change", type: "interaction",
+    content: "حدّث المكوّن وأصلح الخلل ثم تحقق من النتيجة",
+    emotion: 0, valence: "neutral", importance: 0.9, timestamp: now - 10 * 60 * 1000,
+    tags: ["conversation", "inbound"],
+    semanticSignals: ["execution-directive", "code-change", "verification"],
+  }];
+  const opportunities = detectThoughtOpportunities(context(ego));
+  const replay = opportunities.find((item) => item.triggerDetail.includes("حدّث المكوّن"));
+  assert.equal(replay?.suggestedAction, "run-agent-task");
 });
 
 test("local backtest result questions route to local analysis instead of search-web", () => {

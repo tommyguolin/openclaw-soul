@@ -31,6 +31,18 @@ test("IntentionStore persists and deduplicates a user directive by origin", asyn
   assert.match(first.intention.evidenceNeeded.join(" "), /clear user-facing outcome report/);
 });
 
+test("structured semantics give an Arabic code-change directive concrete completion evidence", () => {
+  const intention = buildUserDirectiveIntention(
+    "حدّث المكوّن وأصلح الخلل",
+    "message-arabic-change",
+    undefined,
+    ["execution-directive", "code-change"],
+  );
+  assert(intention.evidenceNeeded.includes("concrete changed files"));
+  assert(intention.evidenceNeeded.includes("relevant verification command passes"));
+  assert.equal(intention.urgency, 0.8);
+});
+
 test("a persisted host-agent handoff restores project scope and acceptance criteria after restart", async () => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-handoff-restart-"));
   try {
@@ -151,6 +163,23 @@ test("expression feedback keeps observations separate and no-reply neutral", asy
   assert.equal(adapted.policy.minimumAgeMultiplier > 1, true);
 });
 
+test("model semantics upgrade an earlier unknown-language feedback observation", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-expression-multilingual-upgrade-"));
+  const store = new ExpressionFeedbackStore(path.join(dir, "feedback.json"), "adaptive");
+  const proposal = {
+    id: "proposal-ar", sourceType: "thought" as const, sourceId: "thought-ar",
+    content: "اقتراح لتحسين الاستقرار", reason: "mature thought",
+    status: "sent" as const, createdAt: Date.now(), evaluatedAt: Date.now(),
+  };
+  const initial = await store.observeReply(proposal, "هذه الرسالة لم تكن مفيدة", "reply-ar");
+  assert.equal(initial.inference.label, "unclear");
+  const upgraded = await store.observeReply(
+    proposal, "هذه الرسالة لم تكن مفيدة", "reply-ar", ["negative-feedback"],
+  );
+  assert.equal(upgraded.inference.label, "not-useful");
+  assert.equal((await store.load()).policy.samples, 1);
+});
+
 test("observe expression policy records explicit feedback without adapting thresholds", async () => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-expression-observe-"));
   const store = new ExpressionFeedbackStore(path.join(dir, "feedback.json"), "observe");
@@ -183,6 +212,18 @@ test("feedback inference does not turn an unrelated reply into negative feedback
   assert.deepEqual(inferred.observations, ["reply-unrelated"]);
   assert.equal(inferred.label, "unclear");
   assert.equal(inferNoReplyFeedback().label, "unclear");
+});
+
+test("model semantic feedback works for non-Latin languages", () => {
+  const negative = inferExpressionFeedback(
+    "هذه الرسالة لم تكن مفيدة",
+    "تفاصيل التحسين المقترح",
+    ["negative-feedback"],
+  );
+  assert.equal(negative.label, "not-useful");
+  assert.ok(negative.observations.includes("explicit-negative"));
+  const adopted = inferExpressionFeedback("طبقت الاقتراح", "الاقتراح", ["adopted"]);
+  assert.equal(adopted.label, "adopted");
 });
 
 test("operational work receives a traceable Intention before task execution", async () => {

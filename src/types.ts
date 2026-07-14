@@ -127,6 +127,8 @@ export interface UserPreference {
   firstMentionedAt: number;
   updatedAt: number;
   timesObserved: number;
+  /** Language-independent stance supplied by the model. */
+  direction?: "prefer" | "avoid";
 }
 
 export interface EgoNeed {
@@ -236,7 +238,18 @@ export type InteractionSemanticSignal =
   | "execution-directive"
   | "topic-shift"
   | "closure"
-  | "small-talk";
+  | "small-talk"
+  | "preference"
+  | "positive-feedback"
+  | "negative-feedback"
+  | "correction"
+  | "bad-timing"
+  | "already-known"
+  | "adopted"
+  | "code-change"
+  | "verification"
+  | "local-evidence"
+  | "self-improvement";
 
 export interface Thought {
   id: string;

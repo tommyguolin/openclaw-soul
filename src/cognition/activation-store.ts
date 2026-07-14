@@ -36,7 +36,8 @@ export class ActivationStore {
     const snapshot: ActivationStateFile = {
       version: 1,
       updatedAt: now,
-      states: [...states].filter((state) => state.activation >= 0.01 || state.fatigue >= 0.01),
+      states: [...states].filter((state) => state.activation >= 0.01 || state.fatigue >= 0.01
+        || (state.refractoryUntil ?? 0) > now),
     };
     this.writeChain = this.writeChain.then(async () => {
       const directory = path.dirname(this.filePath);

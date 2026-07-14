@@ -41,8 +41,12 @@ function computeEngagementScore(ego: EgoState, timeSinceLastInteraction: number)
   // Factor 3: Content substance — questions or technical topics (0-0.4)
   const substantiveCount = recentInteractions.filter((m) => {
     const text = m.content.toLowerCase();
-    const hasQuestionStructure = /[?？]/.test(text) || /\b(how|what|why|when|where)\b/.test(text) ||
-      /(怎么|如何|为什么|为啥|什么|有没有)/.test(text);
+    const hasModelSubstance = m.semanticSignals?.some((signal) =>
+      signal === "question" || signal === "problem" || signal === "execution-directive");
+    const hasQuestionStructure = m.semanticSignals && m.semanticSignals.length > 0
+      ? hasModelSubstance
+      : /[?？]/.test(text) || /\b(how|what|why|when|where)\b/.test(text)
+        || /(怎么|如何|为什么|为啥|什么|有没有)/.test(text);
     const hasTechnicalContent = m.tags.some(
       (t) => t !== "conversation" && t !== "inbound" && t !== "outbound",
     );

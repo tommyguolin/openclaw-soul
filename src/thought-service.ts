@@ -83,7 +83,8 @@ import {
 import { ActivationStore, resolveActivationStatePath } from "./cognition/activation-store.js";
 import { CognitiveJournal, resolveCognitiveJournalPath } from "./cognition/cognitive-journal.js";
 import { CognitionRunner } from "./cognition/runner.js";
-import type { CognitionMode } from "./cognition/types.js";
+import type { CognitionMode, CognitiveTemperament } from "./cognition/types.js";
+import { temperamentActivationConfig } from "./cognition/associative-expansion.js";
 import { inferCognitiveKind } from "./cognition/kind.js";
 import { emergeFromWorkspace } from "./cognition/emergence.js";
 import { IntentionStore, resolveIntentionStorePath } from "./intention/store.js";
@@ -95,6 +96,7 @@ import {
   type ExpressionPolicyMode,
 } from "./expression/feedback-store.js";
 import { ThoughtEpisodeStore, resolveThoughtEpisodeStorePath } from "./cognition/thought-store.js";
+import { buildUserLanguageInstruction, supportsLocalMessageTemplate } from "./language-context.js";
 
 const log = createSoulLogger("thought-service");
 type LLMBudgetLane = "critical" | "action" | "thought" | "shadow";
@@ -316,6 +318,7 @@ export type ThoughtServiceOptions = {
   shadowThoughtRate?: number;
   /** Cognitive activation path. Default: legacy. */
   cognitionMode?: CognitionMode;
+  cognitiveTemperament?: CognitiveTemperament;
   /** Expression feedback policy. Disabled by default and independent of cognition. */
   expressionPolicy?: ExpressionPolicyMode;
 };
@@ -422,6 +425,7 @@ export class ThoughtService {
       this.cognitionRunner = new CognitionRunner({
         store: new ActivationStore(resolveActivationStatePath(this.storePath)),
         journal: new CognitiveJournal(resolveCognitiveJournalPath(this.storePath)),
+        config: temperamentActivationConfig(options.cognitiveTemperament ?? "balanced"),
       });
       if (this.cognitionMode === "shadow") {
         this.cognitionShadowPool = new ThoughtPool(resolveThoughtPoolV31ShadowPath(this.storePath));
@@ -442,7 +446,8 @@ export class ThoughtService {
         ? "Cognition Primary enabled for private thoughts; operational opportunities and all safety gates remain active"
         : this.cognitionMode === "shadow"
           ? "Cognition Workspace Shadow enabled (private LLM journal only; no action, message, or real Thought Pool writes)"
-          : "Cognition Activation Observer enabled (no LLM, action, message, or Thought Pool writes)");
+        : "Cognition Activation Observer enabled (no LLM, action, message, or Thought Pool writes)");
+      log.info(`Cognitive temperament: ${options.cognitiveTemperament ?? "balanced"} (context-adaptive associative expansion)`);
     }
     if (this.expressionPolicy !== "legacy" && this.cognitionMode !== "primary") {
       log.warn(`Expression policy ${this.expressionPolicy} requires cognitionMode=primary; falling back to legacy`);
@@ -730,19 +735,35 @@ export class ThoughtService {
       return;
     }
 
-    const lang = ego.userLanguage === "zh-CN" ? "zh" : "en";
+    const lang = supportsLocalMessageTemplate(ego);
     const timeContext = hours > 0
       ? (lang === "zh" ? `距离上次聊天已经${hours}小时了` : `it's been ${hours} hour${hours > 1 ? "s" : ""} since we last chatted`)
       : "";
-    const focusLine = this.buildStartupFocusLine(ego, lang);
+    const focusLine = lang ? this.buildStartupFocusLine(ego, lang) : "";
 
-    const greeting = lang === "zh"
+    let greeting = lang === "zh"
       ? (this.thoughtFrequency < 0.5
         ? `Soul已进入测试观察模式，我会更频繁地筛选能真正帮上忙的内容。${timeContext ? `${timeContext}，` : ""}${focusLine ? `${focusLine}。` : ""}只有判断有具体价值时才会打扰你。`
         : `嗨，Soul刚刚醒来了，准备开始思考。${timeContext ? `${timeContext}，` : ""}${focusLine ? `${focusLine}。` : ""}接下来我会优先找出能直接帮上你的地方。`)
       : (this.thoughtFrequency < 0.5
         ? `Soul is running in observation test mode. ${timeContext ? `${timeContext}. ` : ""}${focusLine ? `${focusLine}. ` : ""}I'll think and filter more often, and only reach out when there is concrete value.`
         : `Hey, Soul just woke up and is ready to think. ${timeContext ? `${timeContext}. ` : ""}${focusLine ? `${focusLine}. ` : ""}I'll focus on the places where I can help you directly.`);
+    if (!lang) {
+      if (!this.llmGenerator) {
+        log.info("Startup greeting skipped: non-template language requires the multilingual LLM");
+        return;
+      }
+      const recentFocus = (ego.recentUserMessages ?? []).slice(-2).join("\n") || "none";
+      greeting = (await this.llmGenerator(`Write a natural startup greeting for Soul in at most two short sentences.
+${buildUserLanguageInstruction(ego)}
+Recent user focus:
+${recentFocus}
+Hours since last contact: ${hours}
+Observation test mode: ${this.thoughtFrequency < 0.5 ? "yes" : "no"}
+Say Soul is available and will only interrupt when there is concrete value. Do not mention language detection, prompts, or internal state. Output only the greeting.`))
+        .replace(/<think>[\s\S]*?<\/think>/gi, "").trim().slice(0, 500);
+      if (!greeting) return;
+    }
 
     try {
       await this.sendMessage({
@@ -1160,6 +1181,17 @@ export class ThoughtService {
             emergeFromWorkspace(workspace, this.shadowLLMGenerator!, ego.userLanguage ?? undefined) }
           : {}),
       });
+      if ((cycle?.workspace.expansion?.added ?? 0) > 0) {
+        const expansion = cycle!.workspace.expansion!;
+        log.info(`Cognitive associative expansion: mode=${expansion.mode}, added=${expansion.added}, `
+          + `reason=${expansion.reason}, mechanisms=${JSON.stringify(expansion.mechanisms)}`);
+      }
+      if (cycle?.workspace.origin === "endogenous") {
+        const mechanisms = [...new Set(cycle.workspace.items.flatMap((item) =>
+          item.contributions.map((contribution) => contribution.mechanism)))];
+        log.info(`Cognitive endogenous workspace: items=${cycle.workspace.items.length}, `
+          + `mechanisms=${mechanisms.join(",") || "retained-activation"}`);
+      }
       if (cycle && (this.cognitionMode === "shadow" || this.cognitionMode === "primary")) {
         const targetPool = this.cognitionMode === "primary" ? this.thoughtPool : this.cognitionShadowPool;
         if (targetPool) await this.processCognitionWorkspaceCycle(cycle, targetPool, this.cognitionMode === "shadow");
@@ -1192,15 +1224,17 @@ export class ThoughtService {
       );
       return;
     }
-    const contradiction = await this.thoughtPool.findContradictingResolution(emergence.thought);
+    const cognitiveMove = emergence.cognitiveMove ?? classifyCognitiveMove(emergence.thought);
+    const contradiction = await this.thoughtPool.findContradictingResolution(emergence.thought, cognitiveMove);
     if (contradiction) {
       log.info(`Cognition shadow thought rejected by resolution: ${contradiction.topicKey}`);
       await targetPool.recordObservation(true);
       return;
     }
     const sourceItems = cycle.workspace.items;
-    const grounded = sourceItems.filter((item) => ["user", "tool", "web"].includes(item.trace.provenance));
-    const cognitiveMove = emergence.cognitiveMove ?? classifyCognitiveMove(emergence.thought);
+    // Associative material is causal context, not independent evidence for the new connection.
+    const grounded = sourceItems.filter((item) => item.role !== "associative"
+      && ["user", "tool", "web"].includes(item.trace.provenance));
     const epistemicNature = inferEpistemicNature(emergence.thought, cognitiveMove);
     const episode = !experimental && this.thoughtEpisodeStore
       ? await this.thoughtEpisodeStore.integrate({
@@ -1211,8 +1245,8 @@ export class ThoughtService {
         stimulusId: cycle.workspace.stimulusId,
         evidence: sourceItems.map((item) => ({
           sourceId: item.trace.sourceId,
-          relation: "context" as const,
-          grounded: ["user", "tool", "web"].includes(item.trace.provenance),
+          relation: item.role === "associative" ? "association" as const : "context" as const,
+          grounded: item.role !== "associative" && ["user", "tool", "web"].includes(item.trace.provenance),
           strength: item.activation,
           observedAt: cycle.record.timestamp,
         })),
@@ -1246,7 +1280,8 @@ export class ThoughtService {
     log.info(
       `Cognition ${experimental ? "shadow" : "primary"} candidate ${candidate.merged ? "reactivated" : "created"}: `
       + `id=${candidate.candidate.id}, nature=${candidate.candidate.epistemicNature ?? "uncertain"}, `
-      + `attention=${eligible?.id === candidate.candidate.id ? "private" : "pending"}`,
+      + `attention=${eligible?.id === candidate.candidate.id ? "private" : "pending"}, `
+      + `hold=${candidate.candidate.qualityFlags.includes("association-unverified") ? "association-unverified" : "none"}`,
     );
   }
 
@@ -1321,11 +1356,18 @@ export class ThoughtService {
       return;
     }
 
-    const wantsChinese = ego.userLanguage === "zh-CN" ||
-      (ego.recentUserMessages ?? []).some((m) => /[\u4e00-\u9fff]/.test(m));
-    const content = wantsChinese
+    const templateLanguage = supportsLocalMessageTemplate(ego);
+    let content = templateLanguage === "zh"
       ? "我检测到你希望我自动优化或修改项目，但 autonomousActions 还没有开启。要不要开启？开启后我才能自动改文件、运行写入类命令；未开启时只能分析和给建议。"
       : "I noticed you want me to autonomously optimize or modify a project, but autonomousActions is not enabled. Do you want to enable it? With it on I can edit files and run write-capable commands; with it off I can only analyze and suggest changes.";
+    if (!templateLanguage) {
+      if (!this.llmGenerator) return;
+      content = (await this.llmGenerator(`Write a concise permission request to the user.
+${buildUserLanguageInstruction(ego)}
+Explain that autonomousActions is disabled. Ask whether to enable it. Explain that enabling it permits file edits and write-capable commands; otherwise Soul can only analyze and recommend. Preserve the literal config name autonomousActions. Output only the message.`))
+        .replace(/<think>[\s\S]*?<\/think>/gi, "").trim().slice(0, 600);
+      if (!content) return;
+    }
 
     try {
       await this.sendMessage({
@@ -1579,7 +1621,7 @@ export class ThoughtService {
         this.recentCognitiveMoves = [...this.recentCognitiveMoves, "silence"].slice(-3);
         return;
       }
-      const contradiction = await this.thoughtPool.findContradictingResolution(content);
+      const contradiction = await this.thoughtPool.findContradictingResolution(content, parsedThought.cognitiveMove);
       if (contradiction) {
         log.info(`Rejected shadow thought with resolved premise: topic=${contradiction.topicKey}`);
         return;
@@ -2909,7 +2951,7 @@ export class ThoughtService {
 
       // Store the conversation content as an interaction memory
       // Keep only recent interactions to avoid unbounded growth
-      if (text.length >= 5) {
+      if (text.trim().length >= 2) {
         // Extract topic tags from the conversation text
         const extractedTags = this.extractInteractionTags(text);
         const tags = ["conversation", type, ...extractedTags];
@@ -2949,7 +2991,7 @@ export class ThoughtService {
         }
 
         // Detect user language from message text
-        if (type === "inbound" && text.length >= 5) {
+        if (type === "inbound" && text.trim().length >= 2) {
           const detected = this.detectLanguage(text);
           if (detected) {
             ego.userLanguage = detected;
@@ -3102,9 +3144,11 @@ export class ThoughtService {
     return null;
   }
 
-  async extractUserFacts(userMessage: string, messageId?: string): Promise<{ factsAdded: number; facts: UserFact[] }> {
+  async extractUserFacts(userMessage: string, messageId?: string): Promise<{
+    factsAdded: number; facts: UserFact[]; semanticSignals: InteractionSemanticSignal[];
+  }> {
     if (!userMessage || userMessage.length < 5) {
-      return { factsAdded: 0, facts: [] };
+      return { factsAdded: 0, facts: [], semanticSignals: [] };
     }
 
     const store = await loadEgoStore(this.storePath);
@@ -3112,10 +3156,10 @@ export class ThoughtService {
 
     if (!this.llmGenerator) {
       log.info("extractUserFacts: No LLM generator available");
-      return { factsAdded: 0, facts: [] };
+      return { factsAdded: 0, facts: [], semanticSignals: [] };
     }
     if (this.isLLMBackoffActive("user fact extraction")) {
-      return { factsAdded: 0, facts: [] };
+      return { factsAdded: 0, facts: [], semanticSignals: [] };
     }
 
     const prompt = this.buildUserFactExtractionPrompt(userMessage, existingFacts);
@@ -3125,11 +3169,12 @@ export class ThoughtService {
       const parsed = this.parseUserFactResponse(response) ?? [];
       const semanticSignals = this.parseSemanticSignals(response);
       const semanticTopicTags = this.parseSemanticTopicTags(response);
-      if (semanticSignals.length > 0 || semanticTopicTags.length > 0) {
-        await this.persistInteractionSemanticSignals(userMessage, messageId, semanticSignals, semanticTopicTags);
+      const languageCode = this.parseLanguageCode(response);
+      if (semanticSignals.length > 0 || semanticTopicTags.length > 0 || languageCode) {
+        await this.persistInteractionSemanticSignals(userMessage, messageId, semanticSignals, semanticTopicTags, languageCode);
         log.info(`Interaction semantics classified: ${semanticSignals.join(",") || "none"}; topics=${semanticTopicTags.join(",") || "none"}`);
       }
-      if (parsed.length === 0) return { factsAdded: 0, facts: [] };
+      if (parsed.length === 0) return { factsAdded: 0, facts: [], semanticSignals };
 
       const newFacts: UserFact[] = [];
       for (const item of parsed) {
@@ -3207,10 +3252,10 @@ export class ThoughtService {
       });
 
       log.info(`Extracted ${newFacts.length} user facts from message`);
-      return { factsAdded: newFacts.length, facts: newFacts };
+      return { factsAdded: newFacts.length, facts: newFacts, semanticSignals };
     } catch (err) {
       log.warn(`User fact extraction failed: ${String(err)}`);
-      return { factsAdded: 0, facts: [] };
+      return { factsAdded: 0, facts: [], semanticSignals: [] };
     }
   }
 
@@ -3227,8 +3272,13 @@ export class ThoughtService {
 Message:
 ${userMessage.slice(0, 1200)}
 
-Return only a JSON array containing zero or more of these exact labels:
-"question", "problem", "execution-directive", "topic-shift", "closure", "small-talk".
+Return only one JSON object with this shape:
+{"semanticSignals":[],"languageCode":"BCP-47 language code"}
+
+semanticSignals may contain only:
+"question", "problem", "execution-directive", "topic-shift", "closure", "small-talk",
+"preference", "positive-feedback", "negative-feedback", "correction", "bad-timing",
+"already-known", "adopted", "code-change", "verification", "local-evidence", "self-improvement".
 
 Definitions:
 - question: the user is asking for information or an explanation
@@ -3237,22 +3287,39 @@ Definitions:
 - topic-shift: the user redirects focus or states what to work on now
 - closure: the user says a previous topic is resolved, unwanted, paused, or should not continue
 - small-talk: greeting, acknowledgement, or social chat without substantive work
+- preference: the user states how Soul should communicate, behave, or what they prefer
+- positive-feedback / negative-feedback: explicit evaluation of Soul's output
+- correction: the user says a prior claim or interpretation is wrong
+- bad-timing: content was unwelcome specifically because of timing
+- already-known: the user says the information was already known
+- adopted: the user says they used or accepted a suggestion
+- code-change: completing the directive requires creating or modifying code/configuration
+- verification: the directive primarily asks to test or verify something
+- local-evidence: the directive requires reading local files, logs, metrics, or project state
+- self-improvement: the user explicitly asks Soul/OpenClaw to improve itself or this plugin
 
+languageCode must identify the message's language using a concise BCP-47 code such as de, pl, ar, ru, ja, ko, or zh-CN.
 Do not translate or answer the message.`;
     try {
       const response = await this.llmGenerator(prompt);
-      const match = response.replace(/```(?:json)?/gi, "").replace(/```/g, "").match(/\[[\s\S]*?\]/);
+      const cleaned = response.replace(/```(?:json)?/gi, "").replace(/```/g, "");
+      const match = cleaned.match(/\{[\s\S]*?\}/) ?? cleaned.match(/\[[\s\S]*?\]/);
       if (!match) return [];
       const parsed = JSON.parse(match[0]);
-      if (!Array.isArray(parsed)) return [];
+      const parsedSignals = Array.isArray(parsed) ? parsed : parsed?.semanticSignals;
+      if (!Array.isArray(parsedSignals)) return [];
       const allowed = new Set<InteractionSemanticSignal>([
         "question", "problem", "execution-directive", "topic-shift", "closure", "small-talk",
+        "preference", "positive-feedback", "negative-feedback", "correction", "bad-timing",
+        "already-known", "adopted", "code-change", "verification", "local-evidence", "self-improvement",
       ]);
-      const signals = [...new Set(parsed.filter((value): value is InteractionSemanticSignal =>
+      const signals = [...new Set(parsedSignals.filter((value): value is InteractionSemanticSignal =>
         typeof value === "string" && allowed.has(value as InteractionSemanticSignal),
       ))];
-      if (signals.length === 0) return [];
-      await this.persistInteractionSemanticSignals(userMessage, messageId, signals);
+      const languageCode = !Array.isArray(parsed) && typeof parsed?.languageCode === "string"
+        ? this.normalizeLanguageCode(parsed.languageCode) : undefined;
+      if (signals.length === 0 && !languageCode) return [];
+      await this.persistInteractionSemanticSignals(userMessage, messageId, signals, [], languageCode);
       log.info(`Interaction semantics classified: ${signals.join(",")}`);
       return signals;
     } catch (err) {
@@ -3299,6 +3366,7 @@ Do not translate or answer the message.`;
           existing.timesObserved += 1;
           existing.confidence = Math.min(1, existing.confidence + 0.15);
           existing.updatedAt = Date.now();
+          if (item.direction) existing.direction = item.direction;
           newPrefs.push(existing);
         } else {
           const validSources = ["explicit", "inferred", "interaction"] as const;
@@ -3313,6 +3381,7 @@ Do not translate or answer the message.`;
             firstMentionedAt: Date.now(),
             updatedAt: Date.now(),
             timesObserved: 1,
+            ...(item.direction ? { direction: item.direction } : {}),
           };
           newPrefs.push(newPref);
         }
@@ -3405,15 +3474,19 @@ Please extract user-specific information about themselves, such as:
 - company (company)
 
 Only return truly useful information that may help in the future. Do not extract generic common sense.
+Do not turn a requested task, instruction, or one-time work target into a fact about the user.
 
 Also classify the message by meaning regardless of its language. semanticSignals may contain only:
-"question", "problem", "execution-directive", "topic-shift", "closure", "small-talk".
+"question", "problem", "execution-directive", "topic-shift", "closure", "small-talk",
+"preference", "positive-feedback", "negative-feedback", "correction", "bad-timing",
+"already-known", "adopted", "code-change", "verification", "local-evidence", "self-improvement".
 
 Return only this JSON object:
 {
   "facts": [{"category":"category","content":"specific content","confidence":0.8,"source":"explicit"}],
   "semanticSignals": ["question"],
-  "topicTags": ["short-language-neutral-concept"]
+  "topicTags": ["short-language-neutral-concept"],
+  "languageCode": "BCP-47 language code of the user input"
 }
 
 Use an empty facts array when there is no valuable user information. topicTags must contain 0-5 concise semantic concepts, preferably stable English identifiers, derived by meaning rather than keyword matching.`;
@@ -3452,11 +3525,11 @@ Please analyze and extract preferences of the following types:
    - topics the user no longer wants, wants less of, or says are not needed
 
 Only return preferences that can genuinely improve the conversation experience.
-For topic preferences, preserve direction clearly, e.g. "focus on AI consciousness and Theory of Mind" or "deprioritize image-to-Word layout preservation".
+For every preference, classify direction by meaning regardless of language: "prefer" or "avoid".
 
 Return in JSON array format:
 [
-  {"aspect": "response_length", "preference": "short responses", "confidence": 0.8, "source": "inferred"},
+  {"aspect": "response_length", "preference": "short responses", "direction": "prefer", "confidence": 0.8, "source": "inferred"},
   ...
 ]
 
@@ -3496,6 +3569,8 @@ If there are no new preferences, return an empty array: []`;
       if (!Array.isArray(parsed?.semanticSignals)) return [];
       const allowed = new Set<InteractionSemanticSignal>([
         "question", "problem", "execution-directive", "topic-shift", "closure", "small-talk",
+        "preference", "positive-feedback", "negative-feedback", "correction", "bad-timing",
+        "already-known", "adopted", "code-change", "verification", "local-evidence", "self-improvement",
       ]);
       return [...new Set(parsed.semanticSignals.filter((value): value is InteractionSemanticSignal =>
         typeof value === "string" && allowed.has(value as InteractionSemanticSignal),
@@ -3522,12 +3597,31 @@ If there are no new preferences, return an empty array: []`;
     }
   }
 
+  private normalizeLanguageCode(value: string): string | undefined {
+    const normalized = value.trim();
+    return /^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/i.test(normalized) ? normalized : undefined;
+  }
+
+  private parseLanguageCode(response: string): string | undefined {
+    try {
+      let jsonStr = response.trim();
+      const codeBlockMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (codeBlockMatch) jsonStr = codeBlockMatch[1].trim();
+      const parsed = JSON.parse(jsonStr) as { languageCode?: unknown };
+      return typeof parsed.languageCode === "string" ? this.normalizeLanguageCode(parsed.languageCode) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async persistInteractionSemanticSignals(
     userMessage: string,
     messageId: string | undefined,
     signals: InteractionSemanticSignal[],
     semanticTopicTags: string[] = [],
+    languageCode?: string,
   ): Promise<void> {
+    let classifiedMemory: SoulMemory | undefined;
     await updateEgoStore(this.storePath, (ego) => {
       const candidates = ego.memories.filter((memory) =>
         memory.type === "interaction" && memory.tags.includes("inbound")
@@ -3535,11 +3629,70 @@ If there are no new preferences, return an empty array: []`;
       );
       const target = candidates.sort((a, b) => b.timestamp - a.timestamp)[0];
       if (target) {
+        const hadLexicalEmotion = target.valence !== "neutral";
         target.semanticSignals = signals;
         target.tags = [...new Set([...target.tags, ...semanticTopicTags])];
+        if (signals.includes("positive-feedback")) {
+          target.valence = "positive";
+          target.emotion = Math.max(target.emotion, 18);
+        } else if (signals.includes("negative-feedback") || signals.includes("correction")) {
+          target.valence = "negative";
+          target.emotion = Math.min(target.emotion, -18);
+        }
+        if (!hadLexicalEmotion && signals.includes("positive-feedback")) {
+          ego.needs.connection.current = Math.min(100, ego.needs.connection.current + 3);
+        } else if (!hadLexicalEmotion
+          && (signals.includes("negative-feedback") || signals.includes("correction"))) {
+          ego.needs.security.current = Math.max(0, ego.needs.security.current - 2);
+        }
+        classifiedMemory = { ...target, tags: [...target.tags], semanticSignals: [...signals] };
+      }
+      if (languageCode) ego.userLanguage = languageCode;
+      if (ego.relationshipProfile && signals.includes("positive-feedback")) {
+        ego.relationshipProfile.recentEmotionalTone = "positive";
+      } else if (ego.relationshipProfile
+        && (signals.includes("negative-feedback") || signals.includes("correction"))) {
+        ego.relationshipProfile.recentEmotionalTone = "negative";
       }
       return ego;
     });
+    if (!classifiedMemory) return;
+    const originId = classifiedMemory.sourceMessageId || classifiedMemory.id;
+    if (signals.includes("execution-directive") && this.cognitionMode === "primary" && this.intentionStore) {
+      const result = await this.intentionStore.add(buildUserDirectiveIntention(
+        userMessage,
+        originId,
+        classifiedMemory.sourceConversationId,
+        signals,
+      ));
+      if (result.created) log.info(`Multilingual semantic directive recorded as Intention: id=${result.intention.id}`);
+    }
+    if (signals.includes("closure")) {
+      await this.thoughtPool.registerResolution({
+        topicKey: resolutionTopicKey(userMessage),
+        resolutionText: userMessage,
+        resolvedAt: classifiedMemory.timestamp,
+      });
+      await this.thoughtPool.fadeRelatedCandidates(userMessage);
+      if (this.thoughtEpisodeStore) {
+        await this.thoughtEpisodeStore.supersedeRelated(userMessage, classifiedMemory.id);
+      }
+    }
+    if (this.expressionFeedbackStore && this.expressionStore
+      && signals.some((signal) => ["positive-feedback", "negative-feedback", "correction",
+        "bad-timing", "already-known", "adopted"].includes(signal))) {
+      const expressions = await this.expressionStore.load();
+      const proposal = expressions.proposals.find((item) => item.status === "sent"
+        && Date.now() - (item.evaluatedAt ?? item.createdAt) < 24 * 60 * 60 * 1000);
+      if (proposal) {
+        await this.expressionFeedbackStore.observeReply(
+          proposal,
+          userMessage,
+          classifiedMemory.sourceMessageId || classifiedMemory.id,
+          signals,
+        );
+      }
+    }
   }
 
   private parseUserPreferenceResponse(
@@ -3549,6 +3702,7 @@ If there are no new preferences, return an empty array: []`;
     preference: string;
     confidence: number;
     source?: string;
+    direction?: "prefer" | "avoid";
   }> | null {
     try {
       let jsonStr = response.trim();
@@ -3578,7 +3732,10 @@ If there are no new preferences, return an empty array: []`;
           typeof item.preference === "string" &&
           item.preference.length > 0 &&
           isFinite(item.confidence),
-      );
+      ).map((item) => ({
+        ...item,
+        ...(item.direction === "prefer" || item.direction === "avoid" ? { direction: item.direction } : {}),
+      }));
     } catch {
       return null;
     }

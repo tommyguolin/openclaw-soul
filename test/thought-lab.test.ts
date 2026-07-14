@@ -43,8 +43,17 @@ test("contentTokens is script-neutral for European and non-Latin languages", () 
   assert(tokens.includes("ελληνικά"));
 });
 
+test("model topic tags create language-independent topic clusters", () => {
+  const clusters = memoryTopicClusters({
+    content: "Łączność pozostaje niestabilna po ponownym uruchomieniu",
+    tags: ["topic:connection-reliability"],
+  });
+  assert.ok(clusters.includes("topic:connection-reliability"));
+});
+
 test("classifyCognitiveMove labels questions before generic reflection", () => {
   assert.equal(classifyCognitiveMove("这两个现象为什么会有相同结构？"), "question");
+  assert.equal(classifyCognitiveMove("它现在更像实验，还是已经接近可交付产品。"), "question");
   assert.equal(classifyCognitiveMove("This reminds me of the same hidden-state pattern."), "analogy");
 });
 

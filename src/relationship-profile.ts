@@ -117,7 +117,8 @@ function inferPersonalitySignal(message = ""): {
 
 function preferenceDerivedAvoids(ego: EgoState): string[] {
   return (ego.userPreferences ?? [])
-    .filter((p) => p.confidence >= 0.45 && /不要|别|不用|少|停止|avoid|stop|less|deprioriti[sz]e/i.test(p.preference))
+    .filter((p) => p.confidence >= 0.45 && (p.direction === "avoid"
+      || (!p.direction && /不要|别|不用|少|停止|avoid|stop|less|deprioriti[sz]e/i.test(p.preference))))
     .map((p) => p.preference.slice(0, 80));
 }
 

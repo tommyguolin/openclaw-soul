@@ -103,6 +103,7 @@ export interface ThoughtPoolMetrics {
   resolvedTopicRecurrenceRate: number;
   naturalSilenceRate: number;
   unsupportedUncertaintyRate: number;
+  unverifiedAssociationRate: number;
   contextContinuityRate: number;
   thoughtSpecificityRate: number;
   meanSourceMemoryAgeDays: number;
@@ -179,6 +180,8 @@ export function calculateAttentionScore(
   const qualityPenalty = (qualityFlags.includes("meta-framing") ? 0.25 : 0)
     + (qualityFlags.includes("forced-association") ? 0.2 : 0)
     + (qualityFlags.includes("task-pressure") ? 0.15 : 0)
+    // Epistemic hold, not a nonsense penalty: it may remain a useful private hypothesis.
+    + (qualityFlags.includes("association-unverified") ? 0.05 : 0)
     + (qualityFlags.includes("truncated") ? 0.2 : 0);
   return clamp01(
     scores.novelty * 0.3
@@ -242,6 +245,8 @@ export function calculateThoughtPoolMetrics(candidates: ThoughtCandidate[], now 
     unsupportedUncertaintyRate: rate(candidates.filter((candidate) =>
       /(?:maybe|perhaps|could|might|不确定|也许|或许|可能)/i.test(candidate.content)
       && candidate.activationHistory.every((activation) => activation.fingerprint === "ungrounded")).length),
+    unverifiedAssociationRate: rate(candidates.filter((candidate) =>
+      candidate.qualityFlags.includes("association-unverified")).length),
     contextContinuityRate: rate(candidates.filter((candidate) =>
       candidate.sourceMemoryTimestamps.some((timestamp) => now - timestamp < 24 * 60 * 60 * 1000)).length),
     thoughtSpecificityRate: rate(candidates.filter((candidate) =>
@@ -599,7 +604,7 @@ export class ThoughtPool {
     return reopened;
   }
 
-  async findContradictingResolution(content: string): Promise<ResolutionRecord | undefined> {
+  async findContradictingResolution(content: string, cognitiveMove?: string): Promise<ResolutionRecord | undefined> {
     const store = await this.load();
     const tokens = new Set(contentTokens(content));
     const sshSetupRecheck =
@@ -610,7 +615,8 @@ export class ThoughtPool {
         record.status === "resolved" && record.topicKey === "ssh-access:192.168.1.206");
       if (resolvedSsh) return resolvedSsh;
     }
-    const expressesProblem = /(?:fail|failed|failing|unable|cannot|can't|broken|problem|issue|still|不确定|失败|无法|不能|连不上|有问题|仍然|是否)/i.test(content);
+    const expressesProblem = ["question", "confusion", "speculation"].includes(cognitiveMove ?? "")
+      || /(?:fail|failed|failing|unable|cannot|can't|broken|problem|issue|still|不确定|失败|无法|不能|连不上|有问题|仍然|是否)/i.test(content);
     if (!expressesProblem) return undefined;
     return store.resolutions
       .filter((record) => record.status === "resolved")

@@ -35,10 +35,6 @@ function normalizeTarget(channel: string, target: string): string {
   return target;
 }
 
-function hasExplicitPreferenceSignal(text: string): boolean {
-  return /(?:我(?:更)?(?:喜欢|偏好|希望|想要)|请(?:尽量|不要|别)|最好|更倾向|不喜欢|讨厌|\b(?:i\s+(?:prefer|like|want)|please\s+(?:do|don't|avoid)|my\s+preference)\b)/i.test(text);
-}
-
 type CapturedMessageSend = { text: string; toolCallId?: string };
 
 function parseToolArguments(value: unknown): Record<string, unknown> | undefined {
@@ -262,6 +258,8 @@ type PluginConfig = {
   shadowThoughtRate?: number;
   /** Cognitive activation mode. "observe" records activation/workspace only. */
   cognitionMode?: "legacy" | "observe" | "shadow" | "primary";
+  /** Associative expansion temperament; task context can still narrow it. */
+  cognitiveTemperament?: "focused" | "balanced" | "expansive";
   /** Expression feedback policy. Requires cognitionMode=primary when non-legacy. */
   expressionPolicy?: "legacy" | "observe" | "adaptive";
 };
@@ -363,6 +361,7 @@ const plugin = {
       thoughtFrequency: { type: "number", description: "Thought frequency multiplier. Default: 1.0. Lower = more frequent (e.g. 0.2 for testing), higher = less frequent" },
       shadowThoughtRate: { type: "number", minimum: 0, maximum: 1, description: "Private actionless shadow thought probability. Default: 0.1" },
       cognitionMode: { type: "string", enum: ["legacy", "observe", "shadow", "primary"], description: "Cognitive activation mode. primary routes private thoughts through Activation while preserving operational detectors and all safety gates" },
+      cognitiveTemperament: { type: "string", enum: ["focused", "balanced", "expansive"], description: "Associative expansion style. balanced is the safe default; active troubleshooting always narrows automatically" },
       expressionPolicy: { type: "string", enum: ["legacy", "observe", "adaptive"], description: "Expression feedback policy. observe records feedback; adaptive adjusts expression timing/value only. Requires cognitionMode=primary" },
       llm: {
         type: "object",
@@ -478,6 +477,7 @@ const plugin = {
         thoughtFrequency: config.thoughtFrequency ?? 1.0,
         shadowThoughtRate: config.shadowThoughtRate ?? 0.1,
         cognitionMode: config.cognitionMode ?? "legacy",
+        cognitiveTemperament: config.cognitiveTemperament ?? "balanced",
         expressionPolicy: config.expressionPolicy ?? "legacy",
       });
       serviceCreated = true;
@@ -605,14 +605,15 @@ const plugin = {
             conversationId: conversationId || undefined,
           })
             .catch((err) => log.warn(`Record interaction failed: ${String(err)}`));
-          setTimeout(() => {
+          const annotationTimer = setTimeout(() => {
             service.extractUserFacts(text, messageId || undefined)
-              .then(() => hasExplicitPreferenceSignal(text)
+              .then((result) => result.semanticSignals.includes("preference")
                 ? service.extractUserPreferences(text)
                 : undefined)
               .catch((err) => log.warn(`Background message processing failed: ${String(err)}`));
           }, delayMs);
-        } else if (text.length >= 5) {
+          annotationTimer.unref?.();
+        } else if (text.trim().length >= 2) {
           service.recordInteractionWithText({
             type: "inbound",
             text,
@@ -621,6 +622,14 @@ const plugin = {
             conversationId: conversationId || undefined,
           })
             .catch((err) => log.warn(`Record interaction failed: ${String(err)}`));
+          // Short substantive messages can still be directives or closures in
+          // languages where a useful sentence occupies few characters. Let the
+          // multilingual model classify meaning instead of growing keyword tables.
+          const semanticTimer = setTimeout(() => {
+            service.classifyInteractionSemantics(text, messageId || undefined)
+              .catch((err) => log.warn(`Background semantic classification failed: ${String(err)}`));
+          }, 2 * 60 * 1000);
+          semanticTimer.unref?.();
         } else {
           service.recordInteraction({ type: "inbound" }).catch((err) =>
             log.warn(`Record interaction failed: ${String(err)}`),

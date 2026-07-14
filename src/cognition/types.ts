@@ -1,6 +1,7 @@
 import type { SoulMemory } from "../types.js";
 
 export type CognitionMode = "legacy" | "observe" | "shadow" | "primary";
+export type CognitiveTemperament = "focused" | "balanced" | "expansive";
 
 export type CognitiveTraceType =
   | "memory"
@@ -49,6 +50,7 @@ export type ActivationMechanism =
   | "unresolved-state"
   | "contradiction"
   | "recurrence"
+  | "incubation"
   | "random-recall";
 
 export interface ActivationContribution {
@@ -68,6 +70,7 @@ export interface ActivationConfig {
   maxUnresolvedInput: number;
   maxContradictionInput: number;
   maxTemporalInput: number;
+  maxRecurrenceInput: number;
   stochasticRecallProbability: number;
   stochasticRecallInput: number;
   fatigueIncrement: number;
@@ -80,6 +83,20 @@ export interface ActivationConfig {
   hardDominantThreshold: number;
   maxWorkspaceItems: number;
   maxActiveSetSize: number;
+  maxEndogenousUnresolved: number;
+  maxEndogenousRecurring: number;
+  maxEndogenousTemporal: number;
+  minTemporalAgeMs: number;
+  endogenousRefractoryMs: number;
+  endogenousGlobalCooldownMs: number;
+  /** Stable temperament knobs. Runtime context still narrows or widens them. */
+  associativeBreadth: number;
+  noveltySeeking: number;
+  inhibition: number;
+  persistence: number;
+  incubationDepth: number;
+  convergencePressure: number;
+  maxAssociativeItems: number;
 }
 
 export const DEFAULT_ACTIVATION_CONFIG: ActivationConfig = {
@@ -87,9 +104,10 @@ export const DEFAULT_ACTIVATION_CONFIG: ActivationConfig = {
   maxPerceptionInput: 0.72,
   maxSemanticSpread: 0.20,
   maxAssociationSpread: 0.15,
-  maxUnresolvedInput: 0.15,
+  maxUnresolvedInput: 0.055,
   maxContradictionInput: 0.25,
-  maxTemporalInput: 0.05,
+  maxTemporalInput: 0.025,
+  maxRecurrenceInput: 0.03,
   stochasticRecallProbability: 0.02,
   stochasticRecallInput: 0.08,
   fatigueIncrement: 0.15,
@@ -102,6 +120,19 @@ export const DEFAULT_ACTIVATION_CONFIG: ActivationConfig = {
   hardDominantThreshold: 0.68,
   maxWorkspaceItems: 4,
   maxActiveSetSize: 120,
+  maxEndogenousUnresolved: 3,
+  maxEndogenousRecurring: 2,
+  maxEndogenousTemporal: 2,
+  minTemporalAgeMs: 6 * 60 * 60 * 1000,
+  endogenousRefractoryMs: 24 * 60 * 60 * 1000,
+  endogenousGlobalCooldownMs: 2 * 60 * 60 * 1000,
+  associativeBreadth: 0.5,
+  noveltySeeking: 0.55,
+  inhibition: 0.6,
+  persistence: 0.5,
+  incubationDepth: 0.45,
+  convergencePressure: 0.65,
+  maxAssociativeItems: 3,
 };
 
 export interface CognitionStimulus {
@@ -124,6 +155,27 @@ export interface WorkspaceItem {
   fatigue: number;
   contributions: ActivationContribution[];
   selectionReason: string;
+  role?: "core" | "associative";
+  association?: {
+    sourceTraceId: string;
+    mechanism: "explicit-association" | "shared-pattern" | "semantic-bridge";
+    bridgeLabels: string[];
+    semanticDistance: number;
+    relevance: number;
+    confidence: number;
+    exploratory: true;
+  };
+}
+
+export interface AssociativeExpansionSummary {
+  mode: "narrow" | "balanced" | "broad";
+  attempted: number;
+  added: number;
+  effectiveBreadth: number;
+  stagnation: number;
+  taskPressure: boolean;
+  reason: string;
+  mechanisms: Record<string, number>;
 }
 
 export interface CognitiveWorkspace {
@@ -136,6 +188,8 @@ export interface CognitiveWorkspace {
   aggregateActivation: number;
   allowEmergence: boolean;
   silenceReason?: string;
+  expansion?: AssociativeExpansionSummary;
+  origin?: "external" | "endogenous";
 }
 
 export interface ActivationStateFile {
@@ -165,6 +219,8 @@ export interface CognitionCycleRecord {
     aggregateActivation: number;
     allowEmergence: boolean;
     silenceReason?: string;
+    expansion?: AssociativeExpansionSummary;
+    origin?: "external" | "endogenous";
   };
   emergence: {
     called: boolean;

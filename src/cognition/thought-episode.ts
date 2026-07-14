@@ -2,7 +2,7 @@ import type { EpistemicNature } from "../thought-pool.js";
 
 export interface ThoughtEvidence {
   sourceId: string;
-  relation: "supports" | "contradicts" | "refines" | "context";
+  relation: "supports" | "contradicts" | "refines" | "context" | "association";
   grounded: boolean;
   strength: number;
   observedAt: number;

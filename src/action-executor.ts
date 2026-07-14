@@ -25,6 +25,7 @@ import {
 } from "./behavior-log.js";
 import { isLLMErrorContent as isLLMErrorOutput } from "./llm-errors.js";
 import { describePersonalityProfile, describeRelationshipProfile } from "./relationship-profile.js";
+import { buildUserLanguageInstruction } from "./language-context.js";
 
 const log = createSoulLogger("action-executor");
 
@@ -260,17 +261,6 @@ const CONCRETE_WORK_SIGNAL_PATTERNS = [
   /\u9519\u8bef|\u5931\u8d25|\u963b\u585e|\u6839\u56e0|\u5b9a\u4f4d|\u98ce\u9669|\u53c2\u6570/i,
 ];
 
-const SHAREABLE_RECALL_SIGNAL_PATTERNS = [
-  /\b(?:completed|finished|ran|tested|verified|changed|fixed|implemented|measured|benchmarked|backtested)\b/i,
-  /\b(?:root cause|blocked|failed because|error|command|file|diff|patch|verification)\b/i,
-  /\b(?:drawdown|sharpe|cagr|win rate|pnl|profit|loss|slippage|fee|benchmark)\b/i,
-  /\b\d+(?:\.\d+)?\s*(?:%|ms|sec|s|min|m|h|x|bps)\b/i,
-  /(?:^|[\s`])[\w.-]+\.(?:ts|tsx|js|jsx|py|json|md|yml|yaml|sh|ps1|toml|csv)(?:\b|[`:\s])/i,
-  /(?:^|[\s`])(?:[\w.-]+[\\/])+[\w.-]+(?:\b|[`:\s])/i,
-  /\u5b8c\u6210|\u8dd1\u5b8c|\u5df2\u9a8c\u8bc1|\u9a8c\u8bc1\u901a\u8fc7|\u547d\u4ee4|\u6587\u4ef6|\u4fee\u6539|\u6539\u4e86|\u4fee\u590d/i,
-  /\u9519\u8bef|\u5931\u8d25|\u963b\u585e|\u6839\u56e0|\u5b9a\u4f4d/i,
-];
-
 const VAGUE_STATUS_PATTERNS = [
   /\b(?:ready to help|let me check|I can help|happy to help)\b/i,
   /\b(?:thinking about|want to|planning to|going to)\b.{0,80}\b(?:work|run|check|optimize|investigate)\b/i,
@@ -328,14 +318,42 @@ export function assessOutgoingProactiveMessage(message: string): MessageQualityC
   return { ok: true };
 }
 
+async function assessOutgoingProactiveMessageSemantically(
+  message: string,
+  ego: EgoState,
+  llmGenerator?: LLMGenerator,
+): Promise<MessageQualityCheck> {
+  const local = assessOutgoingProactiveMessage(message);
+  if (!local.ok || !llmGenerator) return local;
+  try {
+    const raw = await llmGenerator(`Evaluate this proposed proactive message by meaning regardless of its language.
+
+Message:
+${message.slice(0, 1200)}
+
+Return only JSON: {"ok":true,"reason":"none"} or {"ok":false,"reason":"short-stable-label"}.
+Reject if it asks the user to choose from a menu, asks permission to do ordinary work, promises future work that has not happened, presents unsupported local metrics as facts, reopens a clearly resolved premise, contains assistant-like filler, or mainly describes Soul's internal process.
+Do not reject a concrete verified result, a useful grounded finding, or one natural relationship question.`);
+    const match = raw.replace(/```(?:json)?/gi, "").replace(/```/g, "").match(/\{[\s\S]*?\}/);
+    if (!match) throw new Error("missing quality JSON");
+    const parsed = JSON.parse(match[0]) as { ok?: unknown; reason?: unknown };
+    if (typeof parsed.ok !== "boolean") throw new Error("invalid quality JSON");
+    return parsed.ok ? { ok: true } : { ok: false, reason: typeof parsed.reason === "string" ? parsed.reason : "semantic-quality" };
+  } catch (error) {
+    // For languages without an audited local template, an unavailable model
+    // must fail closed instead of silently trusting English/Chinese heuristics.
+    if (!ego.userLanguage?.toLocaleLowerCase().startsWith("zh")
+      && !ego.userLanguage?.toLocaleLowerCase().startsWith("en")) {
+      log.warn(`Multilingual proactive quality check unavailable: ${String(error)}`);
+      return { ok: false, reason: "multilingual-quality-unavailable" };
+    }
+    return local;
+  }
+}
+
 function hasConcreteWorkSignal(message: string): boolean {
   const text = message.replace(/\s+/g, " ").trim();
   return CONCRETE_WORK_SIGNAL_PATTERNS.some((pattern) => pattern.test(text));
-}
-
-function hasShareableRecallSignal(message: string): boolean {
-  const text = message.replace(/\s+/g, " ").trim();
-  return SHAREABLE_RECALL_SIGNAL_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 function isBlockedMetaWorkThought(message: string): boolean {
@@ -1055,7 +1073,7 @@ async function executeSendMessage(
     };
   }
 
-  const quality = assessOutgoingProactiveMessage(messageContent);
+  const quality = await assessOutgoingProactiveMessageSemantically(messageContent, ego, options.llmGenerator);
   if (!quality.ok) {
     log.info(`Proactive message skipped: ${quality.reason ?? "quality-gate"}: ${messageContent.slice(0, 120)}`);
     return {
@@ -1162,18 +1180,7 @@ async function generateValuableMessage(
       const adjacentGuidance = "";
 
       // Language instruction based on detected user language or message samples
-      const lang = ego.userLanguage;
-      const userSamples = ego.recentUserMessages ?? [];
-      let langInstruction: string;
-      if (lang === "zh-CN" || lang === "ja" || lang === "ko") {
-        // CJK languages detected reliably via character ranges
-        langInstruction = `**User's language**: ${lang}\n**Rule**: You MUST write your message in ${lang === "zh-CN" ? "Chinese (中文)" : lang === "ja" ? "Japanese" : "Korean"}. Do NOT use any other language.`;
-      } else if (userSamples.length > 0) {
-        // Latin-script languages: pass samples so LLM matches the language
-        langInstruction = `**User's recent messages**:\n${userSamples.map((s, i) => `${i + 1}. ${s}`).join("\n")}\n**Rule**: You MUST write your message in the SAME language the user uses. Match their language exactly. Do NOT use any other language.`;
-      } else {
-        langInstruction = "Use Chinese if the user speaks Chinese, otherwise English.";
-      }
+      const langInstruction = buildUserLanguageInstruction(ego);
 
       // Time-of-day context
       const hour = new Date().getHours();
@@ -1890,16 +1897,7 @@ Write 3-5 concise insights in flowing prose (NOT a numbered list). Each insight 
 
   // Step 4: Send message to user
   // Use the language samples for matching
-  const userSamples = ego.recentUserMessages ?? [];
-  const cjkLang = ego.userLanguage === "zh-CN" ? "Chinese (中文)"
-    : ego.userLanguage === "ja" ? "Japanese"
-      : ego.userLanguage === "ko" ? "Korean"
-        : undefined;
-  const langInstruction = cjkLang
-    ? `Write in ${cjkLang}.`
-    : userSamples.length > 0
-      ? `The user writes in this language:\n${userSamples.slice(0, 3).join("\n")}\nWrite in the SAME language.`
-      : "Use the same language as the user's messages above.";
+  const langInstruction = buildUserLanguageInstruction(ego);
 
   const messagePrompt = `You are sending a proactive message to the user about something you researched for them.
 
@@ -1927,6 +1925,12 @@ Write 3-5 sentences as a natural message to the user. Rules:
 
   if (!cleanedMessage || cleanedMessage.length < 10) {
     return { result: { type: "proactive-research", success: true, result: "no-message-generated" }, metricsChanged: [] };
+  }
+
+  const messageQuality = await assessOutgoingProactiveMessageSemantically(cleanedMessage, ego, llmGenerator);
+  if (!messageQuality.ok) {
+    return { result: { type: "proactive-research", success: true,
+      result: `skipped-${messageQuality.reason ?? "quality-gate"}` }, metricsChanged: [] };
   }
 
   const sendLimit = await getProactiveMessageLimitReason(ego, cleanedMessage, options.thoughtFrequency);
@@ -2096,16 +2100,7 @@ In 3-5 sentences, describe the most interesting finding. Be specific — mention
   }
 
   // Step 3: Generate message
-  const userSamples = ego.recentUserMessages ?? [];
-  const cjkLang = ego.userLanguage === "zh-CN" ? "Chinese (中文)"
-    : ego.userLanguage === "ja" ? "Japanese"
-      : ego.userLanguage === "ko" ? "Korean"
-        : undefined;
-  const langInstruction = cjkLang
-    ? `Write in ${cjkLang}.`
-    : userSamples.length > 0
-      ? `The user writes in this language:\n${userSamples.slice(0, 3).join("\n")}\nWrite in the SAME language.`
-      : "Use the same language as the user.";
+  const langInstruction = buildUserLanguageInstruction(ego);
 
   const messagePrompt = `You found an interesting article/news item for the user based on their interests.
 
@@ -2135,6 +2130,12 @@ Write 3-5 sentences as a natural message sharing this find. Rules:
 
   if (!cleanedMessage || cleanedMessage.length < 10) {
     return { result: { type: "proactive-content-push", success: false, result: "no-message" }, metricsChanged: [] };
+  }
+
+  const messageQuality = await assessOutgoingProactiveMessageSemantically(cleanedMessage, ego, llmGenerator);
+  if (!messageQuality.ok) {
+    return { result: { type: "proactive-content-push", success: true,
+      result: `skipped-${messageQuality.reason ?? "quality-gate"}` }, metricsChanged: [] };
   }
 
   const sendLimit = await getProactiveMessageLimitReason(ego, cleanedMessage, options.thoughtFrequency);
@@ -2227,40 +2228,8 @@ Describe in 1-2 sentences what these memories make you think about, and what you
     }
   }
 
-  // Memory reflection is internal by default. Only share it when it carries
-  // concrete evidence, then reuse the normal proactive outbound gates.
-  const actionablePattern = /应该|可以|需要|想要|打算|我要|要去|我来|I should|I can|I want|I need|I'll|let me|I plan/i;
-  if (actionablePattern.test(memorySummary) && options.sendMessage && options.channel && options.target) {
-    if (!hasShareableRecallSignal(memorySummary)) {
-      log.info(`Recall memory not shared: no-concrete-result: ${memorySummary.slice(0, 120)}`);
-    } else {
-      const quality = assessOutgoingProactiveMessage(memorySummary);
-      if (!quality.ok) {
-        log.info(`Recall memory not shared: ${quality.reason ?? "quality-gate"}: ${memorySummary.slice(0, 120)}`);
-      } else {
-        const sendLimit = await getProactiveMessageLimitReason(ego, memorySummary, options.thoughtFrequency);
-        if (sendLimit) {
-          log.info(`Recall memory not shared: ${sendLimit}: ${memorySummary.slice(0, 120)}`);
-        } else {
-          try {
-            await options.sendMessage({ to: options.target, content: memorySummary, channel: options.channel });
-            await recordProactiveOutboundMemory(memorySummary, ["recall-memory"]);
-            log.info("Recall memory: concrete reflection sent as message");
-            return {
-              result: { type: "recall-memory", success: true, result: "reflection-shared-as-message" },
-              metricsChanged: [
-                { need: "meaning", delta: 3, reason: "recollection brings a sense of connection" },
-                { need: "connection", delta: 2, reason: "shared concrete reflection with user" },
-              ],
-            };
-          } catch {
-            // Fall through to return silent reflection
-          }
-        }
-      }
-    }
-  }
-
+  // Recall is private cognition. Expression, in any language, must mature via
+  // Thought Pool/Attention rather than keyword-triggered direct messaging.
   return {
     result: {
       type: "recall-memory",

@@ -83,7 +83,16 @@ export function analyzeTopicFrequencies(memories: SoulMemory[]): TopicFrequency[
   const frequencies = new Map<string, TopicFrequency>();
 
   for (const memory of memories) {
-    const topics = extractTopicsFromText(memory.content);
+    const semanticTopics = memory.tags
+      .filter((tag) => tag.startsWith("topic:"))
+      .map((tag) => ({
+        topic: tag.slice("topic:".length).replace(/-/g, " "),
+        type: (memory.semanticSignals?.includes("question") ? "curiosity"
+          : memory.semanticSignals?.includes("preference") ? "achievement" : "learning") as ObsessionType,
+      }));
+    // Model concepts are the normal multilingual path; lexical extraction is
+    // retained only for legacy memories without semantic topic tags.
+    const topics = semanticTopics.length > 0 ? semanticTopics : extractTopicsFromText(memory.content);
 
     for (const { topic, type } of topics) {
       const existing = frequencies.get(topic);

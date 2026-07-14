@@ -15,6 +15,7 @@ import type { Thought, EgoState, ActionResult, MetricDelta, AutonomousTask, Task
 import type { MessageSender } from "./soul-actions.js";
 import { updateEgoStore, resolveEgoStorePath } from "./ego-store.js";
 import { resolveSoulDir } from "./paths.js";
+import { buildUserLanguageInstruction, supportsLocalMessageTemplate } from "./language-context.js";
 
 const log = createSoulLogger("autonomous-actions");
 
@@ -1293,11 +1294,10 @@ export async function executeReportFindings(
   // files, metrics, or blockers. Exact message dedup below is enough to prevent
   // repeated sends without swallowing useful work.
 
-  const cjkLang = ego.userLanguage === "zh-CN" ? "Chinese (中文)"
-    : ego.userLanguage === "ja" ? "Japanese"
-      : ego.userLanguage === "ko" ? "Korean"
-      : undefined;
-  const directMessage = buildDirectTaskReportMessage(reportableTasks, ego);
+  const templateLanguage = supportsLocalMessageTemplate(ego);
+  // Local reports intentionally have only two audited templates. Every other
+  // language goes through the multilingual model instead of receiving English.
+  const directMessage = templateLanguage ? buildDirectTaskReportMessage(reportableTasks, ego) : null;
   if (directMessage) {
     const msgNorm = directMessage.trim().toLowerCase().slice(0, 200);
     const dedupCutoff = Date.now() - 4 * 60 * 60 * 1000;
@@ -1333,12 +1333,7 @@ export async function executeReportFindings(
     return { result: { type: "report-findings", success: true, result: "nothing meaningful to report" }, metricsChanged: [] };
   }
 
-  const userSamples = ego.recentUserMessages ?? [];
-  const reportLangInstruction = cjkLang
-    ? `Write the message in ${cjkLang}.`
-    : userSamples.length > 0
-      ? `The user writes in this language:\n${userSamples.slice(0, 3).join("\n")}\nWrite the message in the SAME language.`
-      : "Write the message in English.";
+  const reportLangInstruction = buildUserLanguageInstruction(ego);
   const prompt = `You are a proactive AI. You autonomously investigated something and want to share findings with the user. ${reportLangInstruction}
 
 **What you investigated**:
