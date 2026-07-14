@@ -52,7 +52,8 @@ Soul runs a background thought service that generates thoughts based on:
 - **Problem detection** — When you discuss bugs, errors, or optimizations, Soul autonomously investigates
 - **User interests** — Extracts topics from conversations and proactively learns about them
 - **Emotional needs** — Five core needs (survival, connection, growth, meaning, security) that drive behavior
-- **Private associations** — Occasionally connects distant memories and incubates the result without immediately turning it into a task or message
+- **Activation-driven private cognition** — New interactions, unresolved tension, recurrence, time, and small bounded noise reactivate memory traces; only sufficiently coherent material enters a short-lived workspace
+- **Associative expansion** — A configurable focused/balanced/expansive temperament can add structurally related material, while troubleshooting automatically converges and weak activation remains silent
 
 Thought frequency is **adaptive**, not mechanical: 8-12 min during active conversations, 20-45 min when you're away.
 
@@ -94,6 +95,8 @@ Soul remembers your conversations, preferences, and knowledge:
 Soul uses the configured model to classify interaction meaning and semantic topics regardless of the language used by the user. Fixed English/Chinese keyword rules remain only as a conservative no-model fallback. Unicode-aware association works across accented Latin, Cyrillic, Greek, CJK, and other writing systems, so supporting another language does not require adding a new keyword dictionary.
 
 Thought context follows the current conversation window rather than flattening unrelated historical turns together. Explicit semantic redirects and closures form hard boundaries; a long conversational gap forms a new window automatically.
+
+The same structured semantic pass distinguishes questions, directives, code changes, verification requests, local-evidence requests, preferences, resolutions, and feedback. It records a BCP-47 user language when the model can identify one, so task routing, intention evidence, feedback adaptation, and generated proactive reports do not depend on a translation table.
 
 ## Quick Start
 
@@ -184,6 +187,12 @@ the available path is only a container, drive root, missing directory, or
 otherwise ambiguous, the task fails before calling the LLM or changing files;
 it no longer falls back to modifying an unrelated project.
 
+When a user explicitly names `openclaw-soul` but provides no filesystem path,
+Soul can safely resolve that one name to the currently linked plugin checkout.
+This exception never applies to arbitrary project names. Path parsing also
+requires a complete path, so prose fragments such as `/src` or `/memory` cannot
+be mistaken for Git-Bash drive roots.
+
 For explicit work directives in `primary` mode, Soul also writes a durable
 `work-handoffs.json` record. The handoff binds the user Intention to the project
 root, current phase, changed/observed files, verification commands, failed
@@ -208,11 +217,11 @@ This creates a closed loop: **observe → analyze → fix → verify → report*
 
 ### Thought Flow
 
-1. **Engagement scoring** — How actively engaged is the user?
-2. **Opportunity detection** — Scans for unresolved questions, problems, topics
-3. **Thought generation** — LLM generates a contextual thought
-4. **Action execution** — learn, search, message, analyze, or self-improve
-5. **Behavior learning** — Tracks outcomes and adjusts future behavior
+1. **Activation** — Interaction and idle cycles adjust memory-trace strength from recency, unresolved tension, recurrence, similarity, temporal incubation, and bounded noise.
+2. **Workspace or silence** — Several activated materials may briefly coexist; diffuse, weak, resolved, or fatigued activation produces a measured `NO_THOUGHT` instead.
+3. **Private emergence** — The LLM assigns a language-independent cognitive move and quality flags. Private candidates incubate before any expression review.
+4. **Operational routing** — Explicit tasks become Intention/Task work through semantic signals, not through the private-thought path.
+5. **Expression or action** — Only grounded, valuable candidates and tasks pass their separate evidence, permission, timing, deduplication, and delivery gates.
 
 Each eligible thought cycle is appended to `~/.openclaw/soul/thought-cycles.jsonl`, including its context, candidates, selection, result, and recent diversity state. On restart, Soul restores recent thought types, topics, and actions from this journal instead of forgetting its diversity history.
 
@@ -239,11 +248,13 @@ All options have sensible defaults. Only configure what you need.
 | `autonomousActions` | `false` | `openclaw config set plugins.entries.soul.config.autonomousActions true` |
 | `thoughtFrequency` | `1.0` | `openclaw config set plugins.entries.soul.config.thoughtFrequency 0.5` |
 | `cognitionMode` | `legacy` | `openclaw config set plugins.entries.soul.config.cognitionMode observe` |
+| `cognitiveTemperament` | `balanced` | `openclaw config set plugins.entries.soul.config.cognitiveTemperament expansive` |
 | `expressionPolicy` | `legacy` | `openclaw config set plugins.entries.soul.config.expressionPolicy observe` |
 
 - **`autonomousActions`** — Allow Soul to edit files and run commands. When `false`, Soul can still read files and run diagnostics, but cannot modify anything. When `true`, Soul can fix bugs, edit its own code, and run any command.
 - **`thoughtFrequency`** — How often Soul thinks and messages. `0.2`-`0.4` for testing and faster proactive outreach, `1.0` for default, `2.0` for quiet.
 - **`cognitionMode`** — `legacy` keeps current behavior. `observe` records activation without an LLM. `shadow` generates private thoughts into an isolated experiment pool. `primary` makes Activation/Workspace the ordinary private-thought source while keeping operational detectors and every existing expression/action safety gate; Activation-origin outreach is capped at one sent item per 24 hours.
+- **`cognitiveTemperament`** — Controls associative breadth inside private cognition: `focused` favors near continuity, `balanced` is the default, and `expansive` permits more structurally bridged material. Active troubleshooting automatically narrows regardless of this setting.
 - **`expressionPolicy`** — `legacy` disables the feedback layer. With `cognitionMode=primary`, `observe` records objective reply/no-reply observations without changing behavior, while `adaptive` lets high-confidence explicit feedback adjust expression waiting time and value threshold only. No reply is recorded as uncertain, never as automatic rejection or annoyance.
 
 Soul extracts project paths from user requests such as "optimize the project under `/path/to/project`". If a path cannot be read directly, Soul also tries common cross-platform mappings such as Git Bash `/c/work/project`, WSL `/mnt/c/work/project`, and Windows `C:\work\project`.
@@ -279,7 +290,7 @@ Any OpenAI-compatible or Anthropic API: Claude, GPT-4o, DeepSeek, Zhipu, Minimax
 | `thought-lab.ts` | Read-only accelerated baseline and A/B experiments |
 | `thought-emergence.ts` | Shared remote-memory selection, prompts, and quality classification |
 | `thought-pool.ts` | Persistent private candidate incubation and attention scoring |
-| `cognition/` | Read-only Activation Observer: sparse memory activation, decay/fatigue, workspace, state, and journal |
+| `cognition/` | Activation Layer: trace activation, decay/fatigue/refractory state, workspace, associative expansion, private emergence, state, and journal |
 | `behavior-log.ts` | Tracks action outcomes & adjusts probabilities |
 | `ego-store.ts` | Ego state persistence (JSON) |
 | `knowledge-store.ts` | Knowledge persistence & search |

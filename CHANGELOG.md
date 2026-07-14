@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Changes
+
+- **Add Activation-first private cognition**: `primary` cognition now uses memory-trace activation, decay/fatigue/refractory state, unresolved tension, temporal incubation, cognitive workspaces, and natural silence before a private thought can emerge.
+- **Add bounded associative expansion**: `cognitiveTemperament` (`focused`, `balanced`, `expansive`) controls private associative breadth with lineage tracking; active troubleshooting converges automatically.
+- **Complete language-independent semantic routing**: Model-returned structured signals now drive intentions, code-change/verification evidence, local-evidence handling, preference direction, feedback adaptation, and cross-language topic/resolution links. User language is retained as a BCP-47 code when available.
+- **Generate user-facing background output in the user's language**: Startup greetings, autonomous-action permission prompts, task reports, and proactive quality review use the model's language instruction for languages outside the audited Chinese/English local templates.
+
+### Fixes
+
+- **Resolve explicitly named Soul work safely**: A user request that explicitly names `openclaw-soul` now resolves to the linked plugin checkout when no verified project root is available. It does not affect arbitrary project names.
+- **Reject false Git-Bash path fragments**: Ordinary workspace text such as `/src` and `/memory` can no longer become fake `/s` or `/m` drive candidates that block a valid self-improvement target.
+- **Keep recall private until it matures**: Raw memory recall no longer directly sends a message; it must pass Thought Pool, Attention, and normal Expression safeguards.
+
 ## 2.6.0 (2026-07-12)
 
 ### Changes

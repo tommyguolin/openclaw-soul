@@ -89,6 +89,24 @@ Controls the gradual Activation Layer rollout.
 
 Observer state is stored in `~/.openclaw/soul/activation-state.json`; compact cycle traces are appended to `~/.openclaw/soul/cognitive-cycles.jsonl`. Return the option to `legacy` to disable the new path immediately.
 
+### `cognitiveTemperament`
+
+| | |
+|---|---|
+| **Type** | `"focused" \| "balanced" \| "expansive"` |
+| **Default** | `"balanced"` |
+| **Command** | `openclaw config set plugins.entries.soul.config.cognitiveTemperament expansive` |
+
+Controls associative breadth only within the private Activation/Workspace path.
+
+- `focused` favors recently related, convergent material.
+- `balanced` is the default: it allows a small number of structurally bridged associations when the active context is stable.
+- `expansive` permits a wider but still lineage-tracked set of associations.
+
+The setting never bypasses evidence, Attention, Expression, permission, or
+delivery gates. Active troubleshooting and explicit task pressure narrow the
+workspace automatically in every mode.
+
 ### `expressionPolicy`
 
 | | |
@@ -140,6 +158,13 @@ source contents into Ego state and does not grant additional write authority.
 This context prevents a later Improvement from losing the project that the main
 agent just inspected or edited. Ambiguous paths now stop the task instead of
 falling back to a different project.
+
+An explicit full path is always preferred. As a narrow convenience for a linked
+installation, an explicit reference to `openclaw-soul` can resolve to the
+running plugin's own checkout when no path or host-agent project context is
+available. No other project name receives this fallback. Path extraction is
+structural: short prose fragments such as `/src` and `/memory` are not treated
+as Git-Bash drive paths.
 
 With `cognitionMode=primary`, an explicit user directive is additionally linked
 to the successful host-agent project activity in
