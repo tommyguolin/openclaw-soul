@@ -238,6 +238,7 @@ function resolveHooksToken(openclawConfig: Record<string, unknown>): string | un
 let thoughtService: ThoughtService | null = null;
 let serviceCreated = false;
 let lastPluginConfig = "";
+let serviceConfig = "";
 
 /**
  * Extract a typed config value from pluginConfig.
@@ -379,7 +380,8 @@ const plugin = {
 
   register(api: OpenClawPluginApi) {
     const configStr = JSON.stringify(api.pluginConfig ?? {});
-    if (configStr !== lastPluginConfig) {
+    const configChanged = configStr !== lastPluginConfig;
+    if (configChanged) {
       lastPluginConfig = configStr;
       log.info(`pluginConfig received: ${configStr}`);
     }
@@ -402,11 +404,13 @@ const plugin = {
     const observedInboundChannels = new Set<string>();
     if (proactiveChannel) observedInboundChannels.add(proactiveChannel);
 
-    // --- Service singleton: only create ThoughtService ONCE ---
+    // --- Service lifecycle: share within one config generation, replace on reload ---
     // The gateway may call register() multiple times (e.g. for different agent
     // session registries). We must always register hooks (api.on) for each
-    // registry, but the ThoughtService instance is shared.
-    if (!serviceCreated) {
+    // registry, but the ThoughtService instance is shared while the effective
+    // plugin config is unchanged. A hot reload needs a new registered service:
+    // OpenClaw registers the new generation before stopping the old one.
+    if (!serviceCreated || serviceConfig !== configStr) {
       // --- 1. Auto-resolve LLM config from OpenClaw's primary model ---
       const llmConfig = resolveLLMConfigFromOpenClaw(
         openclawConfig as Parameters<typeof resolveLLMConfigFromOpenClaw>[0],
@@ -458,8 +462,7 @@ const plugin = {
 
       // --- 4. Create and register the thought service ---
       const workspaceFiles = config.workspaceFiles ?? ["SOUL.md", "AGENTS.md", "MEMORY.md", "USER.md"];
-      serviceCreated = true;
-      thoughtService = new ThoughtService({
+      const service = new ThoughtService({
         checkIntervalMs: config.checkIntervalMs ?? 60_000,
         llmConfig,
         proactiveChannel,
@@ -477,16 +480,21 @@ const plugin = {
         cognitionMode: config.cognitionMode ?? "legacy",
         expressionPolicy: config.expressionPolicy ?? "legacy",
       });
+      serviceCreated = true;
+      serviceConfig = configStr;
+      thoughtService = service;
 
       api.registerService({
         id: "soul-thought-service",
         start: async () => {
-          await thoughtService!.refreshWorkspaceContext();
-          await thoughtService!.start();
+          await service.refreshWorkspaceContext();
+          await service.start();
           log.info("Soul thought service started");
         },
         stop: async () => {
-          thoughtService?.stop();
+          // Capture this registration's instance. During hot reload, stopping
+          // the old generation must never stop the newly registered service.
+          service.stop();
           log.info("Soul thought service stopped");
         },
       });

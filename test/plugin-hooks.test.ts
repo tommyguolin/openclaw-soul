@@ -202,3 +202,35 @@ test("reply delivery captures confirmed assistant replies once and ignores priva
     await fs.promises.rm(directory, { recursive: true, force: true });
   }
 });
+
+test("config hot reload registers a new Soul service generation", async () => {
+  const { default: plugin } = await import(`../index.js?reload=${Date.now()}`);
+  const services: Array<{
+    id: string;
+    start: () => Promise<void>;
+    stop: () => Promise<void>;
+  }> = [];
+  const register = (autonomousActions: boolean) => plugin.register({
+    pluginConfig: { autonomousActions },
+    config: {},
+    on() {},
+    registerService(service: {
+      id: string;
+      start: () => Promise<void>;
+      stop: () => Promise<void>;
+    }) {
+      services.push(service);
+    },
+  });
+
+  register(false);
+  register(false);
+  assert.equal(services.length, 1, "same-config registry reuse must keep one service generation");
+
+  register(true);
+  assert.equal(services.length, 2, "changed config must register a replacement service generation");
+  assert.equal(services[0]?.id, "soul-thought-service");
+  assert.equal(services[1]?.id, "soul-thought-service");
+  assert.notEqual(services[0]?.start, services[1]?.start);
+  assert.notEqual(services[0]?.stop, services[1]?.stop);
+});
