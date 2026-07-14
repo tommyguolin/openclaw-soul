@@ -24,7 +24,7 @@ test("autonomous improvement reports concrete verified changes and never complet
       "utf8",
     );
 
-    const [{ executeObserveAndImprove }, { createDefaultEgoState }] = await Promise.all([
+    const [{ executeAutonomousAction, executeObserveAndImprove }, { createDefaultEgoState }] = await Promise.all([
       import(`../src/autonomous-actions.js?improvement=${Date.now()}`),
       import("../src/ego-store.js"),
     ]);
@@ -206,6 +206,32 @@ test("autonomous improvement reports concrete verified changes and never complet
     assert.match(bridgedTask.result, /\[ \] concrete changed files/);
     assert.equal((await intentionStore.load()).intentions[0].status, "blocked");
     assert.equal((await workHandoffStore.load()).handoffs[0].phase, "blocked");
+
+    const analysisThought = {
+      ...thought,
+      id: "analysis-cannot-complete-implementation-test",
+      content: "Please fix it",
+      motivation: "act on the implementation directive",
+      actionType: "analyze-problem",
+      actionParams: {
+        intentionId: linkedIntention.id,
+        workHandoffId: linkedHandoff.id,
+        projectRoot: projectDir,
+        acceptanceCriteria: ["concrete changed files", "relevant verification command passes"],
+      },
+    };
+    const analysis = await executeAutonomousAction("analyze-problem", analysisThought, ego, {
+      autonomousActions: true,
+      gatewayPort: 18789,
+    });
+    assert.equal(analysis.result.success, false);
+    store = JSON.parse(await fs.promises.readFile(storePath, "utf8"));
+    const analysisTask = store.ego.activeTasks.find((task: any) => task.sourceThoughtId === analysisThought.id);
+    assert.equal(analysisTask.status, "failed");
+    assert.match(analysisTask.result, /Status: blocked/);
+    assert.match(analysisTask.result, /acceptance-criteria-not-met/);
+    assert.match(analysisTask.result, /concrete changed files/);
+    assert.match(analysisTask.result, /verification command passes/);
   } finally {
     if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
     else process.env.OPENCLAW_STATE_DIR = previousStateDir;

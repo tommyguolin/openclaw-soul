@@ -88,7 +88,7 @@ import { inferCognitiveKind } from "./cognition/kind.js";
 import { emergeFromWorkspace } from "./cognition/emergence.js";
 import { IntentionStore, resolveIntentionStorePath } from "./intention/store.js";
 import { buildUserDirectiveIntention, isExplicitUserDirective } from "./intention/formation.js";
-import { WorkHandoffStore, resolveWorkHandoffStorePath } from "./handoff/store.js";
+import { WorkHandoffStore, isUsableWorkHandoff, resolveWorkHandoffStorePath } from "./handoff/store.js";
 import { ExpressionStore, resolveExpressionStorePath } from "./expression/store.js";
 import {
   ExpressionFeedbackStore, resolveExpressionFeedbackPath,
@@ -2427,7 +2427,7 @@ export class ThoughtService {
       .filter((item) => item.origin === "user-directive" && item.status === "active")
       .map((item) => item.id));
     const latestHandoffIntentionId = handoffs?.handoffs
-      .filter((handoff) => activeIds.has(handoff.intentionId))
+      .filter((handoff) => activeIds.has(handoff.intentionId) && isUsableWorkHandoff(handoff))
       .sort((a, b) => b.updatedAt - a.updatedAt)[0]?.intentionId;
     const thoughtTokens = contentTokens(`${thought.content} ${thought.motivation}`);
     const matchedUserIntention = intentions.intentions

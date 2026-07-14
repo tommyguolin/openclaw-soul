@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { DEFAULT_EGO_STORE_PATH, SOUL_DIR } from "./paths.js";
+import { DEFAULT_EGO_STORE_PATH, SOUL_DIR, resolveDefaultEgoStorePath } from "./paths.js";
 import { createSoulLogger } from "./logger.js";
 import type {
   EgoState,
@@ -38,7 +38,7 @@ export function resolveEgoStorePath(storePath?: string): string {
     }
     return path.resolve(raw);
   }
-  return DEFAULT_EGO_STORE_PATH;
+  return resolveDefaultEgoStorePath();
 }
 
 function createDefaultEgoNeeds(): EgoNeeds {

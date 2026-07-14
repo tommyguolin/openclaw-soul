@@ -94,6 +94,30 @@ test("a persisted host-agent handoff restores project scope and acceptance crite
   }
 });
 
+test("a handoff whose local project disappeared is not restored", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-stale-handoff-"));
+  try {
+    const project = path.join(dir, "ephemeral-project");
+    await fs.promises.mkdir(project, { recursive: true });
+    const store = new WorkHandoffStore(path.join(dir, "work-handoffs.json"));
+    await store.upsert({
+      intentionId: "intent-stale",
+      objective: "fix the ephemeral project",
+      targetProjectRoot: project,
+      phase: "implementing",
+      acceptanceCriteria: ["concrete changed files"],
+      observedFiles: [],
+      modifiedFiles: [],
+      verificationCommands: [],
+      failedTools: [],
+    });
+    await fs.promises.rm(project, { recursive: true, force: true });
+    assert.equal(await store.latestForIntention("intent-stale"), undefined);
+  } finally {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("ExpressionStore separates proposal creation from sent/withheld resolution", async () => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-expressions-"));
   const store = new ExpressionStore(path.join(dir, "expression-proposals.json"));

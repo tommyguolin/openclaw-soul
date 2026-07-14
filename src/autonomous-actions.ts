@@ -14,7 +14,7 @@ import type { LLMGenerator } from "./soul-llm.js";
 import type { Thought, EgoState, ActionResult, MetricDelta, AutonomousTask, TaskStep, ActionType } from "./types.js";
 import type { MessageSender } from "./soul-actions.js";
 import { updateEgoStore, resolveEgoStorePath } from "./ego-store.js";
-import { SOUL_DIR } from "./paths.js";
+import { resolveSoulDir } from "./paths.js";
 
 const log = createSoulLogger("autonomous-actions");
 
@@ -385,6 +385,7 @@ function isInterimTaskNarration(result: string): boolean {
 }
 
 function isTaskBlockedOrPartial(task: AutonomousTask, result: string): boolean {
+  if (unmetAcceptanceCriteria(task, result).length > 0) return true;
   const reportStatus = taskReportStatus(result);
   if (task.status === "failed") return true;
   if (reportStatus === "completed") return false;
@@ -474,6 +475,33 @@ function taskContinuityFields(thought: Thought): Pick<AutonomousTask,
       ? { acceptanceCriteria: params.acceptanceCriteria.filter((item): item is string => typeof item === "string") }
       : {}),
   };
+}
+
+function unmetAcceptanceCriteria(task: AutonomousTask, result: string): string[] {
+  const criteria = task.acceptanceCriteria ?? [];
+  if (criteria.length === 0) return [];
+  const successfulActions = task.steps
+    .filter((step) => step.success)
+    .map((step) => step.action)
+    .join(" ");
+  const explicitlyNoChange = /No files were changed|No source files changed|没有修改任何文件|修改文件：\s*0/i.test(result);
+  const hasChangeEvidence = !explicitlyNoChange && (
+    /修改文件：\s*(?!0\b|无\b|none\b)[^\n]+/i.test(result)
+    || /Files modified:\s*(?!0\b|none\b)[^\n]+/i.test(result)
+    || /Applied and verified improvement fix|Fixed\s+[^\n:]+:/i.test(result)
+    || /\b(?:apply|edit|patch|write|modify)[\w-]*\b/i.test(successfulActions)
+  );
+  const explicitlyNoVerification = /Verification:\s*not run|验证：未执行|没有执行验证|No verification was run|not verified end-to-end/i.test(result);
+  const hasVerificationEvidence = !explicitlyNoVerification && (
+    /(?:verification|验证|npm|pnpm|yarn|pytest|typecheck|test|build)[^\n]{0,160}(?:passed|通过|succeeded|成功)/i.test(result)
+    || /\b(?:verify|test|typecheck|build)[\w-]*\b/i.test(successfulActions)
+  );
+
+  return criteria.filter((criterion) => {
+    if (/concrete changed files|files? changed|code change/i.test(criterion)) return !hasChangeEvidence;
+    if (/verification command|verified|verification passes/i.test(criterion)) return !hasVerificationEvidence;
+    return false;
+  });
 }
 
 /**
@@ -826,11 +854,25 @@ export async function executeAnalyzeProblem(
     analysisResult = "No relevant information could be gathered for analysis.";
   }
 
-  // Update task as completed
+  const unmetCriteria = unmetAcceptanceCriteria({ ...task, steps }, analysisResult);
+  const taskStatus: "completed" | "failed" = unmetCriteria.length > 0 ? "failed" : "completed";
+  if (unmetCriteria.length > 0) {
+    analysisResult = [
+      "Status: blocked",
+      "Reason: acceptance-criteria-not-met",
+      `Unmet acceptance criteria: ${unmetCriteria.join("; ")}`,
+      "",
+      "This bounded analysis gathered information only. It did not claim implementation or verification work that it did not perform.",
+      "",
+      analysisResult,
+    ].join("\n");
+  }
+
+  // Complete only when this action actually satisfies its inherited contract.
   await updateEgoStore(resolveEgoStorePath(), (e) => {
     const t = (e.activeTasks ?? []).find((at) => at.id === taskId);
     if (t) {
-      t.status = "completed";
+      t.status = taskStatus;
       t.steps = steps;
       t.result = analysisResult;
       t.updatedAt = Date.now();
@@ -843,12 +885,12 @@ export async function executeAnalyzeProblem(
     return e;
   });
 
-  log.info(`Analysis task ${taskId} completed: ${steps.length} steps, result ${analysisResult.length} chars`);
+  log.info(`Analysis task ${taskId} ${taskStatus}: ${steps.length} steps, result ${analysisResult.length} chars`);
 
   return {
     result: {
       type: "analyze-problem",
-      success: true,
+      success: taskStatus === "completed",
       result: analysisResult.slice(0, 500),
       data: { taskId, stepsCompleted: steps.length, stepsFailed: steps.filter((s) => !s.success).length },
     },
@@ -891,7 +933,7 @@ async function executeBoundedLocalAgentTask(
   const analysisContext = latestAnalysis?.result?.slice(0, 1000) ?? "";
 
   const taskId = randomBytes(4).toString("hex");
-  const resultDir = join(SOUL_DIR, "results");
+  const resultDir = join(resolveSoulDir(), "results");
   mkdirSync(resultDir, { recursive: true });
   const resultFilePath = join(resultDir, `${taskId}.md`);
   const steps: TaskStep[] = [{
@@ -1066,7 +1108,7 @@ export async function executeRunAgentTask(
 
   // Create task first to get ID for result file path
   const taskId = randomBytes(4).toString("hex");
-  const resultDir = join(SOUL_DIR, "results");
+  const resultDir = join(resolveSoulDir(), "results");
   mkdirSync(resultDir, { recursive: true });
   const resultFilePath = join(resultDir, `${taskId}.md`);
 
@@ -2101,6 +2143,7 @@ async function completeTask(
   resultDelivered = false,
 ): Promise<void> {
   let linkedIntentionId: string | undefined;
+  let linkedAcceptanceMet = true;
   await updateEgoStore(resolveEgoStorePath(), (e) => {
     const t = (e.activeTasks ?? []).find((at) => at.id === taskId);
     if (t) {
@@ -2125,7 +2168,11 @@ No before/after benchmark metrics were recorded.
 
 ## Next
 Run a focused verification command or a smaller follow-up improvement if the result needs implementation confirmation.`;
-      t.status = reportStatusToTaskStatus(finalResult);
+      const unmetCriteria = unmetAcceptanceCriteria(t, finalResult);
+      linkedAcceptanceMet = unmetCriteria.length === 0;
+      t.status = status === "failed" || !linkedAcceptanceMet
+        ? "failed"
+        : reportStatusToTaskStatus(finalResult);
       t.result = finalResult;
       t.completedAt = Date.now();
       t.updatedAt = Date.now();
@@ -2142,6 +2189,7 @@ Run a focused verification command or a smaller follow-up improvement if the res
       const reportsNoChange = /No files were changed|没有修改任何文件|Files modified:\s*0|修改文件：0/i.test(result);
       const reportsNoVerification = /Verification:\s*not run|验证：未执行|没有执行验证|No verification was run/i.test(result);
       intention.status = status === "failed"
+        || !linkedAcceptanceMet
         || (requiresChange && reportsNoChange)
         || (requiresVerification && reportsNoVerification)
         ? "blocked"

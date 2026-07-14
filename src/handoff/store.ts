@@ -59,7 +59,7 @@ export class WorkHandoffStore {
   async latestForIntention(intentionId: string): Promise<WorkHandoff | undefined> {
     const file = await this.load();
     return file.handoffs
-      .filter((handoff) => handoff.intentionId === intentionId)
+      .filter((handoff) => handoff.intentionId === intentionId && isUsableWorkHandoff(handoff))
       .sort((a, b) => b.updatedAt - a.updatedAt)[0];
   }
 
@@ -90,5 +90,13 @@ export class WorkHandoffStore {
     });
     this.writeChain = pending.catch(() => undefined);
     return pending;
+  }
+}
+
+export function isUsableWorkHandoff(handoff: WorkHandoff): boolean {
+  try {
+    return fs.statSync(handoff.targetProjectRoot).isDirectory();
+  } catch {
+    return false;
   }
 }

@@ -13,7 +13,21 @@ export function resolveStateDir(): string {
   return path.join(os.homedir(), ".openclaw");
 }
 
-export const SOUL_DIR = path.join(resolveStateDir(), "soul");
+export function resolveSoulDir(): string {
+  return path.join(resolveStateDir(), "soul");
+}
+
+export function resolveDefaultEgoStorePath(): string {
+  return path.join(resolveSoulDir(), "ego.json");
+}
+
+export function resolveDefaultKnowledgeStorePath(): string {
+  return path.join(resolveSoulDir(), "knowledge.json");
+}
+
+// Snapshot constants retained for public compatibility. Runtime code should
+// use the resolver functions so a late state-directory override remains safe.
+export const SOUL_DIR = resolveSoulDir();
 export const DEFAULT_EGO_STORE_PATH = path.join(SOUL_DIR, "ego.json");
 export const DEFAULT_KNOWLEDGE_STORE_PATH = path.join(SOUL_DIR, "knowledge.json");
 export const DIARY_PATH = path.join(SOUL_DIR, "diary.md");

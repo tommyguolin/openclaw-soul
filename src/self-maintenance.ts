@@ -2,16 +2,14 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { createSoulLogger } from "./logger.js";
 import { updateEgoStore } from "./ego-store.js";
-import { SOUL_DIR } from "./paths.js";
+import { resolveSoulDir } from "./paths.js";
 import { consolidateMemories } from "./memory-consolidation.js";
 import type { EgoState, Thought, SoulActionResult } from "./types.js";
 
 const log = createSoulLogger("self-maintenance");
 
-const DIARY_PATH = path.join(SOUL_DIR, "diary.md");
-const MEMORY_PATH = path.join(SOUL_DIR, "learned.md");
-
 export async function writeDiaryEntry(ego: EgoState, thought: Thought): Promise<void> {
+  const diaryPath = path.join(resolveSoulDir(), "diary.md");
   const timestamp = new Date().toISOString();
   const needsSummary = Object.entries(ego.needs)
     .map(([, n]) => `${n.name}: ${n.current.toFixed(0)}/${n.ideal}`)
@@ -31,8 +29,8 @@ export async function writeDiaryEntry(ego: EgoState, thought: Thought): Promise<
 `;
 
   try {
-    await fs.mkdir(path.dirname(DIARY_PATH), { recursive: true });
-    await fs.appendFile(DIARY_PATH, entry, "utf-8");
+    await fs.mkdir(path.dirname(diaryPath), { recursive: true });
+    await fs.appendFile(diaryPath, entry, "utf-8");
     log.info(`Diary entry written: ${thought.type}`);
   } catch (err) {
     log.error(`Failed to write diary: ${String(err)}`);
@@ -40,6 +38,7 @@ export async function writeDiaryEntry(ego: EgoState, thought: Thought): Promise<
 }
 
 export async function writeLearnedContent(topic: string, summary: string): Promise<void> {
+  const memoryPath = path.join(resolveSoulDir(), "learned.md");
   const timestamp = new Date().toISOString();
   const entry = `
 ## ${timestamp} - ${topic}
@@ -50,8 +49,8 @@ ${summary}
 `;
 
   try {
-    await fs.mkdir(path.dirname(MEMORY_PATH), { recursive: true });
-    await fs.appendFile(MEMORY_PATH, entry, "utf-8");
+    await fs.mkdir(path.dirname(memoryPath), { recursive: true });
+    await fs.appendFile(memoryPath, entry, "utf-8");
     log.info(`Learning recorded: ${topic}`);
   } catch (err) {
     log.error(`Failed to write learning: ${String(err)}`);
@@ -73,7 +72,7 @@ export async function cleanupOldMemories(ego: EgoState): Promise<number> {
     return 0;
   }
 
-  const storePath = path.join(SOUL_DIR, "ego.json");
+  const storePath = path.join(resolveSoulDir(), "ego.json");
   await updateEgoStore(storePath, (e) => {
     e.memories = e.memories.filter((m) => !toRemove.includes(m.id));
     return e;
@@ -93,7 +92,7 @@ export async function consolidateObsessions(ego: EgoState): Promise<void> {
   const sorted = [...ego.obsessions].sort((a, b) => b.intensity - a.intensity);
   const toKeep = sorted.slice(0, MAX_OBSSESSIONS).map((o) => o.id);
 
-  const storePath = path.join(SOUL_DIR, "ego.json");
+  const storePath = path.join(resolveSoulDir(), "ego.json");
   await updateEgoStore(storePath, (e) => {
     e.obsessions = e.obsessions.filter((o) => toKeep.includes(o.id));
     return e;

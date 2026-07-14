@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { DEFAULT_KNOWLEDGE_STORE_PATH, SOUL_DIR } from "./paths.js";
+import { DEFAULT_KNOWLEDGE_STORE_PATH, resolveDefaultKnowledgeStorePath } from "./paths.js";
 import { createSoulLogger } from "./logger.js";
 import type { KnowledgeItem, KnowledgeStore } from "./types.js";
 
@@ -22,7 +22,7 @@ export function resolveKnowledgeStorePath(p?: string): string {
     }
     return path.resolve(raw);
   }
-  return DEFAULT_KNOWLEDGE_STORE_PATH;
+  return resolveDefaultKnowledgeStorePath();
 }
 
 function createEmptyStore(): KnowledgeStore {
