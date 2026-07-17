@@ -196,6 +196,13 @@ const META_WORK_PROMISE_PATTERNS = [
   /\b(?:no substantive progress|keep working quietly|will report when|not disturb|don't disturb)\b/i,
 ];
 
+const FUTURE_PROMISE_PATTERNS = [
+  /\bI(?:'ll| will| am going to|'m going to)\b.{0,120}\b(?:keep|continue|follow up|check|watch|look into|report|share|update)\b/i,
+  /\b(?:if you want|if you'd like|should you want|if helpful)\b.{0,80}\b(?:I(?:'ll| will| can)|I can)\b/i,
+  /\u6211(?:\u4f1a|\u5c06|\u4ee5\u540e\u4f1a|\u540e\u9762\u4f1a|\u63a5\u4e0b\u6765\u4f1a|\u4e4b\u540e\u4f1a|\u53ef\u4ee5\u540e\u9762|\u53ef\u4ee5\u7a0d\u540e).{0,80}(?:\u7ee7\u7eed|\u5173\u6ce8|\u7559\u610f|\u518d\u8ddf\u8fdb|\u518d\u8865\u5145|\u518d\u8bf4|\u53d1)/i,
+  /\u5982\u679c\u4f60\u613f\u610f[\s\S]{0,40}(?:\u6211\u4f1a|\u6211\u53ef\u4ee5|\u540e\u9762\u6211\u4f1a)/i,
+];
+
 const META_WORK_THOUGHT_BLOCK_PATTERNS = [
   /\u8001\u677f(?:\u5feb)?\s*\d{1,3}\s*\u5c0f\u65f6\u6ca1\u6765\u4e86/i,
   /\u7ee7\u7eed.{0,16}\u95f7\u5934/i,
@@ -240,6 +247,10 @@ export function assessOutgoingProactiveMessage(message: string): MessageQualityC
 
   if (META_WORK_PROMISE_PATTERNS.some((pattern) => pattern.test(text))) {
     return { ok: false, reason: "meta-work-promise" };
+  }
+
+  if (FUTURE_PROMISE_PATTERNS.some((pattern) => pattern.test(text))) {
+    return { ok: false, reason: "future-promise" };
   }
 
   const permissionOrMenuQuestion = /(?:你(?:更)?想(?:先)?|你希望|要不要|是否需要我|需要我|让我|我可以).{0,80}(?:还是|或者|吗|么|？|\?)/i.test(text)
@@ -1022,7 +1033,7 @@ async function executeSendMessage(
   }
 
   // Generate message content — only send if there's something valuable to say
-  const messageContent = await generateValuableMessage(thought, ego, options);
+  let messageContent = await generateValuableMessage(thought, ego, options);
 
   if (!messageContent) {
     log.info("Proactive message skipped: no valuable content to share");
@@ -1032,7 +1043,19 @@ async function executeSendMessage(
     };
   }
 
-  const quality = await assessOutgoingProactiveMessageSemantically(messageContent, ego, options.llmGenerator);
+  let quality = await assessOutgoingProactiveMessageSemantically(messageContent, ego, options.llmGenerator);
+  if (!quality.ok && quality.reason === "future-promise" && options.llmGenerator) {
+    const repairedMessage = await rewriteFuturePromiseProactiveMessage(messageContent, thought, ego, options.llmGenerator);
+    if (repairedMessage) {
+      const repairedQuality = await assessOutgoingProactiveMessageSemantically(repairedMessage, ego, options.llmGenerator);
+      if (repairedQuality.ok) {
+        log.info("Proactive message repaired to remove future promise language");
+        messageContent = repairedMessage;
+        quality = repairedQuality;
+      }
+    }
+  }
+
   if (!quality.ok) {
     log.info(`Proactive message skipped: ${quality.reason ?? "quality-gate"}: ${messageContent.slice(0, 120)}`);
     return {
@@ -1157,6 +1180,11 @@ its substantive observation or advice into a natural proactive message for the
 user; do not discard it merely because it is proactive. Do not impose a sentence,
 word, character, or formatting limit. Develop useful analysis, explanation,
 advice, or next steps as fully as the context warrants.
+Write as a message that can be sent immediately. Do not describe future plans,
+promises, or follow-up work. Avoid phrases like "I will", "I'll", "I can later",
+"if you want, I can", "I will keep", "I will continue", "我会", "我以后会",
+"后面我可以", or "接下来我会". Focus on the current observation, judgment, or
+recommendation only.
 
 ${langInstruction}
 ${timeContext}
@@ -1207,6 +1235,10 @@ Output only the response or NO_MESSAGE:`;
         const message = cleaned;
         const quality = assessOutgoingProactiveMessage(message);
         if (!quality.ok) {
+          if (quality.reason === "future-promise") {
+            log.info("Value gate: future-promise candidate handed to repair step");
+            return message;
+          }
           log.info(`Value gate: rejected generated proactive message (${quality.reason ?? "quality-gate"})`);
           return null;
         }
@@ -1254,6 +1286,45 @@ Output only the response or NO_MESSAGE:`;
 
   // No valuable content — don't send
   return null;
+}
+
+async function rewriteFuturePromiseProactiveMessage(
+  messageContent: string,
+  thought: Thought,
+  ego: EgoState,
+  llmGenerator: LLMGenerator,
+): Promise<string | null> {
+  try {
+    const repairPrompt = `Rewrite the following proactive message so it can be sent immediately.
+Remove any future promises, future-tense commitments, follow-up offers, or "if you want, I can" style wording.
+Keep the same core meaning, but make it concrete, grounded, and present-focused.
+Do not add new facts. Do not mention what Soul will do later. Output only the rewritten message or NO_MESSAGE.
+
+Original candidate thought:
+${thought.content}
+
+Message to repair:
+${messageContent}
+
+Relationship/personality context:
+${describeRelationshipProfile(ego)}
+${describePersonalityProfile(ego)}
+
+Output only the rewritten message or NO_MESSAGE:`;
+    const response = await llmGenerator(repairPrompt);
+    const cleaned = response
+      .replace(/<think[\s\S]*?<\/think>/gi, "")
+      .replace(/<think[\s\S]*?$/gi, "")
+      .trim();
+    const stripped = stripMetaAnalysis(cleaned);
+    if (!stripped || stripped.toUpperCase() === "NO_MESSAGE" || isLLMErrorOutput(stripped)) {
+      return null;
+    }
+    return stripped;
+  } catch (error) {
+    log.warn("Future-promise proactive message repair failed", String(error));
+    return null;
+  }
 }
 
 async function executeLearnTopic(

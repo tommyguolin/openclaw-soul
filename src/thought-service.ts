@@ -1043,6 +1043,7 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
   private shouldProtectExecutionOpportunity(opportunity: DetectedThoughtOpportunity, ego: EgoState): boolean {
     if (!isExecutionFocusedOpportunity(opportunity)) return false;
     if (!this.isOpportunityActionReady(opportunity, ego)) return false;
+    if (opportunity.suggestedAction === "send-message") return true;
     if (opportunity.suggestedAction === "report-findings") return true;
     if (opportunity.type === "conversation-replay" && opportunity.priority >= 70) return true;
     return opportunity.priority >= 80;

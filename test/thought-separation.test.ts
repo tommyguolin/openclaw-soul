@@ -9,7 +9,8 @@ import { collectKnownLocalEvidenceTargets, detectMaintenanceOpportunities, detec
 import { ThoughtService } from "../src/thought-service.js";
 import { ThoughtPool } from "../src/thought-pool.js";
 import { buildUserLanguageInstruction, supportsLocalMessageTemplate } from "../src/language-context.js";
-import type { EgoState, SoulMemory, ThoughtGenerationContext } from "../src/types.js";
+import { executeThoughtAction } from "../src/action-executor.js";
+import type { EgoState, SoulMemory, Thought, ThoughtGenerationContext } from "../src/types.js";
 
 function context(inputEgo?: ReturnType<typeof createDefaultEgoState>): ThoughtGenerationContext {
   const ego = inputEgo ?? createDefaultEgoState();
@@ -199,6 +200,77 @@ test("a successfully delivered proactive message records outbound memory directl
     assert.equal(outbound[0].content, "A grounded proactive update was delivered.");
   } finally {
     await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("future-promise proactive messages are repaired before send", async () => {
+  const sent: string[] = [];
+  const ego = createDefaultEgoState();
+  ego.behaviorLog = [];
+  const originalNow = Date.now;
+  const originalStateDir = process.env.OPENCLAW_STATE_DIR;
+  const baseNow = originalNow();
+  const stateDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-future-promise-"));
+
+  const thought: Thought = {
+    id: "thought-repair",
+    type: "bond-deepen",
+    content: "你这个偏好其实很明确：不是要更热情，而是要更会看人。",
+    trigger: "memory",
+    source: "memory-recall",
+    triggerDetail: "repair future promise",
+    motivation: "connect more usefully",
+    targetMetrics: [],
+    priority: 80,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + 10 * 60 * 1000,
+    executed: false,
+    relatedNeeds: ["connection"],
+    actionType: "send-message",
+  };
+
+  const llmGenerator = async (prompt: string): Promise<string> => {
+    if (prompt.includes("Rewrite the following proactive message")) {
+      return "你这个偏好其实很明确：不是要更热情，而是要更会看人、也更会找时机。";
+    }
+    if (prompt.includes("Evaluate this proposed proactive message")) {
+      if (prompt.includes("你这个偏好其实很明确：不是要更热情，而是要更会看人、也更会找时机。")) {
+        return JSON.stringify({ ok: true, reason: "none" });
+      }
+      return JSON.stringify({ ok: false, reason: "future-promise" });
+    }
+    return "你这个偏好其实很明确：不是要更热情，而是要更会看人、也更会找时机。我以后会继续留意。";
+  };
+
+  process.env.OPENCLAW_STATE_DIR = stateDir;
+  Date.now = () => baseNow + 10 * 60 * 1000;
+  try {
+    const result = await executeThoughtAction(thought, ego, {
+      channel: "feishu",
+      target: "ou_test",
+      sendMessage: async ({ content }) => {
+        sent.push(content);
+      },
+      llmGenerator,
+      thoughtFrequency: 1,
+    });
+
+    assert.equal(result.result.success, true);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].includes("我会"), false);
+    assert.equal(sent[0].includes("以后"), false);
+    assert.match(sent[0], /更会看人|更会找时机/);
+  } finally {
+    Date.now = originalNow;
+    Date.now = () => baseNow - 30 * 60 * 1000;
+    markActionExecuted("send-message");
+    Date.now = originalNow;
+    if (originalStateDir === undefined) {
+      delete process.env.OPENCLAW_STATE_DIR;
+    } else {
+      process.env.OPENCLAW_STATE_DIR = originalStateDir;
+    }
+    await fs.promises.rm(stateDir, { recursive: true, force: true });
   }
 });
 
