@@ -137,6 +137,11 @@ After every inbound message, Soul enforces a five-minute active-conversation
 quiet period. During this window its background cycle, private LLM calls, and
 proactive messages are deferred; normal assistant replies are unaffected.
 
+There is no daily message quota or once-per-day expression cap. When proactive
+messaging is enabled, delivery is paced only by `thoughtFrequency` and still
+requires a non-duplicative, useful, safe message outside the active-conversation
+quiet period.
+
 ### Codex conversation and project-continuity permission
 
 Codex may send channel replies from inside its app-server harness, bypassing
@@ -219,7 +224,7 @@ openclaw config set plugins.entries.soul.config.llm.provider openai
 openclaw config set plugins.entries.soul.config.llm.model gpt-4o
 openclaw config set plugins.entries.soul.config.llm.apiKeyEnv OPENAI_API_KEY
 openclaw config set plugins.entries.soul.config.llm.baseUrl https://api.openai.com/v1
-openclaw config set plugins.entries.soul.config.llm.maxTokens 1024
+openclaw config set plugins.entries.soul.config.llm.maxTokens 8192
 ```
 
 | Field | Description |
@@ -228,6 +233,6 @@ openclaw config set plugins.entries.soul.config.llm.maxTokens 1024
 | `model` | Model ID (e.g., gpt-4o, claude-sonnet-4-6) |
 | `apiKeyEnv` | Environment variable name containing the API key |
 | `baseUrl` | Custom API base URL (optional) |
-| `maxTokens` | Maximum generated tokens per call, 32-4096 (default: 1024) |
+| `maxTokens` | Optional provider token ceiling (unset by default; minimum: 1) |
 
-`maxTokens` applies to all Soul model calls, including analysis actions. Keep the production default unless every Soul task is intentionally short. Thought Laboratory uses a separate default of 192 tokens.
+By default Soul does not send a completion-length ceiling to gateway and OpenAI-compatible providers, so thoughts can be as complete as ordinary conversation responses. Anthropic's direct API requires a value and uses a generous protocol fallback when this option is unset. Set `maxTokens` only when you intentionally want a ceiling. Thought Laboratory keeps its separate explicit test default.

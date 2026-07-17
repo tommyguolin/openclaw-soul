@@ -32,6 +32,35 @@ test("LLM generator honors configured maxTokens", async () => {
   }
 });
 
+test("LLM generator leaves completion length unrestricted by default", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.SOUL_LLM_TEST_KEY;
+  let requestBody: Record<string, unknown> | undefined;
+  process.env.SOUL_LLM_TEST_KEY = "test-key-for-local-mock";
+  globalThis.fetch = async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(JSON.stringify({ choices: [{ message: { content: "a complete thought" } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  try {
+    const generator = await createSoulLLMGenerator({
+      provider: "mock",
+      model: "mock-model",
+      apiKeyEnv: "SOUL_LLM_TEST_KEY",
+      baseUrl: "http://127.0.0.1:1",
+    });
+    assert(generator);
+    assert.equal(await generator("test"), "a complete thought");
+    assert.equal("max_tokens" in (requestBody ?? {}), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.SOUL_LLM_TEST_KEY;
+    else process.env.SOUL_LLM_TEST_KEY = originalKey;
+  }
+});
+
 test("Soul serializes internal LLM calls to avoid session-store contention", async () => {
   const originalFetch = globalThis.fetch;
   const originalKey = process.env.SOUL_LLM_TEST_KEY;

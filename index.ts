@@ -371,7 +371,7 @@ const plugin = {
           model: { type: "string" },
           apiKeyEnv: { type: "string" },
           baseUrl: { type: "string" },
-          maxTokens: { type: "number", minimum: 32, maximum: 4096 },
+          maxTokens: { type: "number", minimum: 1 },
         },
       },
     },

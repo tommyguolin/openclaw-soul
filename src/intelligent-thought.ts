@@ -2048,8 +2048,9 @@ export async function generateIntelligentThought(
 
   const selectedOpportunity = preferOpportunity || opportunities[0];
 
-  // Use LLM for any thought with priority > 30 (covers most contextual triggers)
-  if (llmGenerator && selectedOpportunity.priority > 30) {
+  // Let every detected opportunity use the same model path. Priority decides
+  // which stimulus is considered first; it must not reduce thought quality.
+  if (llmGenerator) {
     try {
       const prompt = await generateLLMThoughtPrompt(selectedOpportunity, ctx);
       const llmContent = await llmGenerator(prompt);
@@ -2057,8 +2058,7 @@ export async function generateIntelligentThought(
         .replace(/<think>[\s\S]*?<\/think>/gi, "")
         .replace(/<think>[\s\S]*?$/gi, "")
         .replace(/<\/think>[\s\S]*?$/gi, "")
-        .trim()
-        .slice(0, 200);
+        .trim();
 
       const thought = buildThoughtFromOpportunity(selectedOpportunity, ctx.ego);
       thought.content = refinedContent;
@@ -2183,25 +2183,20 @@ Grounded things learned recently:
 ${learningContext}
 
 ${memorySection ? `\n${memorySection}\n` : ""}
-Notice at most one thought that genuinely arises. It may be a question, a
-tension, a correction of an earlier interpretation, or a connection between
-details. It does not need to be useful and it does not need to become an
-action. Prefer uncertainty over pretending to know the person's personality.
+Develop the thought that genuinely arises from this context. It may be a
+question, analysis, tension, correction of an earlier interpretation,
+connection between details, proposed answer, or any other natural response.
+Give it the same depth and completeness you would use in the main conversation.
+There is no sentence, word, or character limit. Prefer uncertainty over
+pretending to know the person's personality.
 CURRENT facts override older conversations and retrieved memories. Never infer
 that a resolved condition is still broken unless newer direct user/tool evidence
 explicitly reopens it. Old failures are historical context, not current evidence.
 Usually continue the foreground or a genuine residue. Only rarely bridge to a
-distant background concern. If no specific tension or connection remains,
-output NO_THOUGHT instead of manufacturing uncertainty.
+distant background concern. Do not force an old phrase into an unrelated topic.
 
-Do not summarize the context. Do not mention goals, trust percentages, needs,
-the thought system, or why this thought was generated. Do not write a task
-plan. Never say "I will", "I'll", "I'm going to", "I should", "let's", or
-promise to run, fetch, test, check, optimize, implement, or report anything.
-Do not force an old poetic phrase into an unrelated technical topic.
-
-Write only the thought, in 1-2 natural sentences in the language of the most
-recent conversation. If nothing distinct arises, output NO_THOUGHT.`;
+Write the complete thought naturally in the language of the most recent
+conversation. Return the thought itself without discussing these instructions.`;
 }
 
 export async function generateProactiveMessage(
@@ -2285,7 +2280,7 @@ Reach out to the user with enough detail to be useful. Requirements:
 2. Based on your current inner state and user information
 3. Natural and friendly, not too eager
 4. Don't make empty remarks like "I miss you"
-5. Use 2-5 sentences for substantive updates; keep only trivial social messages shorter
+5. Use whatever length and structure the content warrants; do not impose an output-length limit
 
 Output what you want to say directly, no explanation.`;
 }

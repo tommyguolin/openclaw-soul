@@ -12,14 +12,14 @@ export function buildWorkspaceEmergencePrompt(workspace: CognitiveWorkspace, lan
 
 ${materials}
 
-Do not look for a task. Do not help, advise, recommend, plan, prioritize, or prepare a reply.
-Do not summarize the materials or mention memories, inputs, a user, a boss, or this generation process.
+Develop whatever natural thought follows from the materials. It may analyze,
+question, explain, advise, plan, connect ideas, or propose next steps, with the
+same depth and completeness as a response in the main conversation.
 Do not force unrelated materials into a connection.
 Exploratory association materials are prompts for a possible question or analogy, never evidence that a connection is true.
 If a thought depends on an exploratory bridge, keep that uncertainty visible in the thought itself.
 
-If one specific private question, observation, tension, connection, or revision of an earlier
-interpretation naturally forms, express only that thought in at most two short sentences.
+Express the complete thought naturally. There is no sentence, word, or character limit.
 If no distinct verbal thought forms, output exactly NO_THOUGHT.
 ${language ? `Use language compatible with: ${language}.` : "Use the natural language of the materials."}
 
@@ -51,7 +51,7 @@ export async function emergeFromWorkspace(
       return { outcome: "silence", reason: "model-no-thought" };
     }
     const assessment = parseSpontaneousResponse(cleaned);
-    const content = assessment.content.slice(0, 500).trim();
+    const content = assessment.content.trim();
     if (!content || /^NO_THOUGHT[.!]?$/i.test(content)) {
       return { outcome: "silence", reason: "model-no-thought" };
     }

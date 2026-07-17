@@ -111,3 +111,39 @@ test("ThoughtService journals a real generation cycle and restores diversity aft
     await fs.promises.rm(directory, { recursive: true, force: true });
   }
 });
+
+test("ThoughtService uses the thought model for execution-focused opportunities", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-journal-execution-thought-"));
+  const storePath = path.join(directory, "ego.json");
+  const journalPath = path.join(directory, "thought-cycles.jsonl");
+  const completeThought = "这不是一个搜索动作标签，而是围绕当前问题形成的完整分析。".repeat(30);
+  type ServiceInternals = {
+    checkAndGenerateThought(): Promise<void>;
+    thoughtLLMGenerator?: (prompt: string) => Promise<string>;
+  };
+  try {
+    const service = new ThoughtService({ storePath, thoughtFrequency: 0.1 });
+    const internals = service as unknown as ServiceInternals;
+    let calls = 0;
+    internals.thoughtLLMGenerator = async () => {
+      calls += 1;
+      return completeThought;
+    };
+    await service.recordInteractionWithText({
+      type: "inbound",
+      text: "Please search for a solution to the recurring TypeScript database timeout problem.",
+    });
+    await updateEgoStore(storePath, (ego) => {
+      ego.lastInteractionTime = Date.now() - 8 * 60 * 1000;
+      ego.lastThoughtTime = null;
+      return ego;
+    });
+    await internals.checkAndGenerateThought();
+    const record = (await new ThoughtCycleJournal(journalPath).loadRecent(1))[0];
+    assert.equal(record.selectedOpportunity?.suggestedAction, "search-web");
+    assert.equal(calls, 1);
+    assert.equal(record.thought?.content, completeThought);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});

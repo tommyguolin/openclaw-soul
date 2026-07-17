@@ -78,7 +78,6 @@ export function classifyThoughtQualityFlags(content: string): string[] {
   if (/\b(?:should|need to|recommend|search for|look up|prioriti[sz]e|prepare a response|next steps?|task requirements?|acting on (?:one'?s )?(?:goals|objectives)|I(?:'ll| will| am going to|'m going to)\s+(?:run|fetch|test|check|optimi[sz]e|implement|report|send|share))\b|应该|需要|建议|搜索|优先|回复|用户|老板|下一步|任务要求/i.test(content)) {
     flags.push("task-pressure");
   }
-  if (content.length >= 495) flags.push("truncated");
   return flags;
 }
 
@@ -102,7 +101,7 @@ export function parseSpontaneousResponse(raw: string): {
     const match = block.match(/\{[\s\S]*\}/);
     if (match) {
       const parsed = JSON.parse(match[0]) as Record<string, unknown>;
-      const content = typeof parsed.thought === "string" ? parsed.thought.trim().slice(0, 500) : "";
+      const content = typeof parsed.thought === "string" ? parsed.thought.trim() : "";
       const cognitiveMove = typeof parsed.cognitiveMove === "string" && COGNITIVE_MOVES.has(parsed.cognitiveMove)
         ? parsed.cognitiveMove
         : classifyCognitiveMove(content);
@@ -116,7 +115,7 @@ export function parseSpontaneousResponse(raw: string): {
   } catch {
     // Fall through to a deterministic classifier for old/small models.
   }
-  const content = cleaned.slice(0, 500);
+  const content = cleaned;
   return {
     content,
     cognitiveMove: classifyCognitiveMove(content),
@@ -205,12 +204,13 @@ ${contents}
 ${choose(stateOptions, random)}
 ${preferredMove ? `A recently underused cognitive motion is ${preferredMove}; use it only if it genuinely fits.` : ""}
 
-Do not look for a task. Do not help, advise, recommend, prioritize, or prepare a response.
-Do not summarize, compare, or explain the supplied contents. Do not refer to the prompt, inputs, memories, a user, or a boss.
-Do not force a bridge between unrelated items. If no real connection appears, stay with one concrete residue, tension, image, or unanswered question from the most salient item. A weak thought is allowed.
+Let a natural thought develop from these contents with the same depth and
+completeness as a response in the main conversation. It can analyze, question,
+explain, advise, connect ideas, or propose next steps. Do not force a bridge
+between unrelated items. There is no sentence, word, or character limit.
 
 Return only compact JSON in this exact shape:
-{"thought":"at most 2 short sentences in the natural language of the contents","cognitiveMove":"question|analogy|speculation|recommendation|research|problem-solving|outreach|follow-up|confusion|reflection","qualityFlags":[]}
+{"thought":"the complete thought in the natural language of the contents","cognitiveMove":"question|analogy|speculation|recommendation|research|problem-solving|outreach|follow-up|confusion|reflection","qualityFlags":[]}
 
 Classify cognitiveMove by meaning, not keywords or language. qualityFlags may contain "meta-framing" if the thought talks about supplied inputs, "forced-association" if it mainly glues unrelated items together, or "task-pressure" if it turns itself into work/help/advice. Do not add markdown.`;
 }

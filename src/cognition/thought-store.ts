@@ -56,7 +56,7 @@ export class ThoughtEpisodeStore {
     if (!active) {
       const episode: ThoughtEpisode = {
         id: randomBytes(8).toString("hex"), workspaceId: input.workspaceId,
-        content: input.content.slice(0, 1000), epistemicNature: input.epistemicNature,
+        content: input.content, epistemicNature: input.epistemicNature,
         state: "forming", causalTraceIds: [...new Set(input.causalTraceIds)], evidence: input.evidence,
         revisions: [], activationCount: 1, distinctStimulusIds: input.stimulusId ? [input.stimulusId] : [],
         createdAt: now, updatedAt: now,
@@ -77,16 +77,16 @@ export class ThoughtEpisodeStore {
     let operation: ThoughtIntegrationOperation = "supported";
     if (contradictsPrior(input.content)) {
       episode.evidence.push(...input.evidence.map((item) => ({ ...item, relation: "contradicts" as const })));
-      episode.revisions.push({ previousContent: episode.content, content: input.content.slice(0, 1000),
+      episode.revisions.push({ previousContent: episode.content, content: input.content,
         reason: "new workspace content contradicted the prior interpretation", revisedAt: now });
-      episode.content = input.content.slice(0, 1000);
+      episode.content = input.content;
       episode.epistemicNature = input.epistemicNature;
       episode.state = "revised";
       operation = "contradicted";
     } else if (active.similarity < 0.9 && input.content.trim() !== episode.content.trim()) {
-      episode.revisions.push({ previousContent: episode.content, content: input.content.slice(0, 1000),
+      episode.revisions.push({ previousContent: episode.content, content: input.content,
         reason: "new activation refined the same developing thought", revisedAt: now });
-      episode.content = input.content.slice(0, 1000);
+      episode.content = input.content;
       episode.epistemicNature = input.epistemicNature;
       episode.state = "revised";
       operation = "revised";

@@ -460,7 +460,7 @@ export class ThoughtPool {
     const fingerprint = activationFingerprint(input);
     const candidate: ThoughtCandidate = {
       id: randomBytes(8).toString("hex"),
-      content: input.content.slice(0, 1000),
+      content: input.content,
       sourceMemoryIds: [...new Set(input.sourceMemoryIds)],
       sourceClusters: [...new Set(input.sourceClusters)],
       sourceMemoryTimestamps: [...new Set(input.sourceMemoryTimestamps ?? [])],

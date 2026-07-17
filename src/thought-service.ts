@@ -1056,7 +1056,28 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
 
     const readyOpportunities = opportunities.filter((o) => this.isOpportunityActionReady(o, ego));
     const candidates = readyOpportunities.length > 0 ? readyOpportunities : opportunities;
+    // Research and content push both require grounded external evidence. When one
+    // has already made no progress in this process, do not let another protected
+    // research turn crowd out a useful, ordinary conversation follow-up.
+    const stalledResearch = opportunities.some((opportunity) => {
+      const action = this.getOpportunityAction(opportunity, ego);
+      return (action === "proactive-research" || action === "proactive-content-push")
+        && (this.noProgressActionBackoff[action]?.count ?? 0) > 0;
+    });
+    if (stalledResearch) {
+      const messageCandidate = candidates.find((opportunity) =>
+        this.getOpportunityAction(opportunity, ego) === "send-message");
+      if (messageCandidate) return messageCandidate;
+    }
     const executionCandidate = candidates.slice(0, 8).find((o) => this.shouldProtectExecutionOpportunity(o, ego));
+    const messageCandidate = candidates.find((opportunity) =>
+      this.getOpportunityAction(opportunity, ego) === "send-message");
+    // A relationship/continuity message that already ranks at least as highly
+    // as protected research is the more direct expression of Soul's proactive
+    // intent. Do not let a lower-priority evidence-gathering task erase it.
+    if (messageCandidate && executionCandidate && messageCandidate.priority >= executionCandidate.priority) {
+      return messageCandidate;
+    }
 
     return executionCandidate ?? candidates[0];
   }
@@ -1848,12 +1869,6 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
     const ageMultiplier = this.expressionPolicy === "adaptive"
       ? feedbackState?.policy.minimumAgeMultiplier ?? 1 : 1;
     const minAgeMs = (this.thoughtFrequency < 0.5 ? 60_000 : 5 * 60_000) * ageMultiplier;
-    if (this.cognitionMode === "primary") {
-      const pool = await this.thoughtPool.load();
-      const sentRecently = pool.candidates.some((item) => item.originWorkspaceId && item.expressedAt
-        && Date.now() - item.expressedAt < 24 * 60 * 60 * 1000);
-      if (sentRecently) return;
-    }
     const candidate = (this.cognitionMode === "primary"
       ? await this.thoughtPool.getExpressionCandidatesV31(minAgeMs, 1)
       : await this.thoughtPool.getExpressionCandidates(minAgeMs, 1))[0];
@@ -2189,15 +2204,28 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
           }
           const selectionPool = unsuppressedOpportunities;
           const nonRepeatingOpportunities = this.recentThoughtTypes.length > 0
-            ? selectionPool.filter((o) => isExecutionFocusedOpportunity(o) || !this.recentThoughtTypes.includes(o.type))
+            ? selectionPool.filter((o) => isExecutionFocusedOpportunity(o)
+              || this.getOpportunityAction(o, ego) === "send-message"
+              || !this.recentThoughtTypes.includes(o.type))
             : selectionPool;
 
           // Static routing only. LLM re-ranking was accurate but expensive:
           // every thought cycle could spend one model call before any real work
           // started. Keep the background worker cheap and reserve model calls
           // for execution/reporting.
-          selectedOpportunity = this.selectBestOpportunity(nonRepeatingOpportunities, ego)
+          const selectedByRouting = this.selectBestOpportunity(nonRepeatingOpportunities, ego)
             ?? this.selectBestOpportunity(selectionPool, ego);
+          // Preserve a ready relationship/continuity opportunity through all
+          // diversity and execution filters. A lower-ranked research task must
+          // not make Soul silently skip an available proactive conversation.
+          const directMessageOpportunity = selectionPool
+            .filter((opportunity) => this.getOpportunityAction(opportunity, ego) === "send-message")
+            .filter((opportunity) => this.isOpportunityActionReady(opportunity, ego))
+            .sort((left, right) => right.priority - left.priority)[0];
+          selectedOpportunity = directMessageOpportunity
+            && (!selectedByRouting || directMessageOpportunity.priority >= selectedByRouting.priority)
+            ? directMessageOpportunity
+            : selectedByRouting;
           if (
             selectedOpportunity &&
             selectedOpportunity !== nonRepeatingOpportunities[0] &&
@@ -2208,11 +2236,8 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
             log.info(`Execution directive protected: selected ${executionAction} over ${staticAction}`);
           }
 
-          const generatorForThought = selectedOpportunity && isExecutionFocusedOpportunity(selectedOpportunity)
-            ? undefined
-            : availableLLMGenerator;
           thought = await generateIntelligentThought(ctx, {
-            llmGenerator: generatorForThought,
+            llmGenerator: availableLLMGenerator,
             preferOpportunity: selectedOpportunity,
           });
           if (signal.aborted) {
@@ -2237,11 +2262,8 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
             if (remainingOpportunities.length > 0) {
               selectedOpportunity = this.selectBestOpportunity(remainingOpportunities, ego);
               try {
-                const retryLLMGenerator = selectedOpportunity && isExecutionFocusedOpportunity(selectedOpportunity)
-                  ? undefined
-                  : availableLLMGenerator;
                 thought = await generateIntelligentThought(ctx, {
-                  llmGenerator: retryLLMGenerator,
+                  llmGenerator: availableLLMGenerator,
                   preferOpportunity: selectedOpportunity,
                 });
                 if (signal.aborted) {

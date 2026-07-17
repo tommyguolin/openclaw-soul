@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { assessOutgoingProactiveMessage, getActionCooldownState, isLocalProjectEvidenceQuery, markActionExecuted } from "../src/action-executor.js";
+import { assessOutgoingProactiveMessage, getActionCooldownState, getProactiveMessageLimitReasonForMemories, isLocalProjectEvidenceQuery, markActionExecuted } from "../src/action-executor.js";
 import { createDefaultEgoState, saveEgoStore } from "../src/ego-store.js";
 import { collectKnownLocalEvidenceTargets, detectMaintenanceOpportunities, detectThoughtOpportunities, generateIntelligentThought, getActionForOpportunity, type DetectedThoughtOpportunity } from "../src/intelligent-thought.js";
 import { ThoughtService } from "../src/thought-service.js";
@@ -257,6 +257,75 @@ test("meaningful bond-deepen absence routes to a gated proactive message", () =>
   const bond = opportunities.find((opportunity) => opportunity.type === "bond-deepen");
   assert.equal(bond?.suggestedAction, "send-message");
   assert.equal(bond && getActionForOpportunity(bond, ego).actionType, "send-message");
+});
+
+test("a stalled research lane yields to a useful proactive message", () => {
+  const service = new ThoughtService();
+  const ego = createDefaultEgoState();
+  const research = {
+    type: "conversation-replay", trigger: "curiosity", triggerDetail: "research topic",
+    priority: 72, source: "user-interaction", relatedNeeds: [], motivation: "research",
+    suggestedAction: "proactive-research",
+  } as const;
+  const message = {
+    type: "bond-deepen", trigger: "bonding", triggerDetail: "useful follow-up",
+    priority: 60, source: "user-interaction", relatedNeeds: [], motivation: "connect",
+    suggestedAction: "send-message",
+  } as const;
+  type SelectionInternals = {
+    noProgressActionBackoff: Record<string, { count: number; until: number }>;
+    selectBestOpportunity<T>(items: T[], ego: EgoState): T | undefined;
+  };
+  const internals = service as unknown as SelectionInternals;
+  internals.noProgressActionBackoff["proactive-research"] = { count: 2, until: Date.now() + 60_000 };
+  assert.equal(internals.selectBestOpportunity([research, message], ego), message);
+});
+
+test("a higher-priority proactive message is not displaced by lower-priority research", () => {
+  const service = new ThoughtService();
+  const ego = createDefaultEgoState();
+  const message = {
+    type: "bond-deepen", trigger: "bonding", triggerDetail: "meaningful continuity",
+    priority: 75, source: "user-interaction", relatedNeeds: [], motivation: "connect",
+    suggestedAction: "send-message",
+  } as const;
+  const research = {
+    type: "conversation-replay", trigger: "curiosity", triggerDetail: "research topic",
+    priority: 72, source: "user-interaction", relatedNeeds: [], motivation: "research",
+    suggestedAction: "proactive-research",
+  } as const;
+  type SelectionInternals = {
+    selectBestOpportunity<T>(items: T[], ego: EgoState): T | undefined;
+  };
+  const internals = service as unknown as SelectionInternals;
+  assert.equal(internals.selectBestOpportunity([message, research], ego), message);
+});
+
+test("an unsent proactive message is not removed by thought-type repetition filtering", () => {
+  const service = new ThoughtService();
+  const ego = createDefaultEgoState();
+  const message = {
+    type: "bond-deepen", trigger: "bonding", triggerDetail: "meaningful continuity",
+    priority: 75, source: "user-interaction", relatedNeeds: [], motivation: "connect",
+    suggestedAction: "send-message",
+  } as const;
+  const research = {
+    type: "conversation-replay", trigger: "curiosity", triggerDetail: "research topic",
+    priority: 72, source: "user-interaction", relatedNeeds: [], motivation: "research",
+    suggestedAction: "proactive-research",
+  } as const;
+  type SelectionInternals = {
+    recentThoughtTypes: string[];
+    getOpportunityAction(item: any, ego: EgoState): string | undefined;
+    selectBestOpportunity<T>(items: T[], ego: EgoState): T | undefined;
+  };
+  const internals = service as unknown as SelectionInternals;
+  internals.recentThoughtTypes = ["bond-deepen"];
+  const nonRepeating = [message, research].filter((item) =>
+    item.suggestedAction === "proactive-research"
+      || internals.getOpportunityAction(item, ego) === "send-message"
+      || !internals.recentThoughtTypes.includes(item.type));
+  assert.equal(internals.selectBestOpportunity(nonRepeating, ego), message);
 });
 
 test("proactive quality gate rejects permission-seeking menu questions", () => {
@@ -861,6 +930,51 @@ test("configured LLM failure does not fall back to a mechanical structured thoug
     }),
     /thought lane budget exhausted/,
   );
+});
+
+test("proactive messaging has no daily count limit and remains frequency-paced", () => {
+  const now = Date.now();
+  const memories: SoulMemory[] = Array.from({ length: 30 }, (_, index) => ({
+    id: `proactive-${index}`,
+    type: "interaction",
+    content: `Topic-${index}: independent technical evidence number ${index} is ready for review.`,
+    emotion: 0.5,
+    valence: "positive",
+    importance: 0.7,
+    timestamp: now - (index + 2) * 30 * 60 * 1000,
+    tags: ["conversation", "outbound", "proactive"],
+  }));
+
+  assert.equal(
+    getProactiveMessageLimitReasonForMemories(memories, "A botanical observation about seasonal growth is ready to share.", 0.5),
+    null,
+  );
+  memories[0].timestamp = now - 5 * 60 * 1000;
+  assert.equal(
+    getProactiveMessageLimitReasonForMemories(memories, "Another useful proactive update.", 0.5),
+    "skipped-rate-limit",
+  );
+});
+
+test("all opportunity priorities use the model and preserve complete thought content", async () => {
+  const ctx = context(createDefaultEgoState());
+  ctx.ego.memories.push({
+    id: "low-priority-stimulus", type: "interaction", content: "A small detail is still worth considering.",
+    emotion: 0, valence: "neutral", importance: 0.4, timestamp: Date.now() - 10 * 60 * 1000,
+    tags: ["conversation", "inbound"], semanticSignals: ["question"],
+  });
+  const completeThought = "一段完整的分析。".repeat(80);
+  const opportunity: DetectedThoughtOpportunity = {
+    type: "memory-resurface", trigger: "memory", triggerDetail: "a quiet low-priority memory",
+    priority: 10, source: "memory-recall", relatedNeeds: [], motivation: "develop the thought",
+  };
+  let calls = 0;
+  const thought = await generateIntelligentThought(ctx, {
+    preferOpportunity: opportunity,
+    llmGenerator: async () => { calls += 1; return completeThought; },
+  });
+  assert.equal(calls, 1);
+  assert.equal(thought.content, completeThought);
 });
 
 test("LLM thought context excludes stale turns outside the current conversation window", async () => {

@@ -8,7 +8,7 @@ export type SoulLLMConfig = {
   model?: string;
   apiKeyEnv?: string;
   baseUrl?: string;
-  /** Maximum generated tokens per call. Default: 1024. */
+  /** Optional provider token ceiling. Omitted by default so the model uses its normal completion limit. */
   maxTokens?: number;
 };
 
@@ -39,19 +39,20 @@ async function callViaGateway(
   authToken: string,
   model: string,
   prompt: string,
-  maxTokens: number,
+  maxTokens?: number,
 ): Promise<string> {
+  const body: Record<string, unknown> = {
+    model,
+    messages: [{ role: "user", content: prompt }],
+  };
+  if (maxTokens !== undefined) body.max_tokens = maxTokens;
   const res = await fetch(gatewayUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${authToken}`,
     },
-    body: JSON.stringify({
-      model,
-      max_tokens: maxTokens,
-      messages: [{ role: "user", content: prompt }],
-    }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -70,8 +71,11 @@ async function callAnthropic(
   apiKey: string,
   model: string,
   prompt: string,
-  maxTokens: number,
+  maxTokens?: number,
 ): Promise<string> {
+  // Anthropic requires max_tokens on every request. Use a generous protocol
+  // fallback when Soul has not been explicitly configured with a ceiling.
+  const anthropicMaxTokens = maxTokens ?? 16_384;
   const res = await fetch(`${baseUrl}/messages`, {
     method: "POST",
     headers: {
@@ -81,7 +85,7 @@ async function callAnthropic(
     },
     body: JSON.stringify({
       model,
-      max_tokens: maxTokens,
+      max_tokens: anthropicMaxTokens,
       messages: [{ role: "user", content: prompt }],
     }),
   });
@@ -98,19 +102,20 @@ async function callOpenAICompatible(
   apiKey: string,
   model: string,
   prompt: string,
-  maxTokens: number,
+  maxTokens?: number,
 ): Promise<string> {
+  const body: Record<string, unknown> = {
+    model,
+    messages: [{ role: "user", content: prompt }],
+  };
+  if (maxTokens !== undefined) body.max_tokens = maxTokens;
   const res = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
     },
-    body: JSON.stringify({
-      model,
-      max_tokens: maxTokens,
-      messages: [{ role: "user", content: prompt }],
-    }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -304,7 +309,9 @@ export async function createSoulLLMGenerator(
 ): Promise<LLMGenerator | null> {
   const provider = config?.provider;
   const model = config?.model;
-  const maxTokens = Math.max(32, Math.min(4096, Math.floor(config?.maxTokens ?? 1024)));
+  const maxTokens = config?.maxTokens === undefined
+    ? undefined
+    : Math.max(1, Math.floor(config.maxTokens));
 
   if (!provider || !model) {
     log.debug("No model configured for soul LLM");
@@ -374,9 +381,13 @@ async function buildDirectFallback(
   log.info(`Direct fallback available: ${provider}/${model} (${isAnthropic ? "anthropic" : "openai-compatible"})`);
 
   if (isAnthropic) {
-    const maxTokens = Math.max(32, Math.min(4096, Math.floor(config?.maxTokens ?? 1024)));
+    const maxTokens = config?.maxTokens === undefined
+      ? undefined
+      : Math.max(1, Math.floor(config.maxTokens));
     return async (prompt: string) => callAnthropic(baseUrl, apiKey, model, prompt, maxTokens);
   }
-  const maxTokens = Math.max(32, Math.min(4096, Math.floor(config?.maxTokens ?? 1024)));
+  const maxTokens = config?.maxTokens === undefined
+    ? undefined
+    : Math.max(1, Math.floor(config.maxTokens));
   return async (prompt: string) => callOpenAICompatible(baseUrl, apiKey, model, prompt, maxTokens);
 }

@@ -7,6 +7,23 @@ import { calculateAttentionScore, calculateThoughtPoolMetrics, inferEpistemicNat
 import { ThoughtCycleJournal } from "../src/thought-journal.js";
 import { ThoughtService } from "../src/thought-service.js";
 
+test("Thought Pool preserves complete long candidate content", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-thought-pool-long-"));
+  try {
+    const pool = new ThoughtPool(path.join(directory, "thought-pool.json"));
+    const content = "完整的私有念头。".repeat(150);
+    const result = await pool.addCandidate({
+      content, sourceMemoryIds: ["m-long"], sourceClusters: ["reflection"],
+      cognitiveMove: "reflection", qualityFlags: [],
+      scores: { novelty: 0.8, coherence: 0.8, resonance: 0.8, userRelevance: 0.8 },
+    });
+    assert.equal(result.candidate.content, content);
+    assert.equal((await pool.load()).candidates[0]?.content, content);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("Thought Pool persists private candidates and incubates repeated thoughts", async () => {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-thought-pool-"));
   const filePath = path.join(directory, "thought-pool.json");

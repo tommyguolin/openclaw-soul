@@ -24,11 +24,12 @@ function workspace(allowEmergence = true): CognitiveWorkspace {
   };
 }
 
-test("workspace prompt does not request a preferred cognitive move or action", () => {
+test("workspace prompt allows a complete main-conversation-quality thought", () => {
   const prompt = buildWorkspaceEmergencePrompt(workspace());
   assert.match(prompt, /private attention/i);
   assert.doesNotMatch(prompt, /preferred move|cognitive move|actionType/i);
-  assert.match(prompt, /Do not look for a task/i);
+  assert.match(prompt, /same depth and completeness as a response in the main conversation/i);
+  assert.match(prompt, /no sentence, word, or character limit/i);
 });
 
 test("workspace emergence accepts thought and NO_THOUGHT without external behavior", async () => {
@@ -42,6 +43,17 @@ test("workspace emergence accepts thought and NO_THOUGHT without external behavi
   const silence = await emergeFromWorkspace(workspace(), async () => "NO_THOUGHT");
   assert.deepEqual(silence, { outcome: "silence", reason: "model-no-thought" });
   assert.equal(calls, 1);
+});
+
+test("workspace emergence preserves long thoughts without truncation", async () => {
+  const longThought = "完整分析。".repeat(180);
+  const result = await emergeFromWorkspace(workspace(), async () => JSON.stringify({
+    thought: longThought,
+    cognitiveMove: "reflection",
+    qualityFlags: [],
+  }));
+  assert.equal(result.outcome, "thought");
+  if (result.outcome === "thought") assert.equal(result.content, longThought);
 });
 
 test("pre-generation silence never calls the emergence model", async () => {

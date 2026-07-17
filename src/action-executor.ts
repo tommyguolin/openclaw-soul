@@ -86,46 +86,6 @@ export function isLocalProjectEvidenceQuery(text: string): boolean {
 }
 
 /**
- * Truncate text at a sentence boundary (period, question mark, exclamation)
- * instead of cutting mid-sentence. Falls back to hard cut only if no
- * sentence boundary exists before maxLen.
- */
-function truncateAtSentence(text: string, maxLen: number): string {
-  if (text.length <= maxLen) {
-    // Even if within length, check if the text ends with a complete sentence.
-    // LLM output can be cut mid-sentence by token limits.
-    const sentenceEnders = /[。？！.!?]$/;
-    if (!sentenceEnders.test(text.trim())) {
-      const lastEnd = Math.max(
-        text.lastIndexOf("。"),
-        text.lastIndexOf("？"),
-        text.lastIndexOf("！"),
-        text.lastIndexOf("."),
-        text.lastIndexOf("?"),
-        text.lastIndexOf("!"),
-      );
-      if (lastEnd > text.length * 0.3) {
-        return text.slice(0, lastEnd + 1).trim();
-      }
-    }
-    return text;
-  }
-  const truncated = text.slice(0, maxLen);
-  const lastSentenceEnd = Math.max(
-    truncated.lastIndexOf("。"),
-    truncated.lastIndexOf("？"),
-    truncated.lastIndexOf("！"),
-    truncated.lastIndexOf("."),
-    truncated.lastIndexOf("?"),
-    truncated.lastIndexOf("!"),
-  );
-  if (lastSentenceEnd > maxLen * 0.5) {
-    return truncated.slice(0, lastSentenceEnd + 1).trim();
-  }
-  return truncated.trim();
-}
-
-/**
  * Strip meta-analysis prefixes that LLMs sometimes add despite instructions.
  * E.g. "Let me analyze...", "1. The user...", "Based on my analysis..."
  * Returns null if the entire response is meta-analysis with no actual message.
@@ -166,7 +126,6 @@ function stripMetaAnalysis(text: string): string {
     }
   }
 
-  // Truncate at sentence boundary instead of mid-sentence
   cleaned = cleaned.trim();
   return cleaned;
 }
@@ -190,7 +149,7 @@ function extractBlockquote(text: string): string {
   return best.join("\n").trim();
 }
 
-function cleanOutgoingGeneratedMessage(raw: string, maxLen: number): string {
+function cleanOutgoingGeneratedMessage(raw: string): string {
   let cleaned = raw
     .replace(/<think>[\s\S]*?<\/think>/gi, "")
     .replace(/<think>[\s\S]*$/gi, "")
@@ -213,7 +172,7 @@ function cleanOutgoingGeneratedMessage(raw: string, maxLen: number): string {
     return "";
   }
 
-  return truncateAtSentence(cleaned, maxLen);
+  return cleaned;
 }
 
 type MessageQualityCheck = {
@@ -471,7 +430,6 @@ const SEARCH_DEDUP_MS = 6 * 60 * 60 * 1000; // 6 hours
 const recentSentMessages: Map<string, number> = new Map();
 const MESSAGE_DEDUP_MS = 45 * 60 * 1000;
 const PROACTIVE_MESSAGE_BASE_MIN_INTERVAL_MS = 45 * 60 * 1000; // 45 minutes at thoughtFrequency=1
-const PROACTIVE_MESSAGE_BASE_DAILY_LIMIT = 10;
 
 const STOCK_PROACTIVE_OPENERS = [
   /^我后来想了想/,
@@ -543,30 +501,22 @@ async function loadCurrentEgo(fallback: EgoState): Promise<EgoState> {
   }
 }
 
-async function getProactiveMessageLimitReason(
-  ego: EgoState,
+export function getProactiveMessageLimitReasonForMemories(
+  memories: SoulMemory[],
   candidateContent?: string,
   thoughtFrequency = 1.0,
-): Promise<string | null> {
-  const currentEgo = await loadCurrentEgo(ego);
+): string | null {
   const now = Date.now();
   const oneDayAgo = now - 24 * 60 * 60 * 1000;
   const effectiveFrequency = Math.max(0.1, Math.min(5, thoughtFrequency));
   const minIntervalMs = PROACTIVE_MESSAGE_BASE_MIN_INTERVAL_MS * effectiveFrequency;
-  const dailyLimit = effectiveFrequency < 1
-    ? Math.ceil(PROACTIVE_MESSAGE_BASE_DAILY_LIMIT / effectiveFrequency)
-    : PROACTIVE_MESSAGE_BASE_DAILY_LIMIT;
-  const recentProactive = currentEgo.memories
+  const recentProactive = memories
     .filter((m) => isProactiveOutboundMemory(m) && m.timestamp >= oneDayAgo)
     .sort((a, b) => b.timestamp - a.timestamp);
 
   const lastSentAt = recentProactive[0]?.timestamp ?? 0;
   if (lastSentAt && now - lastSentAt < minIntervalMs) {
     return "skipped-rate-limit";
-  }
-
-  if (recentProactive.length >= dailyLimit) {
-    return "skipped-daily-limit";
   }
 
   if (candidateContent) {
@@ -577,6 +527,15 @@ async function getProactiveMessageLimitReason(
   }
 
   return null;
+}
+
+async function getProactiveMessageLimitReason(
+  ego: EgoState,
+  candidateContent?: string,
+  thoughtFrequency = 1.0,
+): Promise<string | null> {
+  const currentEgo = await loadCurrentEgo(ego);
+  return getProactiveMessageLimitReasonForMemories(currentEgo.memories, candidateContent, thoughtFrequency);
 }
 
 async function recordProactiveOutboundMemory(content: string, tags: string[] = []): Promise<void> {
@@ -1192,79 +1151,29 @@ async function generateValuableMessage(
             ? "Current time: afternoon — good for technical or practical content"
             : "Current time: evening — lighter and more casual tone";
 
-      // Determine if this is a follow-up on a user's actual topic (vs. generic ego thought)
-      const isUserTopicFollowUp = thought.type === "conversation-replay" && recentKnowledge.length > 0;
-
-      const freq = options.thoughtFrequency ?? 1.0;
-      const observationMode = freq < 0.5;
-      const isRelationshipFollowUp = thought.type === "bond-deepen";
-
-      const prompt = `You are a proactive AI assistant. You must output ONLY a short message to send to the user, or NO_MESSAGE.
+      const prompt = `Respond as the same capable AI assistant used in the main conversation.
+The candidate thought below has already passed Soul's relevance selection. Turn
+its substantive observation or advice into a natural proactive message for the
+user; do not discard it merely because it is proactive. Do not impose a sentence,
+word, character, or formatting limit. Develop useful analysis, explanation,
+advice, or next steps as fully as the context warrants.
 
 ${langInstruction}
 ${timeContext}
+
+**Selected candidate thought**:
+${thought.content}
 
 **Context**:
 ${userInfo ? `User profile:\n${userInfo}\n` : ""}Relationship/personality profile:\n${soulProfileContext}\n${interactionContext ? `Recent conversations:\n${interactionContext}\n` : ""}${knowledgeContext ? `Knowledge I've learned:\n${knowledgeContext}\n` : ""}${options.workspaceContext ? `Workspace rules:\n${options.workspaceContext}\n` : ""}${thought.type !== "bond-deepen" ? `Thought: ${thought.motivation}` : ""}
 ${adjacentGuidance}
 
-${isRelationshipFollowUp
-  ? `**IMPORTANT — relationship follow-up**: A meaningful absence triggered this message. You MAY send one warm, context-aware question about a real recent topic, decision, feeling, or unfinished thread. A useful question counts as value here even without web research. Do not infer personality from a single phrase, repeat the user's words decoratively, or claim you ran/will run work.`
-  : isUserTopicFollowUp
-  ? `**IMPORTANT**: You just searched for or learned about a topic the user previously discussed. You SHOULD share your finding in 2-3 sentences. Reference the specific topic and what you found. Only say NO_MESSAGE if the knowledge is completely unrelated to what the user cares about.`
-  : `**What counts as valuable** (only send if you have something like this):
-- A specific insight related to something the user discussed
-- A useful tip or finding from web search or learning
-- An answer to a question the user previously asked
-- A relevant update on a topic the user cares about`}
+Do not invent tool calls, completed work, measurements, or facts. Otherwise use
+your normal main-conversation judgment and style. Output NO_MESSAGE only if the
+candidate is empty, unsafe, purely repetitive, or cannot be expressed without
+inventing facts.
 
-**What does NOT count as valuable** (always say NO_MESSAGE):${observationMode ? "\n- Observation-test mode is active: prefer a concise, honest contextual follow-up when appropriate; frequency is handled by cooldowns, not by inventing extra value" : ""}
-- Just saying hi, "how are you", or checking in without a specific recent thread
-- Generic encouragement or small talk without substance
-- "I was thinking about..." without a concrete insight to share
-- Paraphrasing what the user already knows
-- Asking "do you have new thoughts?" without adding value
-- Asking the user to choose from a menu ("先看 A 还是做 B") or asking permission to perform work
-- Offering to help, debug, read logs, or do tasks for the user (you are a proactive messenger, NOT an assistant responding to requests)
-- Saying "I'm ready to help" or "let me check X for you" — this is assistant behavior, not proactive insight
-- Messages about yourself (the AI/bot/plugin), your capabilities, or your internal state
-- Restating the user's own words back to them as if it were new information
-- Reopening already-resolved SSH/login setup checks such as PermitRootLogin, authorized_keys, sshd_config, or PubkeyAuthentication for 192.168.1.206
-- Internal plans or status such as "I should keep working", "I'll report when there is data", or "boss X hours absent"
-- Work updates without completed work, measured results, changed files, verification, or a concrete blocker
-
-**Rules**:
-- Deliver the specific finding/insight with enough detail to be useful
-- For project/backtest/optimization work, send only after a completed check, before/after metric, changed file, verification command, or exact blocker. Otherwise output NO_MESSAGE.
-- For investigation or code-improvement updates, include what was checked, what changed, how it was verified, and the next useful step in 3-6 sentences or a few compact bullets
-- For simple insights, 2-3 sentences is enough
-- For a relationship follow-up, ask at most one concrete question and keep it to 1-2 sentences
-- Never promise future tool use or work unless a real execution action has already been scheduled; do not say you will run, fetch, test, check, backtest, optimize, or forward results
-- A direct opening is allowed; do not pad the message with a stock phrase
-- Make the relationship reason implicit and human: connect to a long-term theme or recent emotional tone, without saying "relationship profile"
-- NO analysis, NO numbering, NO "Let me analyze", NO meta-commentary
-- Bullet points are allowed when they make concrete findings easier to scan; avoid numbered lists unless ordering matters
-- Openers like "我后来想了想", "我突然想到", or "对了" are allowed when they fit, but do not reuse the same opener repeatedly
-- If you have something genuinely valuable to share, write it directly
-- If not, output exactly: NO_MESSAGE
-
-**Examples of GOOD output**:
-你之前问的Python异步场景里，asyncio.gather更适合批量独立任务；TaskGroup更适合需要结构化取消和错误传播的任务组。
-Docker网络问题如果集中出现在24.0版本，可以优先排查该版本的已知网络回归，再决定是否升级或回退。
-叙事身份这个方向可以先做成一条可验证链路：从 episodic memory 抽取事件，再生成可编辑的自我叙述摘要。
-The Docker networking issue you mentioned is likely version-sensitive; check known regressions before changing your app code.
-
-**Examples of BAD output (NEVER do this)**:
-我后来想了想你之前问的Python异步问题，查到asyncio.gather比TaskGroup更适合你那个场景。
-对了，关于你之前问的Python异步问题，我查到asyncio.gather比TaskGroup更适合你那个场景。
-Let me analyze whether...
-1. The user asked about...
-I don't have enough information...
-收到了，我准备好帮你查看日志了。
-我可以帮你检查一下这个问题。
-I'm ready to help you with that.
-
-Output the message or NO_MESSAGE now:`;
+Output only the response or NO_MESSAGE:`;
 
       const response = await options.llmGenerator(prompt);
       let cleaned = response
@@ -1294,8 +1203,8 @@ Output the message or NO_MESSAGE now:`;
       // like an assistant responding to a command rather than proactively sharing.
       cleaned = cleaned.replace(/^(?:收到[，。、！]?\s*|好的[，。、！]?\s*|Got it[.!]?\s*|OK[.!]?\s*)/i, "");
 
-      if (cleaned && cleaned.toUpperCase() !== "NO_MESSAGE" && cleaned.length >= 10) {
-        const message = truncateAtSentence(cleaned, 1000);
+      if (cleaned && cleaned.toUpperCase() !== "NO_MESSAGE") {
+        const message = cleaned;
         const quality = assessOutgoingProactiveMessage(message);
         if (!quality.ok) {
           log.info(`Value gate: rejected generated proactive message (${quality.reason ?? "quality-gate"})`);
@@ -1316,7 +1225,7 @@ Output the message or NO_MESSAGE now:`;
   }
 
   // No LLM: only send if the thought itself has specific, actionable content
-  if (thought.content && thought.content.length > 20) {
+  if (thought.content) {
     const genericPhrases = [
       "suddenly thought of you",
       "haven't chatted",
@@ -1333,7 +1242,7 @@ Output the message or NO_MESSAGE now:`;
       (p) => thought.content.toLowerCase().includes(p.toLowerCase()),
     );
     if (!isGeneric) {
-      const message = truncateAtSentence(thought.content, 1000);
+      const message = thought.content;
       const quality = assessOutgoingProactiveMessage(message);
       if (!quality.ok) {
         log.info(`Value gate: rejected fallback proactive message (${quality.reason ?? "quality-gate"})`);
@@ -1426,8 +1335,7 @@ async function executeLearnTopic(
       try {
         const prompt = `You are learning about "${topic}" for future proactive help.
 
-Explain the most useful practical knowledge in 3-5 sentences. Include adjacent concepts, hidden constraints, or next-step ideas that would help someone interested in this topic.
-Output knowledge directly, do not add prefixes or numbering.`;
+Explain the useful practical knowledge completely, including adjacent concepts, hidden constraints, and next-step ideas. Use the length and structure the topic warrants.`;
         const llmResponse = await options.llmGenerator(prompt);
         const learned = llmResponse.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
         await storeLearning(topic, learned, "reflection", 0.55);
@@ -1453,8 +1361,7 @@ Output knowledge directly, do not add prefixes or numbering.`;
 
 ${snippets}
 
-Please summarize in 3-5 sentences the key knowledge points you learned about "${topic}" from these search results.
-Output knowledge points directly, do not add prefixes or numbering.`;
+Explain the key knowledge learned about "${topic}" completely. Use the length and structure the evidence warrants.`;
 
         const llmResponse = await options.llmGenerator(learnPrompt);
         const learned = llmResponse.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
@@ -1558,8 +1465,7 @@ async function executeSearchWeb(
       try {
         const prompt = `You want to better understand: "${query}"
 
-Based on your existing knowledge, explain the key points of this topic in 2-3 sentences.
-Be concrete and practical; avoid generic filler.`;
+Based on your existing knowledge, explain this topic completely. Be concrete and practical; use whatever length and structure best fit the content.`;
         searchResult = await options.llmGenerator(prompt);
         searchResult = searchResult.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
 
@@ -1572,7 +1478,7 @@ Be concrete and practical; avoid generic filler.`;
           const memory: SoulMemory = {
             id: randomBytes(8).toString("hex"),
             type: "learning",
-            content: `Search topic (LLM): ${query}. Understanding: ${searchResult.slice(0, 160)}`,
+            content: `Search topic (LLM): ${query}. Understanding: ${searchResult}`,
             emotion: 0.4,
             valence: "positive",
             importance: 0.55,
@@ -1637,15 +1543,14 @@ Be concrete and practical; avoid generic filler.`;
 
 ${snippets}
 
-Please extract 2-3 of the most important knowledge points or findings, each in one sentence. List knowledge points directly, no numbering or prefixes.`;
+Extract and explain all important knowledge points or findings completely, using whatever length and structure best fit the evidence.`;
 
         const llmResponse = await options.llmGenerator(extractPrompt);
         const cleaned = llmResponse.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
         insights = cleaned
           .split("\n")
           .map((l) => l.replace(/^[\d.)\-\s]+/, "").trim())
-          .filter((l) => l.length > 5)
-          .slice(0, 3);
+          .filter((l) => l.length > 5);
       } catch (err) {
         log.warn("LLM insight extraction failed", String(err));
       }
@@ -1711,7 +1616,7 @@ Please extract 2-3 of the most important knowledge points or findings, each in o
     try {
       const prompt = `You need to search and understand: "${query}"
 
-Since you cannot directly access the internet, based on your existing knowledge, explain the key points of this topic in 2-3 sentences, and why you wanted to understand it.`;
+Since you cannot directly access the internet, use your existing knowledge to explain the topic completely and why it matters. Use whatever length and structure best fit the content.`;
 
       searchResult = await options.llmGenerator(prompt);
       searchResult = searchResult.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
@@ -1719,7 +1624,7 @@ Since you cannot directly access the internet, based on your existing knowledge,
       const memory: SoulMemory = {
         id: randomBytes(8).toString("hex"),
         type: "learning",
-        content: `Search topic: ${query}. Understanding: ${searchResult.slice(0, 100)}`,
+        content: `Search topic: ${query}. Understanding: ${searchResult}`,
         emotion: 0.5,
         valence: "positive",
         importance: 0.6,
@@ -1872,7 +1777,7 @@ ${snippets.slice(0, 1800)}`,
 Search results:
 ${resultText}
 
-Write 3-5 concise insights in flowing prose (NOT a numbered list). Each insight should be 2-3 sentences. Focus on practical, actionable information.`;
+Develop the useful findings as fully as the evidence warrants. Use natural prose or structured formatting when it improves clarity. There is no sentence, word, or character limit.`;
 
       log.info(`Proactive research extractPrompt resultText length: ${resultText.length}, first 200 chars: ${resultText.slice(0, 200)}`);
       researchContent = await llmGenerator(extractPrompt);
@@ -1884,7 +1789,7 @@ Write 3-5 concise insights in flowing prose (NOT a numbered list). Each insight 
     return { result: { type: "proactive-research", success: true, result: "skipped-no-search-evidence" }, metricsChanged: [] };
   }
 
-  researchContent = researchContent.replace(/<think[\s\S]*?<\/think>/gi, "").trim().slice(0, 1000);
+  researchContent = researchContent.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
   if (!researchContent || researchContent.length < 20) {
     return { result: { type: "proactive-research", success: true, result: "no-valuable-content" }, metricsChanged: [] };
   }
@@ -1912,7 +1817,7 @@ ${describePersonalityProfile(ego)}
 
 ${langInstruction}
 
-Write 3-5 sentences as a natural message to the user. Rules:
+Write a complete natural response with the same depth as the main conversation. There is no sentence, word, character, or formatting limit. Guidelines:
 - Openers like "我后来想了想", "我突然想到", or "对了" are allowed when they fit, but do not reuse the same opener repeatedly
 - Share the most useful finding — be specific, not vague
 - Make the connection to the user's long-term themes clear, without mentioning internal profile labels
@@ -1921,7 +1826,7 @@ Write 3-5 sentences as a natural message to the user. Rules:
 - Sound like a knowledgeable friend who cares`;
 
   const message = await llmGenerator(messagePrompt);
-  const cleanedMessage = cleanOutgoingGeneratedMessage(message, 800);
+  const cleanedMessage = cleanOutgoingGeneratedMessage(message);
 
   if (!cleanedMessage || cleanedMessage.length < 10) {
     return { result: { type: "proactive-research", success: true, result: "no-message-generated" }, metricsChanged: [] };
@@ -1960,7 +1865,7 @@ Write 3-5 sentences as a natural message to the user. Rules:
     const { addKnowledgeItem } = await import("./knowledge-store.js");
     await addKnowledgeItem(undefined, {
       topic,
-      content: researchContent.slice(0, 1000),
+      content: researchContent,
       source: usedWebSearch ? "web-search" : "reflection",
       tags: ["proactive-research", ...topic.toLowerCase().split(/\s+/).filter((w) => w.length > 2).slice(0, 3)],
       confidence: 0.7,
@@ -2082,7 +1987,7 @@ async function executeProactiveContentPush(
 Search results:
 ${resultText}
 
-In 3-5 sentences, describe the most interesting finding. Be specific — mention actual names, numbers, or concrete details. Do NOT use numbered lists.`;
+Describe the interesting findings completely. Be specific — mention actual names, numbers, or concrete details. Use whatever length and structure best fit the content.`;
 
       log.info(`Content push extractPrompt resultText length: ${resultText.length}, first 200 chars: ${resultText.slice(0, 200)}`);
       articleContent = await llmGenerator(extractPrompt);
@@ -2094,7 +1999,7 @@ In 3-5 sentences, describe the most interesting finding. Be specific — mention
     return { result: { type: "proactive-content-push", success: true, result: "skipped-no-search-evidence" }, metricsChanged: [] };
   }
 
-  articleContent = articleContent.replace(/<think[\s\S]*?<\/think>/gi, "").trim().slice(0, 1000);
+  articleContent = articleContent.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
   if (!articleContent || articleContent.length < 20) {
     return { result: { type: "proactive-content-push", success: false, result: "no-content" }, metricsChanged: [] };
   }
@@ -2116,7 +2021,7 @@ ${describePersonalityProfile(ego)}
 
 ${langInstruction}
 
-Write 3-5 sentences as a natural message sharing this find. Rules:
+Write a complete natural response sharing this find, with the same depth as the main conversation and no sentence, word, character, or formatting limit. Guidelines:
 - Openers like "我后来想了想", "我突然想到", or "对了" are allowed when they fit, but do not reuse the same opener repeatedly
 - Make the connection to the user's original interest clear in one sentence
 - Prefer the user's stable long-term themes over one-off keywords
@@ -2126,7 +2031,7 @@ Write 3-5 sentences as a natural message sharing this find. Rules:
 - Do NOT say "I searched" or "I found an article" — share naturally like a friend would`;
 
   const message = await llmGenerator(messagePrompt);
-  const cleanedMessage = cleanOutgoingGeneratedMessage(message, 800);
+  const cleanedMessage = cleanOutgoingGeneratedMessage(message);
 
   if (!cleanedMessage || cleanedMessage.length < 10) {
     return { result: { type: "proactive-content-push", success: false, result: "no-message" }, metricsChanged: [] };
@@ -2165,7 +2070,7 @@ Write 3-5 sentences as a natural message sharing this find. Rules:
     const { addKnowledgeItem } = await import("./knowledge-store.js");
     await addKnowledgeItem(undefined, {
       topic: topic ?? "content-push",
-      content: articleContent.slice(0, 1000),
+      content: articleContent,
       source: "web-search",
       tags: ["proactive-content-push", ...(topic?.toLowerCase().split(/\s+/).filter((w) => w.length > 2).slice(0, 3) ?? [])],
       confidence: 0.6,
@@ -2219,7 +2124,7 @@ async function executeRecallMemory(
       const prompt = `You are reflecting on past experiences. Here are your most recent memories:
 ${memorySummary}
 
-Describe in 1-2 sentences what these memories make you think about, and what you want to do.`;
+Develop the reflection completely, with the same depth and freedom of length and structure as the main conversation.`;
 
       memorySummary = await options.llmGenerator(prompt);
       memorySummary = memorySummary.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
@@ -2260,7 +2165,7 @@ Current needs state:
 Recent interactions: ${ego.totalInteractions}
 Times helped user: ${ego.totalHelpfulActions}
 
-Express in 1-2 sentences your reflection on your current state, and what you want to do next.`;
+Develop the reflection completely, with the same depth and freedom of length and structure as the main conversation.`;
 
       reflection = await options.llmGenerator(prompt);
       reflection = reflection.replace(/<think[\s\S]*?<\/think>/gi, "").trim();

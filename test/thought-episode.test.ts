@@ -5,6 +5,18 @@ import path from "node:path";
 import test from "node:test";
 import { ThoughtEpisodeStore } from "../src/cognition/thought-store.js";
 
+test("ThoughtEpisodeStore preserves complete long thought content", async () => {
+  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-thought-episode-long-"));
+  const store = new ThoughtEpisodeStore(path.join(dir, "thought-episodes.json"));
+  const content = "完整的长期思考内容。".repeat(140);
+  const result = await store.integrate({
+    workspaceId: "w-long", content, epistemicNature: "claim",
+    causalTraceIds: ["memory:long"], stimulusId: "long", evidence: [],
+  });
+  assert.equal(result.episode.content, content);
+  assert.equal((await store.load()).episodes[0]?.content, content);
+});
+
 test("ThoughtEpisode evolves through support and revision instead of duplicate immutable thoughts", async () => {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-thought-episode-"));
   const store = new ThoughtEpisodeStore(path.join(dir, "thought-episodes.json"));
