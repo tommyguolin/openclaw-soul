@@ -2479,7 +2479,7 @@ function extractResultFromSessions(task, sinceMs) {
             }
             if (lastAssistantText) {
                 if (isCompleteTaskReport(lastAssistantText) && (!task.resultFilePath || hasFinalTaskResultFile(task))) {
-                    return { status: "completed", result: lastAssistantText.slice(0, 1000) };
+                    return { status: "completed", result: lastAssistantText };
                 }
                 const detail = `Agent session ${name.name} stopped before producing a final result file${task.resultFilePath ? ` (${task.resultFilePath})` : ""}. Last partial output: ${lastAssistantText.slice(0, 1200)}`;
                 const hasUsefulPartial = /\bdone\b|\bfail(?:ed|ure)?\b|\bpasses\b|\bimproved?\b|\bworse\b|\bbug\b|\broot cause\b|\bclear\b|\bmetric\b|\bresult\b|\bverified?\b|\bfixed?\b|\bapplied\b|\bcompleted\b/i.test(lastAssistantText);
