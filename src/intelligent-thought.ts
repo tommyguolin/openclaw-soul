@@ -1870,7 +1870,14 @@ function extractFilePaths(text: string): string[] {
   for (const ext of READABLE_EXTENSIONS) {
     // Require at least one path separator to avoid extracting bare filenames
     // (e.g. "ego.json" from log text) that resolve against process.cwd().
-    const pattern = new RegExp(`(?:(?:[A-Za-z]:)?/[\^\s:]+|[A-Za-z]:\\\\[\w./-\\\\]+)\\${ext}\\b`, "gi");
+    // Two alternatives:
+    //   1. Unix/relative: at least one / in the path
+    //   2. Windows: drive letter + backslash separator
+    // Note: hyphen must come last inside [...] to be treated as literal,
+    // not as a range operator. The previous [\w./-\\] had /-\\ forming
+    // an unintended range (0x2F–0x5C) that excluded hyphen itself, causing
+    // paths with hyphens (e.g. openclaw-2026-07-18.log) to not match.
+    const pattern = new RegExp(`(?:[\\w./-]+/[\\w./-]+|[A-Za-z]:\\\\[\\w.\\\\/-]+)\\${ext}\\b`, "gi");
     const matches = text.match(pattern);
     if (matches) {
       for (const m of matches) {
