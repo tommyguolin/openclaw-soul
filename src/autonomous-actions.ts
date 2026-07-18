@@ -93,7 +93,16 @@ function normalizeTaskResultForReport(result: string): string {
 }
 
 function isTaskBlockedResult(result: string): boolean {
-  return /timed out|timeout|stale|rate limit|cooldown|backing off|too many requests|429|No available auth profile|\bfailed\b|\berror\b|aborted|prompt-error|parsererror|command exited with code [1-9]/i.test(result);
+  // Check for explicit failure indicators, not bare word matches.
+  // Previous regex matched \berror\b / \bfailed\b anywhere, causing false positives
+  // on successful reports containing phrases like "Fixed the error handling" or
+  // "No error found". Require error-like context (status lines, prefixes, or
+  // error-detail sections) to reduce false-positive blocked/partial classifications.
+  return /^Status:\s*(?:failed|blocked|partial)\b/im.test(result)
+    || /timed out|timeout|stale|rate limit|cooldown|backing off|too many requests|429|No available auth profile|aborted|prompt-error|parsererror|command exited with code [1-9]/i.test(result)
+    || /^(?:##\s*)?(?:failure|error)\b/im.test(result)
+    || /\b(?:failed|error)\b\s*(?:to|starting|running|before|because|while|due|with|:)\b/i.test(result)
+    || /(?:Error|Exception|Traceback):/i.test(result);
 }
 
 function isProviderPressureErrorText(value: unknown): boolean {
