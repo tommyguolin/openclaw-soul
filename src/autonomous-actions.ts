@@ -93,7 +93,7 @@ function normalizeTaskResultForReport(result: string): string {
 }
 
 function isTaskBlockedResult(result: string): boolean {
-  return /timed out|timeout|stale|rate limit|cooldown|backing off|too many requests|429|No available auth profile|failed|error|aborted|prompt-error|parsererror|command exited with code [1-9]/i.test(result);
+  return /timed out|timeout|stale|rate limit|cooldown|backing off|too many requests|429|No available auth profile|\bfailed\b|\berror\b|aborted|prompt-error|parsererror|command exited with code [1-9]/i.test(result);
 }
 
 function isProviderPressureErrorText(value: unknown): boolean {
@@ -421,7 +421,7 @@ function isCompleteTaskReport(result: string): boolean {
   if (taskReportStatus(text) === "in-progress") return false;
 
   if (!hasRequiredReportSections(text)) return false;
-  return /changed|implemented|verified|command|baseline|before|after|CAGR|drawdown|metric|backtest|benchmark|files?/i.test(text);
+  return /changed|implemented|verified|command|baseline|before|after|metric|files?/i.test(text);
 }
 
 function hasRequiredReportSections(result: string): boolean {
@@ -2675,10 +2675,6 @@ function makeSkippedStep(action: string, reason: string): TaskStep {
 }
 
 /**
- * Extract meaningful keywords from text for similarity comparison.
- * Filters out common stop words and short tokens.
- */
-/**
  * Try to extract the sub-agent's final report from recent session files.
  * This is a fallback when the agent doesn't write the result file. It returns
  * partial/failed status explicitly when the session timed out or only produced
@@ -2739,7 +2735,7 @@ function extractResultFromSessions(task: AutonomousTask, sinceMs: number): { sta
           return { status: "completed", result: lastAssistantText.slice(0, 1000) };
         }
         const detail = `Agent session ${name.name} stopped before producing a final result file${task.resultFilePath ? ` (${task.resultFilePath})` : ""}. Last partial output: ${lastAssistantText.slice(0, 1200)}`;
-        const hasUsefulPartial = /done|both configs|fail|passes|improved|worse|bug|root cause|clear|metric|CAGR|drawdown|B&H|baseline|\+|-|%|result/i.test(lastAssistantText);
+        const hasUsefulPartial = /\bdone\b|\bfail(?:ed|ure)?\b|\bpasses\b|\bimproved?\b|\bworse\b|\bbug\b|\broot cause\b|\bclear\b|\bmetric\b|\bresult\b|\bverified?\b|\bfixed?\b|\bapplied\b|\bcompleted\b/i.test(lastAssistantText);
         return {
           status: "failed",
           result: hasUsefulPartial ? buildPartialTaskReport(task, detail) : buildFailureTaskReport(task, detail),
@@ -2750,37 +2746,6 @@ function extractResultFromSessions(task: AutonomousTask, sinceMs: number): { sta
   return null;
 }
 
-function extractKeywords(text: string): string[] {
-  const stopWords = new Set([
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "shall", "can", "need", "dare", "ought",
-    "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
-    "as", "into", "through", "during", "before", "after", "above", "below",
-    "between", "out", "off", "over", "under", "again", "further", "then",
-    "once", "here", "there", "when", "where", "why", "how", "all", "both",
-    "each", "few", "more", "most", "other", "some", "such", "no", "nor",
-    "not", "only", "own", "same", "so", "than", "too", "very", "just",
-    "because", "but", "and", "or", "if", "while", "that", "this", "it",
-    "i", "me", "my", "we", "our", "you", "your", "he", "she", "they",
-    "its", "what", "which", "who", "whom", "these", "those",
-    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都",
-    "一", "一个", "上", "也", "很", "到", "说", "要", "去", "你", "会",
-    "着", "没有", "看", "好", "自己", "这",
-  ]);
-  return text.toLowerCase()
-    .replace(/[^\w\u4e00-\u9fff]/g, " ")
-    .split(/\s+/)
-    .filter((w) => w.length > 2 && !stopWords.has(w))
-    .slice(0, 50);
-}
-
-/**
- * Read a local file directly via Node.js fs.
- * Used instead of gateway /tools/invoke because the gateway's tool policy
- * pipeline does not expose "read"/"exec" to HTTP callers.
- * Returns a TaskStep with the file content (last 8000 chars for large files).
- */
 async function readLocalFile(actionName: string, filePath: string): Promise<TaskStep> {
   const id = randomBytes(4).toString("hex");
   const start = Date.now();
