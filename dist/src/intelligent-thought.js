@@ -284,7 +284,7 @@ function buildUserProfile(ego) {
         "error", "bug", "issue", "problem", "stuck", "can't", "doesn't work", "failed",
         "错误", "问题", "不行", "不行了", "解决不了", "卡在", "报错", "失败",
     ];
-    for (const mem of ego.memories.filter((m) => m.type === "interaction").slice(-20)) {
+    for (const mem of ego.memories.filter((m) => m.type === "interaction" && m.tags.includes("inbound")).slice(-20)) {
         const lower = mem.content.toLowerCase();
         if (problemPatterns.some((p) => lower.includes(p)) && challenges.length < 5) {
             challenges.push(mem.content.slice(0, 80));
