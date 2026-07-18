@@ -15,7 +15,7 @@ const WRITE_TOOLS = new Set(["write", "edit", "apply_patch"]);
  * Shell commands that are safe read-only operations.
  * Any exec command NOT matching these patterns is treated as a write operation.
  */
-const READ_ONLY_COMMANDS = /^(?:cat|head|tail|grep|ls|find|wc|diff|which|whoami|pwd|echo|stat|file|du|df|free|uptime|uname|date|ps|top|ss|netstat|ip|ifconfig|env|printenv|node\s+-e\s+"console\.log)/;
+const READ_ONLY_COMMANDS = /^(?:cat|head|tail|grep|ls|find|wc|diff|which|whoami|pwd|echo|stat|file|du|df|free|uptime|uname|date|ps|top|ss|netstat|ip|ifconfig|env|printenv|node\s+-e\s+"console\.log|git\s+(?:log|status|diff|show|blame|branch|remote|tag|ls-files|rev-parse|config\s+--get|config\s+--list)|Get-ChildItem|Get-Content|Get-Item|Select-Object|Where-Object|Sort-Object|Measure-Object|Test-Path|Where(?:-Object)?|Type\s|Dir\s|powershell\s+-Command\s+(?:Get-|Test-|Where-))/;
 
 /**
  * Check if a gateway tool invocation requires write permission.
