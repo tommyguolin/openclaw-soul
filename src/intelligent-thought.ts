@@ -1276,8 +1276,11 @@ function analyzeContextualTriggers(
     const hoursSinceImprove = recentImprove
       ? (Date.now() - recentImprove.timestamp) / (1000 * 60 * 60)
       : Infinity;
-    const recentFailedImprove = recentImprove?.outcome === "failed" && hoursSinceImprove < 3;
-    const recentSuccessfulImprove = recentImprove?.outcome === "success" && hoursSinceImprove < 2;
+    // A failed improve task (often just a stale timeout) should not block
+    // maintenance for 3 hours — 1 hour is enough. The 2h maintenance cooldown
+    // in runMaintenanceIfDue still provides a longer floor.
+    const recentFailedImprove = recentImprove?.outcome === "failed" && hoursSinceImprove < 1;
+    const recentSuccessfulImprove = recentImprove?.outcome === "success" && hoursSinceImprove < 1;
 
     if (!recentFailedImprove && !recentSuccessfulImprove) {
       const basePriority = hoursSinceImprove === Infinity ? 65 : Math.min(65, 35 + hoursSinceImprove * 4);
