@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { readFile, access as accessFile } from "node:fs/promises";
 import { dirname, join, normalize, parse as parsePath, relative, resolve, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -2916,10 +2916,34 @@ export async function pollActiveTasks(storePath: string): Promise<AutonomousTask
 
     // Prune old completed tasks (keep last MAX_TASKS)
     if (e.activeTasks.length > MAX_TASKS) {
-      e.activeTasks = e.activeTasks
-        .sort((a, b) => b.updatedAt - a.updatedAt)
-        .slice(0, MAX_TASKS);
+      // Before pruning from ego, clean up orphaned result files for tasks
+      // being evicted — prevents results/ directory from growing unbounded.
+      const sorted = [...e.activeTasks].sort((a, b) => b.updatedAt - a.updatedAt);
+      const evicted = sorted.slice(MAX_TASKS);
+      for (const t of evicted) {
+        if (t.resultFilePath) {
+          try { unlinkSync(t.resultFilePath); } catch { /* already gone */ }
+        }
+      }
+      e.activeTasks = sorted.slice(0, MAX_TASKS);
     }
+
+    // Clean up orphaned result files not referenced by any task
+    const resultDir = join(resolveSoulDir(), "results");
+    try {
+      const knownResultFiles = new Set(e.activeTasks.map((t) => t.resultFilePath?.toLowerCase()).filter(Boolean));
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000; // 24h retention
+      for (const name of readdirSync(resultDir)) {
+        if (!name.endsWith(".md")) continue;
+        const filePath = join(resultDir, name).toLowerCase();
+        if (knownResultFiles.has(filePath)) continue;
+        try {
+          if (statSync(filePath).mtimeMs < cutoff) {
+            unlinkSync(filePath);
+          }
+        } catch { /* gone */ }
+      }
+    } catch { /* result dir not accessible */ }
 
     return e;
   });
