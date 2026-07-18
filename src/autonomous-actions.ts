@@ -1,8 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { dirname, join, normalize, parse as parsePath, relative, resolve } from "node:path";
+import { readFile, access as accessFile } from "node:fs/promises";
+import { dirname, join, normalize, parse as parsePath, relative, resolve, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
 
@@ -2785,7 +2785,20 @@ async function readLocalFile(actionName: string, filePath: string): Promise<Task
   const id = randomBytes(4).toString("hex");
   const start = Date.now();
   try {
-    const buf = await readFile(filePath, "utf-8");
+    // Resolve bare filenames (no directory component) against the Soul directory
+    // instead of process.cwd() (which is C:\Windows\System32 for the gateway service).
+    let resolvedPath = filePath;
+    if (!isAbsolute(filePath) && !filePath.includes("/") && !filePath.includes("\\")) {
+      const soulDir = resolveSoulDir();
+      const candidate = join(soulDir, filePath);
+      try {
+        await accessFile(candidate);
+        resolvedPath = candidate;
+      } catch {
+        // Not in soul dir; fall through and let readFile attempt the original path
+      }
+    }
+    const buf = await readFile(resolvedPath, "utf-8");
     // Keep last 8000 chars to avoid blowing up LLM context
     const content = buf.length > 8000 ? buf.slice(-8000) : buf;
     return {

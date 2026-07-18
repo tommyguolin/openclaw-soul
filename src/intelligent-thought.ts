@@ -1868,7 +1868,9 @@ const READABLE_EXTENSIONS = [".log", ".ts", ".js", ".py", ".json", ".yaml", ".ym
 function extractFilePaths(text: string): string[] {
   const results: string[] = [];
   for (const ext of READABLE_EXTENSIONS) {
-    const pattern = new RegExp(`(?:/[^\\s:]+|[\\w./-]+)\\${ext}\\b`, "gi");
+    // Require at least one path separator to avoid extracting bare filenames
+    // (e.g. "ego.json" from log text) that resolve against process.cwd().
+    const pattern = new RegExp(`(?:(?:[A-Za-z]:)?/[\^\s:]+|[A-Za-z]:\\\\[\w./-\\\\]+)\\${ext}\\b`, "gi");
     const matches = text.match(pattern);
     if (matches) {
       for (const m of matches) {
