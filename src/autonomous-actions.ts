@@ -2904,7 +2904,7 @@ export async function pollActiveTasks(storePath: string): Promise<AutonomousTask
 
       // Final fallback: stale timeout
       if (Date.now() - task.updatedAt > STALE_MS) {
-        const detail = task.result ?? `Task timed out (stale >8 min). Required final result file was not produced${task.resultFilePath ? `: ${task.resultFilePath}` : ""}.`;
+        const detail = task.result ?? `Task timed out (stale >${Math.round(STALE_MS / 60000)} min). Required final result file was not produced${task.resultFilePath ? `: ${task.resultFilePath}` : ""}.`;
         task.status = "failed";
         task.result = buildFailureTaskReport(task, detail);
         writeTaskReportFile(task.resultFilePath, task.result);
