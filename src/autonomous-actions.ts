@@ -2688,7 +2688,7 @@ function makeSkippedStep(action: string, reason: string): TaskStep {
  * This is a fallback when the agent doesn't write the result file. It returns
  * partial/failed status explicitly when the session timed out or only produced
  * interim narration.
- * Looks for sessions created after `sinceMs` that contain "Soul-Autonomous".
+ * Looks for sessions created after `sinceMs` that contain "Soul-Autonomous" or "[Soul Autonomous".
  */
 function extractResultFromSessions(task: AutonomousTask, sinceMs: number): { status: "completed" | "failed"; result: string } | null {
   const sessionsDir = join(homedir(), ".openclaw/agents/main/sessions");
@@ -2701,7 +2701,7 @@ function extractResultFromSessions(task: AutonomousTask, sinceMs: number): { sta
       .sort((a, b) => b.mtimeMs - a.mtimeMs);
     for (const name of files) {
       const content = readFileSync(name.fp, "utf-8");
-      if (!content.includes("Soul-Autonomous")) continue;
+      if (!content.includes("Soul-Autonomous") && !content.includes("[Soul Autonomous")) continue;
       if (markers.length > 0 && !markers.some((marker) => content.includes(marker))) continue;
       let lastAssistantText = "";
       let promptError = "";
