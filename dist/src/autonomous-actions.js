@@ -1862,9 +1862,14 @@ ${reportZh
         await completeTask(taskId, noSourceReport, "failed");
         return { result: { type: "observe-and-improve", success: false, error: `No source files found in ${target.dir}` }, metricsChanged: [] };
     }
-    // --- Recent analysis context ---
+    // Recent analysis context — only include results from prior improvement
+    // tasks (requiresWritePermission === true). Analyze-problem results are
+    // generic diagnostic summaries that add noise without actionable context.
+    // Also filter out boilerplate partial/failed results that have no findings.
     const recentAnalyses = (ego.activeTasks ?? [])
-        .filter((t) => t.status === "completed" && t.result && t.id !== taskId)
+        .filter((t) => t.status === "completed" && t.result && t.id !== taskId
+        && t.requiresWritePermission === true
+        && !isLowValueAutonomousFailure(t))
         .slice(-2)
         .map((t) => t.result)
         .join("\n\n");
@@ -2174,9 +2179,14 @@ export async function executeSubagentImprove(thought, ego, options) {
         .slice(0, 5)
         .map((g) => `- ${g.title}: ${g.description} (${g.progress.toFixed(0)}%)`)
         .join("\n");
-    // Recent analysis context
+    // Recent analysis context — only include results from prior improvement
+    // tasks (requiresWritePermission === true). Analyze-problem results are
+    // generic diagnostic summaries that add noise without actionable context.
+    // Also filter out boilerplate partial/failed results that have no findings.
     const recentAnalyses = (ego.activeTasks ?? [])
-        .filter((t) => t.status === "completed" && t.result && t.id !== undefined)
+        .filter((t) => t.status === "completed" && t.result && t.id !== undefined
+        && t.requiresWritePermission === true
+        && !isLowValueAutonomousFailure(t))
         .slice(-2)
         .map((t) => t.result)
         .join("\n\n");
