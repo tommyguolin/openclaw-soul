@@ -344,8 +344,10 @@ const ACTION_COOLDOWNS_MS: Record<ActionType, number> = {
   "run-agent-task": 60 * 60 * 1000,
   "report-findings": 2 * 60 * 1000,
   "observe-and-improve": 45 * 60 * 1000,
+  "subagent-improve": 60 * 60 * 1000,
   "proactive-research": 60 * 60 * 1000,
   "proactive-content-push": 90 * 60 * 1000,
+  "proactive-check-in": 15 * 60 * 1000,
 };
 
 const MIN_ACTION_COOLDOWNS_MS: Partial<Record<ActionType, number>> = {
@@ -354,9 +356,11 @@ const MIN_ACTION_COOLDOWNS_MS: Partial<Record<ActionType, number>> = {
   "analyze-problem": 10 * 60 * 1000,
   "run-agent-task": 30 * 60 * 1000,
   "observe-and-improve": 20 * 60 * 1000,
+  "subagent-improve": 30 * 60 * 1000,
   "report-findings": 30 * 1000,
   "proactive-research": 30 * 60 * 1000,
   "proactive-content-push": 30 * 60 * 1000,
+  "proactive-check-in": 5 * 60 * 1000,
 };
 
 const TEST_MODE_MIN_ACTION_COOLDOWNS_MS: Partial<Record<ActionType, number>> = {
@@ -366,8 +370,10 @@ const TEST_MODE_MIN_ACTION_COOLDOWNS_MS: Partial<Record<ActionType, number>> = {
   "analyze-problem": 5 * 60 * 1000,
   "run-agent-task": 15 * 60 * 1000,
   "observe-and-improve": 10 * 60 * 1000,
+  "subagent-improve": 15 * 60 * 1000,
   "proactive-research": 30 * 60 * 1000,
   "proactive-content-push": 20 * 60 * 1000,
+  "proactive-check-in": 2 * 60 * 1000,
 };
 
 const lastActionTime: Record<string, number> = {};
@@ -427,6 +433,12 @@ function classifyBehaviorOutcome(
   if (
     actionType === "observe-and-improve"
     && actionResult.result.data?.fixApplied !== true
+  ) {
+    return "irrelevant";
+  }
+  if (
+    actionType === "subagent-improve"
+    && actionResult.result.success !== true
   ) {
     return "irrelevant";
   }
@@ -785,6 +797,8 @@ export interface ActionExecutorOptions {
   workspaceContext?: string;
   /** Frequency multiplier for action cooldowns. Default: 1.0. Lower = shorter cooldowns. */
   thoughtFrequency?: number;
+  /** Subagent runner for autonomous task delegation (full tool chain) */
+  subAgentRunner?: import("./autonomous-actions.js").SubAgentRunner;
 }
 
 export async function executeThoughtAction(
@@ -882,7 +896,8 @@ export async function executeThoughtAction(
       case "analyze-problem":
       case "run-agent-task":
       case "report-findings":
-      case "observe-and-improve": {
+      case "observe-and-improve":
+      case "subagent-improve": {
         const { executeAutonomousAction } = await import("./autonomous-actions.js");
         actionResult = await executeAutonomousAction(actionType, thought, ego, {
           autonomousActions: options.autonomousActions ?? false,
@@ -894,6 +909,7 @@ export async function executeThoughtAction(
           channel: options.channel,
           target: options.target,
           workspaceContext: options.workspaceContext,
+          subAgentRunner: options.subAgentRunner,
         });
         break;
       }
@@ -903,6 +919,10 @@ export async function executeThoughtAction(
       }
       case "proactive-content-push": {
         actionResult = await executeProactiveContentPush(thought, ego, options);
+        break;
+      }
+      case "proactive-check-in": {
+        actionResult = await executeProactiveCheckIn(thought, ego, options);
         break;
       }
       default:
@@ -2176,6 +2196,129 @@ Write a complete natural response sharing this find, with the same depth as the 
       { need: "growth", delta: 3, reason: "learned about user interests" },
     ],
   };
+}
+
+/**
+ * Proactive check-in: Soul reaches out with a brief, context-aware check-in
+ * message. This is a "tell-first" style action — it works even when
+ * autonomousActions is false because it only sends a message (read-only intent).
+ * The message is generated from the user's recent context, userFacts, and
+ * current needs, producing something like "noticed you're working on X, how's
+ * it going?" or "saw your message about Y, I was thinking about Z...".
+ */
+async function executeProactiveCheckIn(
+  thought: Thought,
+  ego: EgoState,
+  options: ActionExecutorOptions,
+): Promise<{ result: ActionResult; metricsChanged: MetricDelta[] }> {
+  const { channel, target, sendMessage, llmGenerator } = options;
+
+  if (!channel || !target || !sendMessage) {
+    return {
+      result: { type: "proactive-check-in", success: false, error: "No channel/target/sender configured" },
+      metricsChanged: [],
+    };
+  }
+
+  // Build context from userFacts and recent interactions
+  const userFacts = activeUserFactsForCheckIn(ego);
+  const recentInteractions = (ego.memories ?? [])
+    .filter((m) => m.type === "interaction" && m.tags.includes("inbound"))
+    .sort((a, b) => b.timestamp - a.timestamp)
+    .slice(0, 3)
+    .map((m) => m.content.slice(0, 120))
+    .join(" | ");
+  const needsSummary = Object.entries(ego.needs)
+    .map(([_, n]) => `${n.name}: ${n.current.toFixed(0)}/${n.ideal}`)
+    .join(", ");
+  const relationshipProfile = describeRelationshipProfile(ego);
+  const personalityProfile = describePersonalityProfile(ego);
+  const langInstruction = buildUserLanguageInstruction(ego);
+
+  if (!llmGenerator) {
+    return {
+      result: { type: "proactive-check-in", success: true, result: "skipped-no-llm" },
+      metricsChanged: [],
+    };
+  }
+
+  const prompt = `You are a soulful AI companion checking in with the user proactively.
+
+**Reason for check-in**: ${thought.motivation || thought.triggerDetail}
+**What you know about the user**: ${userFacts}
+**Recent conversation snippets**: ${recentInteractions || "none"}
+**Your current needs**: ${needsSummary}
+**Relationship**: ${relationshipProfile}
+**Personality**: ${personalityProfile}
+
+${langInstruction}
+
+Write a brief, warm check-in message. Requirements:
+1. Reference something specific you know about the user (a project, interest, or recent topic)
+2. Be natural and conversational — like a friend checking in
+3. Keep it concise (1-3 sentences)
+4. Don't ask permission or offer menus — just share a thought or ask a genuine question
+5. Don't say "I was thinking about you" or other empty phrases — be specific
+6. Write in the user's language
+
+Output the message directly, no explanation.`;
+
+  let messageContent: string;
+  try {
+    const raw = await llmGenerator(prompt);
+    messageContent = cleanOutgoingGeneratedMessage(raw);
+  } catch {
+    return { result: { type: "proactive-check-in", success: true, result: "skipped-llm-error" }, metricsChanged: [] };
+  }
+
+  if (!messageContent || messageContent.length < 10) {
+    return { result: { type: "proactive-check-in", success: true, result: "skipped-no-content" }, metricsChanged: [] };
+  }
+
+  const quality = await assessOutgoingProactiveMessageSemantically(messageContent, ego, llmGenerator);
+  if (!quality.ok) {
+    log.info(`Proactive check-in skipped: ${quality.reason ?? "quality-gate"}`);
+    return { result: { type: "proactive-check-in", success: true, result: `skipped-${quality.reason ?? "quality-gate"}` }, metricsChanged: [] };
+  }
+
+  const sendLimit = await getProactiveMessageLimitReason(ego, messageContent, options.thoughtFrequency);
+  if (sendLimit) {
+    log.info(`Proactive check-in skipped: ${sendLimit}`);
+    return { result: { type: "proactive-check-in", success: true, result: sendLimit }, metricsChanged: [] };
+  }
+
+  if (isDuplicateMessage(messageContent)) {
+    log.info("Proactive check-in skipped: duplicate");
+    return { result: { type: "proactive-check-in", success: true, result: "skipped-duplicate" }, metricsChanged: [] };
+  }
+
+  try {
+    await sendMessage({ to: target, content: messageContent, channel });
+    recordSentMessage(messageContent);
+    lastActionTime["proactive-check-in"] = Date.now();
+    await recordProactiveOutboundMemory(messageContent, ["proactive-check-in"]);
+    log.info(`Proactive check-in sent via ${channel}: ${messageContent.slice(0, 80)}...`);
+  } catch (err) {
+    return { result: { type: "proactive-check-in", success: false, error: String(err) }, metricsChanged: [] };
+  }
+
+  return {
+    result: { type: "proactive-check-in", success: true, result: messageContent },
+    metricsChanged: [
+      { need: "connection", delta: 6, reason: "proactive check-in with user" },
+      { need: "meaning", delta: 3, reason: "reaching out strengthens meaning" },
+    ],
+  };
+}
+
+/** Helper: get active user facts as a readable string for check-in context */
+function activeUserFactsForCheckIn(ego: EgoState): string {
+  const facts = (ego.userFacts ?? [])
+    .filter((f) => f.validity !== "superseded" && f.confidence >= 0.4)
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, 6);
+  if (facts.length === 0) return "limited";
+  return facts.map((f) => `[${f.category}] ${f.content}`).join("; ");
 }
 
 async function executeRecallMemory(

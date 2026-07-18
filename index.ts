@@ -7,6 +7,13 @@ type OpenClawPluginApi = {
   config: Record<string, unknown>;
   on(event: string, handler: (event: PluginEvent, ctx?: PluginContext) => unknown | Promise<unknown>): void;
   registerService(service: { id: string; start: () => Promise<void>; stop: () => Promise<void> }): void;
+  runtime?: {
+    subagent?: {
+      run(params: { sessionKey: string; message: string; deliver?: boolean; timeoutMs?: number }): Promise<{ runId: string }>;
+      waitForRun(params: { runId: string; timeoutMs?: number }): Promise<{ status: "ok" | "error" | "timeout"; error?: string }>;
+      getSessionMessages(params: { sessionKey: string; limit?: number }): Promise<{ messages: Array<{ role: string; content: string }> }>;
+    };
+  };
 };
 import { readFileSync } from "node:fs";
 import { ThoughtService } from "./src/thought-service.js";
@@ -459,7 +466,43 @@ const plugin = {
             })
           : undefined;
 
-      // --- 4. Create and register the thought service ---
+      // --- 4. Subagent runner (full tool chain: exec, write, read, git) ---
+      const subAgentRunner = api.runtime?.subagent
+        ? async (params: { sessionKey: string; message: string; timeoutMs?: number }) => {
+            const sa = api.runtime!.subagent!;
+            log.info(`Spawning subagent: ${params.sessionKey}`);
+            const { runId } = await sa.run({
+              sessionKey: params.sessionKey,
+              message: params.message,
+              deliver: false,
+              timeoutMs: params.timeoutMs,
+            });
+            const result = await sa.waitForRun({ runId, timeoutMs: params.timeoutMs ?? 120_000 });
+            let output = "";
+            try {
+              const { messages } = await sa.getSessionMessages({ sessionKey: params.sessionKey, limit: 5 });
+              output = messages
+                  .filter((m) => m.role === "assistant")
+                  .map((m) => {
+                    // m.content can be a string (legacy) or an array of content blocks
+                    // like [{type:"text", text:"..."}]. Handle both safely.
+                    if (typeof m.content === "string") return m.content;
+                    if (Array.isArray(m.content)) {
+                      return (m.content as Array<{ type?: string; text?: string }>)
+                        .filter((c) => c?.type === "text" && typeof c.text === "string")
+                        .map((c) => c.text!)
+                        .join("\n");
+                    }
+                    return "";
+                  })
+                  .join("\n\n");
+            } catch { /* ignore */ }
+            return { runId, success: result.status === "ok", output, error: result.error };
+          }
+        : undefined;
+      log.info(`subAgentRunner initialized: ${subAgentRunner ? "yes" : "no (api.runtime?.subagent is " + (api.runtime ? "present but no subagent" : "absent") + ")"}`);
+
+      // --- 5. Create and register the thought service ---
       const workspaceFiles = config.workspaceFiles ?? ["SOUL.md", "AGENTS.md", "MEMORY.md", "USER.md"];
       const service = new ThoughtService({
         checkIntervalMs: config.checkIntervalMs ?? 60_000,
@@ -479,6 +522,7 @@ const plugin = {
         cognitionMode: config.cognitionMode ?? "legacy",
         cognitiveTemperament: config.cognitiveTemperament ?? "balanced",
         expressionPolicy: config.expressionPolicy ?? "legacy",
+        subAgentRunner,
       });
       serviceCreated = true;
       serviceConfig = configStr;
@@ -595,8 +639,8 @@ const plugin = {
         // to avoid wasting tokens on short replies like "ok", "收到", "好的".
         // Delay LLM calls by 2 minutes to avoid competing with the agent's
         // response LLM call for gateway/provider resources.
-        if (text.length >= 15) {
-          const delayMs = 2 * 60 * 1000; // 2 minutes
+        if (text.length >= 8) {
+          const delayMs = 30 * 1000; // 30 seconds — faster user understanding
           service.recordInteractionWithText({
             type: "inbound",
             text,
@@ -628,7 +672,7 @@ const plugin = {
           const semanticTimer = setTimeout(() => {
             service.classifyInteractionSemantics(text, messageId || undefined)
               .catch((err) => log.warn(`Background semantic classification failed: ${String(err)}`));
-          }, 2 * 60 * 1000);
+          }, 30 * 1000); // 30s — faster semantic classification
           semanticTimer.unref?.();
         } else {
           service.recordInteraction({ type: "inbound" }).catch((err) =>

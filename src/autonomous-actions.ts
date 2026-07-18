@@ -5,13 +5,15 @@ import { readFile } from "node:fs/promises";
 import { dirname, join, normalize, parse as parsePath, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
+
+function sleep(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)); }
 import { createSoulLogger } from "./logger.js";
 import { IntentionStore, resolveIntentionStorePath } from "./intention/store.js";
 import { WorkHandoffStore, resolveWorkHandoffStorePath } from "./handoff/store.js";
 import { invokeGatewayTool, fireAgentTask, isWriteTool } from "./gateway-client.js";
 import { isGoodTimeForMessage } from "./action-executor.js";
 import type { LLMGenerator } from "./soul-llm.js";
-import type { Thought, EgoState, ActionResult, MetricDelta, AutonomousTask, TaskStep, ActionType } from "./types.js";
+import type { Thought, EgoState, ActionResult, MetricDelta, AutonomousTask, TaskStep, TaskStatus, ActionType } from "./types.js";
 import type { MessageSender } from "./soul-actions.js";
 import { updateEgoStore, resolveEgoStorePath } from "./ego-store.js";
 import { resolveSoulDir } from "./paths.js";
@@ -24,9 +26,14 @@ const MAX_ACTIVE_TASKS = 1;
 
 const PROVIDER_PRESSURE_BACKOFF_MS = 60 * 60 * 1000;
 const PROVIDER_PRESSURE_TAIL_LINES = 80;
-const AUTONOMOUS_AGENT_TIMEOUT_SECONDS = 300;
+const AUTONOMOUS_AGENT_TIMEOUT_SECONDS = 600;
 const AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS = 150;
 const AUTONOMOUS_AGENT_QUICK_CHECK_SECONDS = 60;
+/** Grace period to wait for a subagent that timed out or errored to finish
+ * writing its result file. The subagent may still be running after
+ * waitForRun returns (e.g. due to timeout) and will write the result file
+ * directly via the write tool. */
+const SUBAGENT_GRACE_PERIOD_MS = 30 * 1000;
 const AUTONOMOUS_FAILURE_BACKOFF_MS = 2 * 60 * 60 * 1000;
 const AUTONOMOUS_FAILURE_LOOKBACK_MS = 6 * 60 * 60 * 1000;
 const READABLE_EVIDENCE_EXTENSIONS = [".log", ".txt", ".json", ".csv", ".md", ".yaml", ".yml", ".conf"];
@@ -153,7 +160,21 @@ function isFinalTaskReport(result: string): boolean {
 }
 
 function reportStatusToTaskStatus(result: string): "completed" | "failed" {
-  return taskReportStatus(result) === "completed" ? "completed" : "failed";
+  // "partial" and "blocked" indicate the subagent did useful work but
+  // could not fully complete (timeout, acceptance-criteria-not-met, etc.).
+  // Treat them as "completed" to avoid triggering failure backoff that
+  // would block future subagent-improve tasks for hours.
+  const status = taskReportStatus(result);
+  if (status === "completed" || status === "partial" || status === "blocked") {
+    return "completed";
+  }
+  // No Status: line found. If the report has all required sections and
+  // looks like a complete task report, treat it as completed — the
+  // subagent did the work but simply omitted the "Status:" header.
+  if (status === null && isCompleteTaskReport(result)) {
+    return "completed";
+  }
+  return "failed";
 }
 
 function writeTaskReportFile(resultFilePath: string | undefined, content: string): void {
@@ -212,6 +233,38 @@ function verifyAppliedFix(targetDir: string, fixFile: string): VerificationResul
   if (script) {
     return runCommand(targetDir, "npm", ["run", script], 120_000);
   }
+  // TypeScript projects: if tsconfig.json exists but no matching npm script
+  try {
+    if (statSync(join(targetDir, "tsconfig.json")).isFile()) {
+      return runCommand(targetDir, "npx", ["tsc", "--noEmit"], 120_000);
+    }
+  } catch { /* no tsconfig */ }
+  // Maven projects
+  try {
+    if (statSync(join(targetDir, "pom.xml")).isFile()) {
+      return runCommand(targetDir, "mvn", ["compile", "-q"], 180_000);
+    }
+  } catch { /* no pom.xml */ }
+  // Gradle projects
+  try {
+    if (
+      statSync(join(targetDir, "build.gradle")).isFile()
+      || statSync(join(targetDir, "build.gradle.kts")).isFile()
+    ) {
+      return runCommand(targetDir, "gradle", ["compileJava", "-q"], 180_000);
+    }
+  } catch { /* no build.gradle */ }
+  // Makefile-based projects
+  try {
+    const makefile = join(targetDir, "Makefile");
+    const makefileLower = join(targetDir, "makefile");
+    if (statSync(makefile).isFile() || statSync(makefileLower).isFile()) {
+      // Try 'make check' first, fall back to 'make build'
+      const checkResult = runCommand(targetDir, "make", ["check"], 120_000);
+      if (!/No rule.*check/i.test(checkResult.summary)) return checkResult;
+      return runCommand(targetDir, "make", ["build"], 120_000);
+    }
+  } catch { /* no Makefile */ }
   if (ext === ".py") {
     return runCommand(targetDir, "python", ["-m", "py_compile", fixFile], 60_000);
   }
@@ -453,6 +506,19 @@ function buildDirectTaskReportMessage(tasks: AutonomousTask[], ego: EgoState): s
     : `Autonomous task status:\n${body}`;
 }
 
+export type SubAgentRunResult = {
+  runId: string;
+  success: boolean;
+  output: string;
+  error?: string;
+};
+
+export type SubAgentRunner = (params: {
+  sessionKey: string;
+  message: string;
+  timeoutMs?: number;
+}) => Promise<SubAgentRunResult>;
+
 export type AutonomousActionOptions = {
   autonomousActions: boolean;
   gatewayPort: number;
@@ -463,6 +529,7 @@ export type AutonomousActionOptions = {
   channel?: string;
   target?: string;
   workspaceContext?: string;
+  subAgentRunner?: SubAgentRunner;
 };
 
 function taskContinuityFields(thought: Thought): Pick<AutonomousTask,
@@ -525,6 +592,7 @@ export async function executeAutonomousAction(
     channel: options.channel,
     target: options.target,
     workspaceContext: options.workspaceContext,
+    subAgentRunner: options.subAgentRunner,
   };
 
   switch (actionType) {
@@ -538,6 +606,8 @@ export async function executeAutonomousAction(
       return executeReportFindings(thought, ego, autoOpts);
     case "observe-and-improve":
       return executeObserveAndImprove(thought, ego, autoOpts);
+    case "subagent-improve":
+      return executeSubagentImprove(thought, ego, autoOpts);
     default:
       return { result: { type: actionType, success: false, error: `Unknown autonomous action: ${actionType}` }, metricsChanged: [] };
   }
@@ -1047,44 +1117,42 @@ export async function executeRunAgentTask(
     return { result: { type: "run-agent-task", success: false, error: "Too many active tasks" }, metricsChanged: [] };
   }
 
-  return executeBoundedLocalAgentTask(thought, ego, options);
-
-  if (!options.hooksToken) {
-    return { result: { type: "run-agent-task", success: false, error: "No hooks token configured" }, metricsChanged: [] };
+  // If we have a subagent runtime, use it — full tool chain (exec, write, read, git)
+  if (options.subAgentRunner) {
+    return executeRunAgentTaskViaSubagent(thought, ego, options);
   }
 
+  // Fallback: bounded local inspection (read-only)
+  return executeBoundedLocalAgentTask(thought, ego, options);
+}
+
+async function executeRunAgentTaskViaSubagent(
+  thought: Thought,
+  ego: EgoState,
+  options: AutonomousActionOptions,
+): Promise<{ result: ActionResult; metricsChanged: MetricDelta[] }> {
+  const target = resolveTargetProject(ego, thought, options.workspaceContext);
+  const readOnlyMode = !options.autonomousActions;
+
+  // Backoff checks
   if (hasRecentProviderPressure()) {
     log.info("Skipping run-agent-task: provider pressure seen recently");
     return {
-      result: { type: "run-agent-task", success: false, error: "Provider rate limit/cooldown seen recently; backing off autonomous agent launch" },
+      result: { type: "run-agent-task", success: false, error: "Provider rate limit/cooldown seen recently; backing off" },
       metricsChanged: [],
     };
   }
-
   const failureBackoff = recentAutonomousFailureBackoff(ego);
   if (failureBackoff !== null) {
     const mins = Math.ceil(failureBackoff!.remainingMs / 60_000);
-    log.info(`Skipping run-agent-task: recent low-value autonomous failure (${failureBackoff!.latest?.id ?? "unknown"}), backoff ${mins}m`);
+    log.info(`Skipping run-agent-task: recent failure backoff ${mins}m`);
     return {
-      result: {
-        type: "run-agent-task",
-        success: false,
-        error: `Recent autonomous task failed without a useful result; backing off agent launch for ${mins}m`,
-      },
+      result: { type: "run-agent-task", success: false, error: `Backing off for ${mins}m` },
       metricsChanged: [],
     };
   }
 
-  const activeCount = (ego.activeTasks ?? []).filter((t) => t.status === "in-progress").length;
-  if (activeCount >= MAX_ACTIVE_TASKS) {
-    return { result: { type: "run-agent-task", success: false, error: "Too many active tasks" }, metricsChanged: [] };
-  }
-
-  return executeBoundedLocalAgentTask(thought, ego, options);
-
-  const target = resolveTargetProject(ego, thought, options.workspaceContext);
-  // Build a detailed prompt for the agent. This is the closest path to the
-  // user's normal "ask OpenClaw to do it" flow, so preserve rich context.
+  // Build context
   const userContext = ego.userFacts.slice(0, 5).map((f) => `[${f.category}] ${f.content}`).join("\n");
   const recentUserMessages = (ego.recentUserMessages ?? [])
     .slice(-5)
@@ -1095,11 +1163,9 @@ export async function executeRunAgentTask(
     .slice(0, 5)
     .map((g) => `- ${g.title}: ${g.description} (${g.progress.toFixed(0)}%)`)
     .join("\n");
-  const readOnlyInstruction = !options.autonomousActions
-    ? "\n\nIMPORTANT: You are in READ-ONLY mode. Only READ files and RUN diagnostic commands (cat, grep, tail, ls, etc.). Do NOT edit, write, or modify any files."
+  const readOnlyInstruction = readOnlyMode
+    ? "\n\nIMPORTANT: You are in READ-ONLY mode. Only READ files and RUN diagnostic commands. Do NOT edit, write, or modify any files."
     : "";
-
-  // Pull analysis result from the latest completed task for fix context
   const latestAnalysis = (ego.activeTasks ?? [])
     .filter((t) => t.status === "completed" && t.result && !t.resultDelivered)
     .slice(-1)[0];
@@ -1107,7 +1173,6 @@ export async function executeRunAgentTask(
     ? `\n\n**Previous analysis result** (use this to implement the fix):\n${latestAnalysis.result?.slice(0, 1000)}`
     : "";
 
-  // Create task first to get ID for result file path
   const taskId = randomBytes(4).toString("hex");
   const resultDir = join(resolveSoulDir(), "results");
   mkdirSync(resultDir, { recursive: true });
@@ -1118,12 +1183,10 @@ ${thought.content}
 
 **IMPORTANT**: This is an AUTONOMOUS task. No one will reply to you. Do NOT ask for confirmation or permission — start working immediately.
 
-You have a hard ${AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS}s work budget. Write the report skeleton immediately, do one bounded iteration, then stop and finalize the report.
-First spend at most ${AUTONOMOUS_AGENT_QUICK_CHECK_SECONDS}s on a quick check: inspect existing recent result files/logs and identify one command that should finish quickly. If you cannot find a command that should finish within ${AUTONOMOUS_AGENT_QUICK_CHECK_SECONDS}s, do not create new scripts or start experiments; write Status: blocked with the exact reason.
-Do not start broad sweeps, parameter sweeps, smooth sweeps, long grid searches, open-ended research, multi-phase experiments, or newly generated backtest harnesses.
+You have a hard ${AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS}s work budget. Do one bounded iteration, then stop and finalize.
 
 Context:
-- Target project: ${target.isSelf ? "not explicitly specified; inspect the current workspace or relevant project context" : `${target.dir} (${target.name})`}
+- Target project: ${target.isSelf ? "not explicitly specified; inspect the current workspace" : `${target.dir} (${target.name})`}
 - User profile: ${userContext || "limited"}
 - Recent user messages:
 ${recentUserMessages || "none"}
@@ -1132,41 +1195,23 @@ ${activeGoals || "none"}
 - Trigger: ${thought.triggerDetail}${readOnlyInstruction}${analysisContext}${options.workspaceContext ? `\n- Workspace rules:\n${options.workspaceContext}` : ""}
 
 Work like the main OpenClaw agent would when the user directly asks for an improvement:
-- First switch to the target project if one is specified. Do not optimize the Soul plugin itself unless the target is explicitly Soul or no project target exists.
-- Inspect only the most relevant code, scripts, docs, recent logs, and existing patterns needed for one decision.
-- Choose exactly ONE concrete, high-value iteration that can finish within this run. Prefer reading existing result artifacts or running an existing quick command over creating new code.
-- If the project is a backtest, trading, ML, benchmark, or strategy project, do not run any parameter/smooth/grid sweep in the background. Run only one existing smoke/evaluation command if it is likely to finish within ${AUTONOMOUS_AGENT_QUICK_CHECK_SECONDS}s. If a full evaluation cannot finish inside that quick-check budget, read existing result artifacts and report a partial/blocked finding instead of launching a new experiment.
-- If you have write access and the fix or experiment is clear, edit the files directly.
-- Run only the most relevant verification command available in the repo, and only if it should finish quickly. Before any command that might run longer than 30 seconds, write Status: partial with the command you are about to try and what evidence already exists.
-- Do not create a new large strategy/backtest script unless you have already completed a quick baseline and know the verification command will finish inside the remaining budget.
+- Inspect only the most relevant code, scripts, docs, recent logs.
+- Choose exactly ONE concrete, high-value iteration that can finish within this run.
+- If you have write access and the fix is clear, edit the files directly.
+- Run the most relevant verification command (build, test, typecheck) if available.
 - Do not ask for confirmation, do not stop at a proposal, and do not invent results.
 
-**CRITICAL REPORT PROTOCOL**
-Immediately update this exact file with a first line of "Status: in-progress" before doing expensive work:
-${resultFilePath}
-Before the work budget expires, overwrite that same file with the final report. The first line must be exactly one of:
-- Status: completed
-- Status: failed
-- Status: blocked
-- Status: partial
-
-Use this exact structure and keep it substantial. A task is not done until this file contains a final status and these sections:
+Write your final report as markdown with these sections:
 ## Outcome
-What you investigated and the final result. Include whether this was completed, partial, blocked, or failed.
-
+What you investigated and the final result.
 ## Changes
 Files changed and why. If no files changed, say why.
-
 ## Verification
-Commands run and their results. If you could not verify, explain the blocker.
-
+Commands run and their results.
 ## Metrics
-For optimization/backtest work, include before/after metrics and comparison to the user's target if available. If metrics are not applicable, say so.
-
+Before/after metrics if applicable.
 ## Next
-Any remaining risk or a sensible next improvement.
-
-If you hit a blocker, timeout risk, provider issue, missing dependency, or a long-running command, stop the command if possible and write Status: blocked or Status: partial with the exact blocker, commands attempted, files touched, and any partial metrics.`;
+Remaining risk or a sensible next improvement.`;
 
   const task: AutonomousTask = {
     id: taskId,
@@ -1177,7 +1222,7 @@ If you hit a blocker, timeout risk, provider issue, missing dependency, or a lon
     updatedAt: Date.now(),
     sourceThoughtId: thought.id,
     ...taskContinuityFields(thought),
-    steps: [{ id: randomBytes(4).toString("hex"), timestamp: Date.now(), action: "fire-agent", input: agentMessage.slice(0, 200), success: true }],
+    steps: [{ id: randomBytes(4).toString("hex"), timestamp: Date.now(), action: "spawn-subagent", input: agentMessage.slice(0, 200), success: true }],
     resultFilePath,
     requiresWritePermission: options.autonomousActions,
     resultDelivered: false,
@@ -1189,59 +1234,96 @@ If you hit a blocker, timeout risk, provider issue, missing dependency, or a lon
     target: target.isSelf ? target.name : `${target.name} at ${target.dir}`,
     resultFilePath,
   }));
-
   await persistTask(task);
 
-  const fireResult = await fireAgentTask({
-    message: agentMessage,
-    gatewayPort: options.gatewayPort,
-    hooksToken: options.hooksToken ?? "",
-    timeoutSeconds: AUTONOMOUS_AGENT_TIMEOUT_SECONDS,
+  const sessionKey = `agent:main:subagent:soul-task-${taskId}`;
+  const timeoutMs = AUTONOMOUS_AGENT_TIMEOUT_SECONDS * 1000;
+
+  log.info(`Spawning subagent for run-agent-task ${taskId}: ${target.dir} (${target.name})`);
+
+  let subResult: SubAgentRunResult;
+  try {
+    subResult = await options.subAgentRunner!({
+      sessionKey,
+      message: agentMessage,
+      timeoutMs,
+    });
+  } catch (err) {
+    subResult = { runId: "", success: false, output: "", error: String(err) };
+  }
+
+  // Read what the subagent wrote to the result file (it may have updated it),
+  // otherwise use the subagent output directly.
+  // When the subagent timed out or errored, wait a grace period for the
+  // subagent to finish writing its result — the subagent may still be
+  // running after waitForRun returns, and it will write the result file
+  // directly via the write tool. Overwriting the file prematurely with
+  // subResult.output would clobber the real result.
+  if (!subResult.success) {
+    await sleep(SUBAGENT_GRACE_PERIOD_MS);
+  }
+  let report: string;
+  try {
+    const fileContent = readFileSync(resultFilePath, "utf-8");
+    // If the file still only contains the initial report skeleton, use subagent output
+    if (fileContent.startsWith("Status: in-progress") || fileContent.length < 200) {
+      if (subResult.success) {
+        report = subResult.output;
+      } else {
+        // Subagent timed out or errored and hasn't written a final report yet.
+        // Write "partial" instead of "failed" so the subagent's eventual write
+        // (if it finishes later) is the canonical result.
+        report = `Status: partial\n\n## Outcome\nSubagent did not finish within the timeout. ${subResult.error || subResult.output || "No output"}`;
+      }
+      writeTaskReportFile(resultFilePath, report);
+    } else {
+      report = fileContent;
+    }
+  } catch {
+    report = subResult.success ? subResult.output : `Status: failed\n\n## Outcome\n${subResult.error || subResult.output || "Subagent failed with no output"}`;
+    writeTaskReportFile(resultFilePath, report);
+  }
+
+  // Determine task status from the report's Status: line.
+  // "completed" → completed; "partial"/"blocked" → also completed (did useful work,
+  //   should NOT trigger failure backoff); everything else → failed.
+  const taskStatus: TaskStatus = reportStatusToTaskStatus(report);
+
+  await updateEgoStore(resolveEgoStorePath(), (e) => {
+    const t = (e.activeTasks ?? []).find((at) => at.id === taskId);
+    if (t) {
+      t.status = taskStatus;
+      t.result = report;
+      t.completedAt = Date.now();
+      t.updatedAt = Date.now();
+      t.resultDelivered = false;
+    }
+    if (latestAnalysis) {
+      const analysisTask = (e.activeTasks ?? []).find((at) => at.id === latestAnalysis.id);
+      if (analysisTask) {
+        analysisTask.resultDelivered = true;
+        analysisTask.updatedAt = Date.now();
+      }
+    }
+    return e;
   });
 
-  if (!fireResult.ok) {
-    await updateEgoStore(resolveEgoStorePath(), (e) => {
-      const t = (e.activeTasks ?? []).find((at) => at.id === taskId);
-      if (t) {
-        const report = buildFailureTaskReport(t, `Failed to start autonomous agent task: ${fireResult.error}`);
-        t.status = "failed";
-        t.result = report;
-        t.completedAt = Date.now();
-        t.updatedAt = Date.now();
-        t.resultDelivered = false;
-        writeTaskReportFile(t.resultFilePath, report);
-      }
-      return e;
-    });
-    return {
-      result: { type: "run-agent-task", success: false, error: fireResult.error },
-      metricsChanged: [],
-    };
-  }
-
-  if (latestAnalysis) {
-    await updateEgoStore(resolveEgoStorePath(), (e) => {
-      const t = (e.activeTasks ?? []).find((at) => at.id === latestAnalysis.id);
-      if (t) {
-        t.resultDelivered = true;
-        t.updatedAt = Date.now();
-      }
-      return e;
-    });
-  }
-
-  log.info(`Fired agent task ${task.id}, runId=${fireResult.runId}`);
+  // Success if the report indicates a terminal state (completed/partial/blocked),
+  // regardless of whether subResult.success was false (e.g. timeout — the subagent
+  // may have finished writing during the grace period).
+  const success = taskStatus === "completed" || subResult.success;
+  log.info(`Subagent run-agent-task ${taskId}: status=${taskStatus}, success=${success}`);
 
   return {
     result: {
       type: "run-agent-task",
-      success: true,
-      result: `Agent task started, runId=${fireResult.runId}`,
-      data: { taskId: task.id, runId: fireResult.runId },
+      success,
+      result: report.slice(0, 500),
+      data: { taskId, resultFilePath, status: taskStatus, runId: subResult.runId },
     },
     metricsChanged: [
-      { need: "growth", delta: 8, reason: "delegated work to agent" },
-      { need: "meaning", delta: 5, reason: "taking initiative" },
+      { need: "growth", delta: success ? 10 : 3, reason: success ? "completed autonomous task via subagent" : "subagent task did not fully complete" },
+      { need: "meaning", delta: success ? 5 : 2, reason: "reported verifiable autonomous task status" },
     ],
   };
 }
@@ -1495,33 +1577,83 @@ type ImprovementProposal = {
 
 function extractJsonObject(text: string): string | null {
   const stripped = text.trim()
+    .replace(/<think[\s\S]*?<\/think>/gi, "")
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/```\s*$/i, "")
     .trim();
   const start = stripped.indexOf("{");
   const end = stripped.lastIndexOf("}");
-  return start >= 0 && end > start ? stripped.slice(start, end + 1) : null;
+  if (start < 0 || end <= start) return null;
+  let raw = stripped.slice(start, end + 1);
+
+  // Strip JavaScript-style comments (// line comments and /* block comments */)
+  raw = raw
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1")
+    .trim();
+
+  // Remove trailing commas before } or ] (common LLM mistake)
+  raw = raw.replace(/,\s*([\]}])/g, "$1");
+
+  return raw;
 }
 
+/**
+ * Attempt to parse a JSON object from LLM output, tolerating common LLM
+ * formatting mistakes: markdown fences, trailing commas, comments, and
+ * leading prose before the JSON block.
+ */
 function parseImprovementProposal(text: string): { proposal?: ImprovementProposal; error?: string } {
   const jsonText = extractJsonObject(text);
   if (!jsonText) return { error: "No JSON object found in LLM response" };
 
-  try {
-    const parsed = JSON.parse(jsonText) as Partial<Record<keyof ImprovementProposal, unknown>>;
-    const proposal: ImprovementProposal = {
-      problem: typeof parsed.problem === "string" ? parsed.problem : "",
-      file: typeof parsed.file === "string" ? parsed.file : "",
-      oldCode: typeof parsed.oldCode === "string" ? parsed.oldCode : "",
-      newCode: typeof parsed.newCode === "string" ? parsed.newCode : "",
-      explanation: typeof parsed.explanation === "string" ? parsed.explanation : "",
-    };
-    if (proposal.file && (proposal.oldCode || proposal.newCode)) return { proposal };
-    if (!proposal.oldCode && !proposal.newCode) return { proposal };
-    return { error: "Improvement proposal is missing required string fields" };
-  } catch (err) {
-    return { error: `Invalid JSON from LLM response: ${String(err)}` };
+  const tryParse = (s: string): Record<string, unknown> | null => {
+    try { return JSON.parse(s) as Record<string, unknown>; } catch { return null; }
+  };
+
+  let parsed = tryParse(jsonText);
+
+  // Fallback 1: try to fix unquoted keys (e.g. {problem: "..."} → {"problem": "..."})
+  if (!parsed) {
+    const fixed = jsonText.replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":');
+    parsed = tryParse(fixed);
   }
+
+  // Fallback 2: try to fix single-quoted values → double-quoted
+  if (!parsed) {
+    const fixed = jsonText.replace(/'([^']*)'/g, '"$1"');
+    parsed = tryParse(fixed);
+  }
+
+  // Fallback 3: extract key-value pairs via regex (last resort)
+  if (!parsed) {
+    const extract = (key: string): string => {
+      const m = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`, "i").exec(jsonText);
+      return m ? m[1].replace(/\\(.)/g, "$1") : "";
+    };
+    const proposal: ImprovementProposal = {
+      problem: extract("problem"),
+      file: extract("file"),
+      oldCode: extract("oldCode"),
+      newCode: extract("newCode"),
+      explanation: extract("explanation"),
+    };
+    if (proposal.file || proposal.oldCode || proposal.newCode) {
+      return { proposal };
+    }
+    return { error: `Invalid JSON from LLM response: unable to parse after all fallbacks` };
+  }
+
+  const proposal: ImprovementProposal = {
+    problem: typeof parsed.problem === "string" ? parsed.problem : "",
+    file: typeof parsed.file === "string" ? parsed.file : "",
+    oldCode: typeof parsed.oldCode === "string" ? parsed.oldCode : "",
+    newCode: typeof parsed.newCode === "string" ? parsed.newCode : "",
+    explanation: typeof parsed.explanation === "string" ? parsed.explanation : "",
+  };
+  if (proposal.file && (proposal.oldCode || proposal.newCode)) return { proposal };
+  if (!proposal.oldCode && !proposal.newCode) return { proposal };
+  return { error: "Improvement proposal is missing required string fields" };
 }
 
 /**
@@ -2028,8 +2160,40 @@ Rules:
           const fullPath = `${target.dir}/${fixFile}`;
           const content = await readFile(fullPath, "utf-8");
 
-          if (content.includes(oldCode)) {
-            const newContent = content.replace(oldCode, newCode);
+          // Try exact match first, then fall back to whitespace-normalized match.
+          // LLMs often return oldCode with slightly different indentation or
+          // line endings (tabs vs spaces, trailing whitespace, CRLF vs LF).
+          const applyPatch = (original: string, old: string, repl: string): string | null => {
+            if (original.includes(old)) return original.replace(old, repl);
+            // Normalize: collapse runs of whitespace to single spaces for matching
+            const normalizeWs = (s: string) => s.replace(/\r\n/g, "\n").replace(/[ \t]+/g, " ").replace(/^ +/gm, "").replace(/ +$/gm, "");
+            const normOriginal = normalizeWs(original);
+            const normOld = normalizeWs(old);
+            if (normOriginal.includes(normOld)) {
+              // Find the actual span in the original that corresponds to the normalized match
+              const startIdx = normOriginal.indexOf(normOld);
+              // Map normalized indices back to original indices
+              let origIdx = 0, normIdx = 0;
+              while (normIdx < startIdx && origIdx < original.length) {
+                if (normalizeWs(original[origIdx]) === normOriginal[normIdx]) {
+                  normIdx++;
+                }
+                origIdx++;
+              }
+              const origStart = origIdx;
+              while (normIdx < startIdx + normOld.length && origIdx < original.length) {
+                if (normalizeWs(original[origIdx]) === normOriginal[normIdx]) {
+                  normIdx++;
+                }
+                origIdx++;
+              }
+              const origEnd = origIdx;
+              return original.slice(0, origStart) + repl + original.slice(origEnd);
+            }
+            return null;
+          };
+          const newContent = applyPatch(content, oldCode, newCode);
+          if (newContent !== null) {
             writeFileSync(fullPath, newContent, "utf-8");
 
             const verification = verifyAppliedFix(target.dir, fixFile);
@@ -2161,6 +2325,271 @@ ${nextText}`;
           { need: "meaning", delta: fixApplied ? 15 : 8, reason: readOnlyMode ? "observing self-improvement opportunities" : "working on user's assigned goal" },
         ]
       : [],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// executeSubagentImprove — full tool-chain improvement via subagent runtime
+// ---------------------------------------------------------------------------
+//
+// This action combines observe-and-improve's focused analysis approach with
+// run-agent-task's subagent runtime delegation. The subagent is a full
+// OpenClaw agent with exec, write, read, and git tools — giving it both
+// write permissions AND full tool-chain access (compile, test, etc.).
+//
+// Unlike observe-and-improve which uses local LLM + spawnSync for verification
+// (limited to npm scripts / python / node --check), this action delegates the
+// entire analyze → patch → verify cycle to the subagent, which can run
+// arbitrary commands through its exec tool.
+//
+// Unlike run-agent-task which gives the subagent a generic task message,
+// this action provides a focused improvement prompt that asks for exactly
+// one concrete fix with verification — combining the best of both paths.
+
+export async function executeSubagentImprove(
+  thought: Thought,
+  ego: EgoState,
+  options: AutonomousActionOptions,
+): Promise<{ result: ActionResult; metricsChanged: MetricDelta[] }> {
+  // Require subagent runtime
+  if (!options.subAgentRunner) {
+    return {
+      result: { type: "subagent-improve", success: false, error: "No subagent runtime available — subagent-improve requires api.runtime.subagent" },
+      metricsChanged: [],
+    };
+  }
+
+  // Backoff checks
+  if (hasRecentProviderPressure()) {
+    log.info("Skipping subagent-improve: provider pressure seen recently");
+    return {
+      result: { type: "subagent-improve", success: false, error: "Provider rate limit/cooldown seen recently; backing off" },
+      metricsChanged: [],
+    };
+  }
+  const failureBackoff = recentAutonomousFailureBackoff(ego);
+  if (failureBackoff !== null) {
+    const mins = Math.ceil(failureBackoff!.remainingMs / 60_000);
+    log.info(`Skipping subagent-improve: recent failure backoff ${mins}m`);
+    return {
+      result: { type: "subagent-improve", success: false, error: `Backing off for ${mins}m` },
+      metricsChanged: [],
+    };
+  }
+
+  const target = resolveTargetProject(ego, thought, options.workspaceContext);
+  if (target.resolutionError) {
+    return {
+      result: { type: "subagent-improve", success: false, error: target.resolutionError },
+      metricsChanged: [],
+    };
+  }
+
+  // Only 1 concurrent improvement task
+  const activeImprove = (ego.activeTasks ?? []).filter(
+    (t) => t.status === "in-progress" && t.title?.toLowerCase().includes("improvement"),
+  ).length;
+  if (activeImprove >= 1) {
+    return { result: { type: "subagent-improve", success: false, error: "Improvement task already running" }, metricsChanged: [] };
+  }
+
+  const reportZh = wantsChineseReport(ego);
+  const readOnlyMode = !options.autonomousActions;
+
+  // Build context
+  const userContext = ego.userFacts.slice(0, 5).map((f) => `[${f.category}] ${f.content}`).join("\n");
+  const recentUserMessages = (ego.recentUserMessages ?? [])
+    .slice(-5)
+    .map((m, i) => `${i + 1}. ${m.slice(0, 240)}`)
+    .join("\n");
+  const activeGoals = ego.goals
+    .filter((g) => g.status === "active")
+    .slice(0, 5)
+    .map((g) => `- ${g.title}: ${g.description} (${g.progress.toFixed(0)}%)`)
+    .join("\n");
+
+  // Recent analysis context
+  const recentAnalyses = (ego.activeTasks ?? [])
+    .filter((t) => t.status === "completed" && t.result && t.id !== undefined)
+    .slice(-2)
+    .map((t) => t.result)
+    .join("\n\n");
+
+  // Project context
+  const projectContext = (ego.projectContexts ?? []).find((context) =>
+    context.root.toLowerCase() === target.dir.toLowerCase());
+  const projectContinuityText = projectContext
+    ? `**Host-agent project continuity**:
+- Last observed: ${new Date(projectContext.lastObservedAt).toISOString()}
+- Recently modified files: ${projectContext.modifiedFiles.join(", ") || "none recorded"}
+- Recently observed files: ${projectContext.observedFiles.join(", ") || "none recorded"}
+- Verification commands already used: ${projectContext.verificationCommands.join(" | ") || "none recorded"}`
+    : "";
+
+  const handoffText = typeof thought.actionParams?.workHandoffId === "string"
+    ? `**Durable work handoff**:
+- Handoff: ${thought.actionParams.workHandoffId}
+- Intention: ${thought.actionParams.intentionId ?? "unknown"}
+- Objective: ${String(thought.actionParams.objective ?? thought.motivation)}
+- Prior phase: ${String(thought.actionParams.priorWorkPhase ?? "unknown")}
+- Acceptance criteria: ${Array.isArray(thought.actionParams.acceptanceCriteria) ? thought.actionParams.acceptanceCriteria.join("; ") : "not recorded"}
+- Prior modified files: ${Array.isArray(thought.actionParams.priorModifiedFiles) ? thought.actionParams.priorModifiedFiles.join(", ") : "none recorded"}
+- Prior verification: ${Array.isArray(thought.actionParams.priorVerificationCommands) ? thought.actionParams.priorVerificationCommands.join(" | ") : "none recorded"}
+- Prior failed tools: ${Array.isArray(thought.actionParams.priorFailedTools) ? thought.actionParams.priorFailedTools.join(", ") : "none"}`
+    : "";
+
+  const taskId = randomBytes(4).toString("hex");
+  const resultDir = join(resolveSoulDir(), "results");
+  mkdirSync(resultDir, { recursive: true });
+  const resultFilePath = join(resultDir, `${taskId}.md`);
+
+  const readOnlyInstruction = readOnlyMode
+    ? "\n\nIMPORTANT: You are in READ-ONLY mode. Only READ files and RUN diagnostic commands. Do NOT edit, write, or modify any files."
+    : "";
+
+  const projectDesc = target.isSelf
+    ? "This is the Soul plugin itself — an autonomous AI agent with ego, thoughts, and actions."
+    : `This is project at ${target.dir}.`;
+
+  const agentMessage = `[Soul Autonomous Improvement Task]
+${thought.content}
+
+**IMPORTANT**: This is an AUTONOMOUS task. No one will reply to you. Do NOT ask for confirmation or permission — start working immediately.
+
+You have a hard ${AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS}s work budget. Do one bounded iteration, then stop and finalize.
+
+Context:
+- Target project: ${target.isSelf ? "not explicitly specified; inspect the current workspace" : `${target.dir} (${target.name})`}
+- ${projectDesc}
+- User profile: ${userContext || "limited"}
+- Recent user messages:
+${recentUserMessages || "none"}
+- Active goals:
+${activeGoals || "none"}
+- Trigger: ${thought.triggerDetail}${readOnlyInstruction}
+${projectContinuityText ? `- ${projectContinuityText}` : ""}
+${handoffText ? `- ${handoffText}` : ""}
+${options.workspaceContext ? `- Workspace rules:\n${options.workspaceContext}` : ""}
+
+**Previous findings**:
+${recentAnalyses || "None."}
+
+Work like the main OpenClaw agent would when the user directly asks for a focused improvement:
+1. Inspect only the most relevant source files, scripts, and recent logs.
+2. Identify exactly ONE concrete, high-value improvement that can finish within this run.
+3. ${readOnlyMode ? "Propose the fix with exact oldCode/newCode, but do NOT write any files." : "Apply the fix directly by editing the file(s)."}
+4. Run the most relevant verification command (build, test, typecheck, compile) to confirm the fix works.
+5. If verification fails, revert the change and report the failure.
+6. Do not ask for confirmation, do not stop at a proposal, and do not invent results.
+
+Write your final report as markdown with these sections:
+## Outcome
+What you investigated and the final result.
+## Changes
+Files changed and why. If no files changed, say why.
+## Verification
+Commands run and their results.
+## Metrics
+Before/after metrics if applicable.
+## Next
+Remaining risk or a sensible next improvement.`;
+
+  const task: AutonomousTask = {
+    id: taskId,
+    title: `Subagent improvement: ${target.name}`,
+    description: `Full tool-chain improvement for ${target.dir}`,
+    status: "in-progress",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    sourceThoughtId: thought.id,
+    ...taskContinuityFields(thought),
+    steps: [{ id: randomBytes(4).toString("hex"), timestamp: Date.now(), action: "spawn-subagent-improve", input: agentMessage.slice(0, 200), success: true }],
+    resultFilePath,
+    requiresWritePermission: options.autonomousActions,
+    resultDelivered: false,
+  };
+
+  writeTaskReportFile(resultFilePath, buildInitialTaskReport({
+    taskId,
+    title: task.title,
+    target: target.isSelf ? target.name : `${target.name} at ${target.dir}`,
+    resultFilePath,
+  }));
+  await persistTask(task);
+
+  const sessionKey = `agent:main:subagent:soul-improve-${taskId}`;
+  const timeoutMs = AUTONOMOUS_AGENT_TIMEOUT_SECONDS * 1000;
+
+  log.info(`Spawning subagent for subagent-improve ${taskId}: ${target.dir} (${target.name})`);
+
+  let subResult: SubAgentRunResult;
+  try {
+    subResult = await options.subAgentRunner!({
+      sessionKey,
+      message: agentMessage,
+      timeoutMs,
+    });
+  } catch (err) {
+    subResult = { runId: "", success: false, output: "", error: String(err) };
+  }
+
+  // Read what the subagent wrote to the result file, otherwise use subagent output
+  // Same grace period logic as executeRunAgentTaskViaSubagent above.
+  if (!subResult.success) {
+    await sleep(SUBAGENT_GRACE_PERIOD_MS);
+  }
+  let report: string;
+  try {
+    const fileContent = readFileSync(resultFilePath, "utf-8");
+    if (fileContent.startsWith("Status: in-progress") || fileContent.length < 200) {
+      if (subResult.success) {
+        report = subResult.output;
+      } else {
+        report = `Status: partial\n\n## Outcome\nSubagent did not finish within the timeout. ${subResult.error || subResult.output || "No output"}`;
+      }
+      writeTaskReportFile(resultFilePath, report);
+    } else {
+      report = fileContent;
+    }
+  } catch {
+    report = subResult.success ? subResult.output : `Status: failed\n\n## Outcome\n${subResult.error || subResult.output || "Subagent failed with no output"}`;
+    writeTaskReportFile(resultFilePath, report);
+  }
+
+  // Determine task status from the report's Status: line.
+  // "completed" → completed; "partial"/"blocked" → also completed (did useful work,
+  //   should NOT trigger failure backoff); everything else → failed.
+  const taskStatus: TaskStatus = reportStatusToTaskStatus(report);
+
+  await updateEgoStore(resolveEgoStorePath(), (e) => {
+    const t = (e.activeTasks ?? []).find((at) => at.id === taskId);
+    if (t) {
+      t.status = taskStatus;
+      t.result = report;
+      t.completedAt = Date.now();
+      t.updatedAt = Date.now();
+      t.resultDelivered = false;
+    }
+    return e;
+  });
+
+  // Success if the report indicates a terminal state (completed/partial/blocked),
+  // regardless of whether subResult.success was false (e.g. timeout — the subagent
+  // may have finished writing during the grace period).
+  const success = taskStatus === "completed" || subResult.success;
+  log.info(`Subagent-improve ${taskId}: status=${taskStatus}, success=${success}`);
+
+  return {
+    result: {
+      type: "subagent-improve",
+      success,
+      result: report.slice(0, 500),
+      data: { taskId, resultFilePath, status: taskStatus, runId: subResult.runId, fixApplied: success, readOnly: readOnlyMode },
+    },
+    metricsChanged: [
+      { need: "growth", delta: success ? 20 : 3, reason: success ? "completed subagent improvement with full tool-chain verification" : "subagent improvement did not fully complete" },
+      { need: "meaning", delta: success ? 10 : 2, reason: "reported verifiable autonomous improvement with tool-chain verification" },
+    ],
   };
 }
 
@@ -2421,7 +2850,7 @@ async function persistTask(task: AutonomousTask): Promise<void> {
  * Returns list of newly completed tasks (with results from file capture).
  */
 export async function pollActiveTasks(storePath: string): Promise<AutonomousTask[]> {
-  const STALE_MS = 8 * 60 * 1000; // hooks/agent times out at 5 minutes; leave a small settle window
+  const STALE_MS = (AUTONOMOUS_AGENT_TIMEOUT_SECONDS + 120) * 1000; // subagent timeout + 2min grace; must exceed AUTONOMOUS_AGENT_TIMEOUT_SECONDS
   const MAX_TASKS = 20;
   const newlyCompleted: AutonomousTask[] = [];
 

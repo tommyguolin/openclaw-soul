@@ -68,11 +68,12 @@ test("LLM lane budgets reserve capacity for actions and critical memory extracti
     llmBackoffUntil: number;
   };
   const internals = service as unknown as BudgetInternals;
-  for (let index = 0; index < 8; index += 1) {
+  // thoughtFrequency defaults to 1 → thought lane limit = 14
+  for (let index = 0; index < 14; index += 1) {
     assert.equal(internals.reserveLLMCallBudget("thought"), true);
   }
   assert.equal(internals.reserveLLMCallBudget("thought"), false);
-  for (let index = 0; index < 10; index += 1) assert.equal(internals.reserveLLMCallBudget("action"), true);
+  for (let index = 0; index < 12; index += 1) assert.equal(internals.reserveLLMCallBudget("action"), true);
   assert.equal(internals.reserveLLMCallBudget("critical"), true);
   assert.equal(internals.reserveLLMCallBudget("critical"), true);
   assert.equal(internals.llmBackoffUntil, 0);
@@ -149,7 +150,7 @@ test("startup greeting hides Soul's internal default goals", () => {
   assert.match(internals.buildStartupFocusLine(ego, "zh"), /完成 Soul 项目优化/);
 });
 
-test("active inbound conversation defers the Soul background cycle for five minutes", async () => {
+test("active inbound conversation defers the Soul background cycle for two minutes", async () => {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-conversation-quiet-"));
   try {
     const storePath = path.join(directory, "ego.json");
@@ -162,13 +163,13 @@ test("active inbound conversation defers the Soul background cycle for five minu
     });
     type QuietInternals = { activeConversationQuietRemainingMs(now?: number): Promise<number> };
     const remaining = await (service as unknown as QuietInternals).activeConversationQuietRemainingMs();
-    assert(remaining > 4 * 60 * 1000);
-    assert(remaining <= 5 * 60 * 1000);
+    assert(remaining > 90 * 1000);
+    assert(remaining <= 2 * 60 * 1000);
 
     const ego = await service.getEgoState();
     const inbound = ego.memories.find((memory) => memory.sourceMessageId === "quiet-1");
     assert(inbound);
-    const afterWindow = inbound.timestamp + 5 * 60 * 1000 + 1;
+    const afterWindow = inbound.timestamp + 2 * 60 * 1000 + 1;
     assert.equal(
       await (service as unknown as QuietInternals).activeConversationQuietRemainingMs(afterWindow),
       0,

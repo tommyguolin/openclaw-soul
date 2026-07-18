@@ -7,6 +7,7 @@ import {
   isGoodTimeForMessage,
 } from "./action-executor.js";
 import type { ActionExecutorOptions } from "./action-executor.js";
+import type { SubAgentRunner } from "./autonomous-actions.js";
 import { expirePending } from "./behavior-log.js";
 import type { MessageSender } from "./soul-actions.js";
 import {
@@ -100,7 +101,7 @@ import { buildUserLanguageInstruction, supportsLocalMessageTemplate } from "./la
 
 const log = createSoulLogger("thought-service");
 type LLMBudgetLane = "critical" | "action" | "thought" | "shadow";
-const ACTIVE_CONVERSATION_QUIET_MS = 5 * 60 * 1000;
+const ACTIVE_CONVERSATION_QUIET_MS = 2 * 60 * 1000;
 
 function isExplicitResolution(text: string): boolean {
   return /(?:已经|早已|昨天.*(?:连上|成功)|连接成功|可以访问|能够访问|已解决|修复好了|不再有问题|authenticated|connected successfully|works now|already (?:works|connected)|resolved|fixed)/i.test(text);
@@ -321,6 +322,8 @@ export type ThoughtServiceOptions = {
   cognitiveTemperament?: CognitiveTemperament;
   /** Expression feedback policy. Disabled by default and independent of cognition. */
   expressionPolicy?: ExpressionPolicyMode;
+  /** Subagent runner for autonomous task delegation (full tool chain) */
+  subAgentRunner?: SubAgentRunner;
 };
 
 export class ThoughtService {
@@ -344,6 +347,7 @@ export class ThoughtService {
   private gatewayPort: number;
   private authToken?: string;
   private hooksToken?: string;
+  private subAgentRunner?: SubAgentRunner;
   private workspaceContext: string;
   private workspaceFiles: string[];
   private thoughtFrequency: number;
@@ -410,6 +414,7 @@ export class ThoughtService {
     this.gatewayPort = options.gatewayPort ?? 18789;
     this.authToken = options.authToken;
     this.hooksToken = options.hooksToken;
+    this.subAgentRunner = options.subAgentRunner;
     this.workspaceContext = options.workspaceContext ?? "";
     this.workspaceFiles = options.workspaceFiles ?? ["SOUL.md", "AGENTS.md", "MEMORY.md", "USER.md"];
     this.thoughtFrequency = Math.max(0.1, Math.min(5, options.thoughtFrequency ?? 1.0));
@@ -923,8 +928,8 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
       };
     }
     return {
-      laneLimits: { critical: 16, action: 10, thought: 8, shadow: 4 },
-      globalLimit: 32,
+      laneLimits: { critical: 16, action: 12, thought: 14, shadow: 6 },
+      globalLimit: 44,
     };
   }
 
@@ -981,6 +986,7 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
       || action === "invoke-tool"
       || action === "run-agent-task"
       || action === "observe-and-improve"
+      || action === "subagent-improve"
       || action === "report-findings"
       || action === "search-web"
       || action === "proactive-research"
@@ -1297,7 +1303,7 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
       },
     });
     await targetPool.recordObservation(false);
-    const eligible = experimental ? (await targetPool.getAttentionCandidatesV31(0.65, 1))[0] : undefined;
+    const eligible = experimental ? (await targetPool.getAttentionCandidatesV31(0.55, 1))[0] : undefined;
     if (eligible) await targetPool.markAttended(eligible.id);
     log.info(
       `Cognition ${experimental ? "shadow" : "primary"} candidate ${candidate.merged ? "reactivated" : "created"}: `
@@ -1606,7 +1612,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
   private async maybeGenerateShadowThought(): Promise<void> {
     if (!this.shadowLLMGenerator || this.shadowThoughtRate <= 0) return;
     const now = Date.now();
-    if (now - this.lastShadowThoughtAt < 5 * 60 * 1000) return;
+    if (now - this.lastShadowThoughtAt < 3 * 60 * 1000) return;
     this.lastShadowThoughtAt = now;
     if (Math.random() >= this.shadowThoughtRate) return;
     if (this.isLLMBackoffActive("shadow thought emergence")) return;
@@ -1779,8 +1785,8 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
   private async maybeAttendThoughtPoolCandidate(): Promise<void> {
     if (Date.now() - this.lastPoolAttentionAt < 30 * 60 * 1000) return;
     const selected = (this.cognitionMode === "primary"
-      ? await this.thoughtPool.getAttentionCandidatesV31(0.65, 1)
-      : await this.thoughtPool.getAttentionCandidates(0.65, 1))[0];
+      ? await this.thoughtPool.getAttentionCandidatesV31(0.55, 1)
+      : await this.thoughtPool.getAttentionCandidates(0.55, 1))[0];
     if (!selected) return;
     const attended = await this.thoughtPool.markAttended(selected.id);
     if (!attended) return;
@@ -1880,7 +1886,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
         sourceType: "thought", sourceId: candidate.thoughtEpisodeId ?? candidate.id,
         content: candidate.content, reason: "A mature private thought reached expression review.",
       }) : undefined;
-    const adaptiveThreshold = 0.65 + (this.expressionPolicy === "adaptive"
+    const adaptiveThreshold = 0.55 + (this.expressionPolicy === "adaptive"
       ? feedbackState?.policy.valueThresholdDelta ?? 0 : 0);
     if (expressionProposal && candidate.attentionScore < adaptiveThreshold) {
       await this.expressionStore?.resolve(expressionProposal.id, false, "low-value");
@@ -1921,6 +1927,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
         hooksToken: this.hooksToken,
         workspaceContext: this.workspaceContext || undefined,
         thoughtFrequency: this.thoughtFrequency,
+        subAgentRunner: this.subAgentRunner,
       });
     } catch (error) {
       if (expressionProposal) await this.expressionStore?.resolve(expressionProposal.id, false, "unsafe");
@@ -1957,9 +1964,10 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
 
     const lastMaintenance = [...(ego.behaviorLog ?? [])]
       .reverse()
-      .find((entry) => entry.actionType === "observe-and-improve");
+      .find((entry) => entry.actionType === "observe-and-improve" || entry.actionType === "subagent-improve");
     if (lastMaintenance && Date.now() - lastMaintenance.timestamp < 2 * 60 * 60 * 1000) return false;
-    if (!getActionCooldownState("observe-and-improve", this.thoughtFrequency).ready) return false;
+    if (!getActionCooldownState("subagent-improve", this.thoughtFrequency).ready
+        && !getActionCooldownState("observe-and-improve", this.thoughtFrequency).ready) return false;
 
     const now = new Date();
     const ctx: ThoughtGenerationContext = {
@@ -1984,7 +1992,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
 
     const workItem = buildThoughtFromOpportunity(opportunity, ego);
     workItem.content = `Scheduled maintenance: ${opportunity.triggerDetail}`;
-    workItem.actionType = "observe-and-improve";
+    workItem.actionType = "subagent-improve";
     log.info(`Running maintenance work outside thought stream: ${opportunity.triggerDetail}`);
     await this.executeThoughtAction(workItem, ego);
     return true;
@@ -2482,7 +2490,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
   }
 
   private async attachIntentionToOperationalWork(thought: Thought): Promise<void> {
-    if (!this.intentionStore || !["analyze-problem", "run-agent-task", "observe-and-improve"].includes(thought.actionType ?? "")) {
+    if (!this.intentionStore || !["analyze-problem", "run-agent-task", "observe-and-improve", "subagent-improve"].includes(thought.actionType ?? "")) {
       return;
     }
     if (typeof thought.actionParams?.intentionId === "string") return;
@@ -2504,13 +2512,13 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
     const handoffIntention = latestHandoffIntentionId
       ? intentions.intentions.find((item) => item.id === latestHandoffIntentionId)
       : undefined;
-    const preferHandoff = thought.actionType === "observe-and-improve"
+    const preferHandoff = (thought.actionType === "observe-and-improve" || thought.actionType === "subagent-improve")
       && handoffIntention
       && (!matchedUserIntention || matchedUserIntention.overlap < 0.05);
     const userIntention = preferHandoff ? handoffIntention : matchedUserIntention?.item;
     const intention = userIntention ?? (await this.intentionStore.add({
       desiredState: thought.motivation.slice(0, 500),
-      origin: thought.actionType === "observe-and-improve" ? "maintenance" : "thought",
+      origin: (thought.actionType === "observe-and-improve" || thought.actionType === "subagent-improve") ? "maintenance" : "thought",
       originId: thought.id,
       commitment: Math.max(0, Math.min(1, thought.priority / 100)),
       urgency: thought.priority >= 90 ? 0.9 : 0.6,
@@ -2556,6 +2564,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
         hooksToken: this.hooksToken,
         workspaceContext: this.workspaceContext || undefined,
         thoughtFrequency: this.thoughtFrequency,
+        subAgentRunner: this.subAgentRunner,
       });
     } catch (err) {
       log.error(`executeThoughtAction threw unhandled error: ${String(err)}`);
@@ -2624,7 +2633,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
       return e;
     }).catch(() => { /* non-critical */ });
 
-    const MAX_CONSECUTIVE_SKIPS = this.thoughtFrequency < 0.5 ? 5 : 4;
+    const MAX_CONSECUTIVE_SKIPS = this.thoughtFrequency < 0.5 ? 8 : 6;
     if (this.consecutiveSkipCount >= MAX_CONSECUTIVE_SKIPS) {
       // Don't fully stop — switch to a low-frequency idle interval so Soul
       // can still surface occasional thoughts during long quiet periods.
@@ -2771,7 +2780,8 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
       actionType === "proactive-research" ||
       actionType === "proactive-content-push" ||
       (actionType === "send-message" && typeof result.actionResult?.result === "string" && !result.actionResult.result.startsWith("skipped-")) ||
-      (actionType === "observe-and-improve" && result.actionResult?.data?.fixApplied === true);
+      (actionType === "observe-and-improve" && result.actionResult?.data?.fixApplied === true) ||
+      (actionType === "subagent-improve" && result.actionResult?.data?.fixApplied === true);
 
     const updatedEgo = await updateEgoStore(this.storePath, (ego) => {
       for (const delta of result.metricsChanged) {

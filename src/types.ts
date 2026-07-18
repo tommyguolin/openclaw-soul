@@ -30,8 +30,10 @@ export type ActionType =
   | "run-agent-task"
   | "report-findings"
   | "observe-and-improve"
+  | "subagent-improve"
   | "proactive-research"
-  | "proactive-content-push";
+  | "proactive-content-push"
+  | "proactive-check-in";
 
 export type ThoughtTrigger =
   | "opportunity"

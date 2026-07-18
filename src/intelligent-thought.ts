@@ -581,14 +581,14 @@ function suppressOrRerouteLowValueMessageThought(
   if (!isMetaWorkPromiseText(combined)) return;
 
   if (hasAutonomousExecutionContext(combined, ctx.ego)) {
-    thought.actionType = "observe-and-improve";
+    thought.actionType = "subagent-improve";
     thought.actionParams = {
       reason: combined.slice(0, 500),
       suppressedLowValueMessage: true,
     };
     thought.content = "Suppressed a meta status message; continue concrete autonomous optimization work and report only measured results.";
     thought.expectedOutcome = "Run concrete autonomous optimization work instead of sending a promise/status message.";
-    log.info("Rerouted low-value proactive message thought to observe-and-improve");
+    log.info("Rerouted low-value proactive message thought to subagent-improve");
     return;
   }
 
@@ -606,6 +606,7 @@ export function isExecutionFocusedOpportunity(opportunity: DetectedThoughtOpport
   const action = opportunity.suggestedAction;
   if (
     action === "observe-and-improve" ||
+    action === "subagent-improve" ||
     action === "run-agent-task" ||
     action === "invoke-tool" ||
     action === "report-findings" ||
@@ -626,6 +627,7 @@ function hasHandledDirectiveAfter(ego: EgoState, timestamp: number): boolean {
     "analyze-problem",
     "run-agent-task",
     "observe-and-improve",
+    "subagent-improve",
     "report-findings",
   ]);
 
@@ -723,9 +725,9 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
     return opportunities;
   }
 
-  // Only generate when user hasn't interacted for 5+ minutes
-  // (lowered so proactive messages reach users faster)
-  if (recentInteractions.length > 0 && ctx.timeSinceLastInteraction < 5 * 60 * 1000) {
+  // Only generate when user hasn't interacted for 2+ minutes
+  // (lowered from 5min so proactive messages reach users faster)
+  if (recentInteractions.length > 0 && ctx.timeSinceLastInteraction < 2 * 60 * 1000) {
     return opportunities;
   }
 
@@ -769,7 +771,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
       source: "user-interaction",
       relatedNeeds: ["growth", "meaning"],
       motivation: `User gave an execution-oriented directive; act on it instead of researching it: "${content}"`,
-      suggestedAction: useImprove ? "observe-and-improve" : useAgent ? "run-agent-task" : "analyze-problem",
+      suggestedAction: useImprove ? "subagent-improve" : useAgent ? "run-agent-task" : "analyze-problem",
       actionParams: useAgent || useImprove
         ? { reason: mem.content.slice(0, 300) }
         : {
@@ -872,15 +874,14 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
 
   // =====================================================
   // 1b. Simple follow-up — when there are interactions but no substantive
-  //     content was found. Only triggers after 15+ minutes to avoid
-  //     annoying the user with follow-ups to test messages.
+  //     content was found. Triggers after 5+ minutes (lowered from 15).
   // =====================================================
   if (recentInteractions.length > 0 && opportunities.length === 0) {
     const lastInteraction = recentInteractions[0];
     const minutesSinceInteraction = (now - lastInteraction.timestamp) / (1000 * 60);
 
-    // After 15-60 minutes: simple follow-up with send-message
-    if (minutesSinceInteraction >= 15 && minutesSinceInteraction <= 60) {
+    // After 5-60 minutes: simple follow-up with send-message
+    if (minutesSinceInteraction >= 5 && minutesSinceInteraction <= 60) {
       const content = lastInteraction.content.slice(0, 80);
       opportunities.push({
         type: "conversation-replay",
@@ -1227,6 +1228,31 @@ function analyzeContextualTriggers(
     });
   }
 
+  // --- Proactive check-in trigger ---
+  // When user has been quiet for 10+ minutes and we have userFacts,
+  // generate a proactive check-in opportunity. This is a "tell-first" action
+  // that works even with autonomousActions=false.
+  if (!localEvidenceBlocked) {
+    const userFactsForCheckIn = activeUserFacts(ego);
+    if (userFactsForCheckIn.length > 0 && ctx.timeSinceLastInteraction > 10 * 60 * 1000) {
+      const recentCheckIn = (ego.behaviorLog ?? []).some(
+        (entry) => entry.actionType === "proactive-check-in" && Date.now() - entry.timestamp < 30 * 60 * 1000,
+      );
+      if (!recentCheckIn) {
+        opportunities.push({
+          type: "opportunity-detected",
+          trigger: "need",
+          triggerDetail: `User has been quiet for ${Math.round(ctx.timeSinceLastInteraction / 60000)}min — check in with something specific`,
+          priority: 58,
+          source: "user-interaction",
+          relatedNeeds: ["connection", "meaning"],
+          motivation: `User hasn't interacted in a while and I know enough about them to check in meaningfully`,
+          suggestedAction: "proactive-check-in",
+        });
+      }
+    }
+  }
+
   // --- Self-improvement goal trigger ---
   // When user has assigned Soul a self-improvement goal, generate opportunities
   // to observe and improve itself via the agent.
@@ -1246,7 +1272,7 @@ function analyzeContextualTriggers(
   if (improvementGoals.length > 0 || hasImproveFact || hasImprovePref) {
     const recentImprove = [...(ego.behaviorLog ?? [])]
       .reverse()
-      .find((entry) => entry.actionType === "observe-and-improve");
+      .find((entry) => entry.actionType === "observe-and-improve" || entry.actionType === "subagent-improve");
     const hoursSinceImprove = recentImprove
       ? (Date.now() - recentImprove.timestamp) / (1000 * 60 * 60)
       : Infinity;
@@ -1264,7 +1290,7 @@ function analyzeContextualTriggers(
         source: "system-monitor",
         relatedNeeds: ["growth", "meaning"],
         motivation: `I have a periodic goal to improve myself: ${goalTitle}`,
-        suggestedAction: "observe-and-improve",
+        suggestedAction: "subagent-improve",
       });
     }
   }
@@ -1685,9 +1711,11 @@ function determineActionForOpportunity(
 
   // --- Standard action routing ---
 
-  // self-improvement-monitor: route to observe-and-improve for self-optimization
+  // self-improvement-monitor: route to subagent-improve when available (full
+  // tool chain: exec, write, read, git), otherwise fall back to observe-and-improve
+  // (local LLM + spawnSync, limited to npm scripts / python / node --check).
   if (type === "self-improvement-monitor") {
-    return { actionType: "observe-and-improve" };
+    return { actionType: "subagent-improve" };
   }
 
   if (
@@ -2070,7 +2098,7 @@ export async function generateIntelligentThought(
       // EXCEPTION: don't override explicit suggestedActions that are deliberate
       // proactive actions (observe-and-improve, proactive-research, proactive-content-push).
       const strongProblemIndicators = /排查.*问题|分析.*错误|修复.*bug|debug|fix.*issue|diagnos|investigate.*error|read.*log.*file|检查.*日志|读取.*文件.*错误/i;
-      const protectedActions = new Set(["send-message", "observe-and-improve", "run-agent-task", "invoke-tool", "analyze-problem", "proactive-research", "proactive-content-push"]);
+      const protectedActions = new Set(["send-message", "observe-and-improve", "subagent-improve", "run-agent-task", "invoke-tool", "analyze-problem", "proactive-research", "proactive-content-push"]);
       const isProtectedAction = protectedActions.has(selectedOpportunity.suggestedAction ?? "");
       if (!isProtectedAction &&
           strongProblemIndicators.test(refinedContent) &&
@@ -2138,6 +2166,15 @@ async function generateLLMThoughtPrompt(
     ? activeFacts.slice(0, 8).map((f) => `[CURRENT ${f.category}] ${f.content}`).join("\n")
     : "none yet";
 
+  // Inject user preferences so the LLM can align thoughts to user style
+  const activePrefs = (ego.userPreferences ?? [])
+    .filter((p) => p.confidence >= 0.4)
+    .sort((a, b) => b.confidence - a.confidence)
+    .slice(0, 6);
+  const userPrefsSummary = activePrefs.length > 0
+    ? activePrefs.map((p) => `- ${p.aspect}: ${p.preference}`).join("\n")
+    : "none yet";
+
   // Include actual conversation content for conversation-replay thoughts
   const recentInteractions = currentConversationMemories(ego, 5)
     .sort((a, b) => b.timestamp - a.timestamp)
@@ -2172,6 +2209,9 @@ ${opportunity.triggerDetail}
 
 Stable context about the person:
 ${userFactsSummary}
+
+User preferences (align your tone and approach to these):
+${userPrefsSummary}
 
 Recent conversation:
 ${conversationContext}
@@ -2250,6 +2290,15 @@ async function generateProactiveMessagePromptLLM(
       ? `What I know about the user: ${userFacts.map((f) => f.content).join("; ")}`
       : "I don't know much about the user yet";
 
+  // Include user preferences so proactive messages align to user style
+  const activePrefs = (ego.userPreferences ?? [])
+    .filter((p) => p.confidence >= 0.4)
+    .sort((a, b) => b.confidence - a.confidence)
+    .slice(0, 5);
+  const prefsInfo = activePrefs.length > 0
+    ? `User preferences: ${activePrefs.map((p) => `${p.aspect}=${p.preference}`).join("; ")}`
+    : "";
+
   // Search external memory plugins for relevant context
   const memoryQuery = `${opportunity.triggerDetail} ${opportunity.motivation}`;
   const externalResults = await searchExternalMemories(memoryQuery, 3);
@@ -2273,6 +2322,7 @@ ${ego.goals
   .join("\n")}
 
 **${userInfo}**
+${prefsInfo ? `**${prefsInfo}**` : ""}
 
 ${memorySection ? `\n${memorySection}\n` : ""}
 Reach out to the user with enough detail to be useful. Requirements:
