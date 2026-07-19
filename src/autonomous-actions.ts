@@ -32,8 +32,9 @@ const AUTONOMOUS_AGENT_QUICK_CHECK_SECONDS = 60;
 /** Grace period to wait for a subagent that timed out or errored to finish
  * writing its result file. The subagent may still be running after
  * waitForRun returns (e.g. due to timeout) and will write the result file
- * directly via the write tool. */
-const SUBAGENT_GRACE_PERIOD_MS = 30 * 1000;
+ * directly via the write tool. Increased from 30s to 5min to allow slow
+ * subagents to complete their final report writing. */
+const SUBAGENT_GRACE_PERIOD_MS = 5 * 60 * 1000;
 const AUTONOMOUS_FAILURE_BACKOFF_MS = 30 * 60 * 1000;
 const AUTONOMOUS_FAILURE_LOOKBACK_MS = 6 * 60 * 60 * 1000;
 const READABLE_EVIDENCE_EXTENSIONS = [".log", ".txt", ".json", ".csv", ".md", ".yaml", ".yml", ".conf"];
@@ -545,7 +546,8 @@ function isInterimTaskNarration(result: string): boolean {
   const normalized = result.trim();
   return /^(?:let me|now let me|i(?:'|’)ll|i will|first i|next i|我先|我将|现在我|让我|接下来|先看|先查|准备)/i.test(normalized)
     && !/##\s*(outcome|changes|verification|metrics|next)|验证|指标|结果|变更|完成|completed|verified|metrics/i.test(normalized);
-}
+}
+
 /** Check if a subagent session for the given task has been written to recently
  * (within the last 5 minutes), indicating the subagent is still actively running. */
 function isSubagentSessionRecentlyActive(task: AutonomousTask): boolean {

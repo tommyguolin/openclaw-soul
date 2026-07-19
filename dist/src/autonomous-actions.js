@@ -24,8 +24,9 @@ const AUTONOMOUS_AGENT_QUICK_CHECK_SECONDS = 60;
 /** Grace period to wait for a subagent that timed out or errored to finish
  * writing its result file. The subagent may still be running after
  * waitForRun returns (e.g. due to timeout) and will write the result file
- * directly via the write tool. */
-const SUBAGENT_GRACE_PERIOD_MS = 30 * 1000;
+ * directly via the write tool. Increased from 30s to 5min to allow slow
+ * subagents to complete their final report writing. */
+const SUBAGENT_GRACE_PERIOD_MS = 5 * 60 * 1000;
 const AUTONOMOUS_FAILURE_BACKOFF_MS = 30 * 60 * 1000;
 const AUTONOMOUS_FAILURE_LOOKBACK_MS = 6 * 60 * 60 * 1000;
 const READABLE_EVIDENCE_EXTENSIONS = [".log", ".txt", ".json", ".csv", ".md", ".yaml", ".yml", ".conf"];
