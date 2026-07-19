@@ -536,10 +536,12 @@ function isCompleteTaskReport(result: string): boolean {
 
 function hasRequiredReportSections(result: string): boolean {
   const text = result.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
-  const requiredSections = ["outcome", "changes", "verification", "metrics", "next"];
-  return requiredSections.every((section) =>
-    new RegExp(`^##\\s+${section}\\b`, "im").test(text),
-  );
+  // Language-agnostic: check for any markdown ## section headers.
+  // The model writes sections in the user's language - we only need 3+ distinct sections.
+  const sectionHeaders = text.match(/^##\s+\w+/gm);
+  if (!sectionHeaders || sectionHeaders.length < 3) return false;
+  const unique = new Set(sectionHeaders.map(h => h.toLowerCase()));
+  return unique.size >= 3;
 }
 
 function isInterimTaskNarration(result: string): boolean {
