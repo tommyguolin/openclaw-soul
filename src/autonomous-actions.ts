@@ -26,8 +26,8 @@ const MAX_ACTIVE_TASKS = 1;
 
 const PROVIDER_PRESSURE_BACKOFF_MS = 60 * 60 * 1000;
 const PROVIDER_PRESSURE_TAIL_LINES = 80;
-const AUTONOMOUS_AGENT_TIMEOUT_SECONDS = 2100;
-const AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS = 1800;
+const AUTONOMOUS_AGENT_TIMEOUT_SECONDS = 3600;
+const AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS = 3000;
 const AUTONOMOUS_AGENT_QUICK_CHECK_SECONDS = 60;
 /** Grace period to wait for a subagent that timed out or errored to finish
  * writing its result file. The subagent may still be running after
