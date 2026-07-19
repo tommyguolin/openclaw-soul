@@ -2879,8 +2879,12 @@ export async function pollActiveTasks(storePath: string): Promise<AutonomousTask
         } catch { /* file not ready yet */ }
       }
 
-      // Fallback: try to extract result from session files
-      if (!task.result && task.requiresWritePermission) {
+      // Fallback: try to extract result from session files — but only after
+      // the stale timeout has elapsed. Running this while the session is still
+      // within its timeout window causes false-positive failures: the session
+      // is still actively running and hasn't had a chance to write its final
+      // report yet.
+      if (!task.result && task.requiresWritePermission && Date.now() - task.updatedAt > STALE_MS) {
         const sessionResult = extractResultFromSessions(task, task.createdAt);
         if (sessionResult) {
           task.result = sessionResult.result;
