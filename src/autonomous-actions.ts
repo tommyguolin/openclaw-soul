@@ -430,6 +430,10 @@ function isCompleteTaskReport(result: string): boolean {
   if (taskReportStatus(text) === "in-progress") return false;
 
   if (!hasRequiredReportSections(text)) return false;
+  // If the report has an explicit Status: header and all required sections,
+  // accept it regardless of body keywords. The keyword check below is a
+  // fallback for reports that omit the Status: header entirely.
+  if (taskReportStatus(text) !== null) return true;
   return /changed|implemented|verified|command|baseline|before|after|metric|files?/i.test(text);
 }
 
