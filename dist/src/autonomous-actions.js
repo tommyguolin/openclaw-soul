@@ -18,15 +18,15 @@ const log = createSoulLogger("autonomous-actions");
 const MAX_ACTIVE_TASKS = 1;
 const PROVIDER_PRESSURE_BACKOFF_MS = 60 * 60 * 1000;
 const PROVIDER_PRESSURE_TAIL_LINES = 80;
-const AUTONOMOUS_AGENT_TIMEOUT_SECONDS = 600;
-const AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS = 150;
+const AUTONOMOUS_AGENT_TIMEOUT_SECONDS = 2100;
+const AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS = 1800;
 const AUTONOMOUS_AGENT_QUICK_CHECK_SECONDS = 60;
 /** Grace period to wait for a subagent that timed out or errored to finish
  * writing its result file. The subagent may still be running after
  * waitForRun returns (e.g. due to timeout) and will write the result file
  * directly via the write tool. */
 const SUBAGENT_GRACE_PERIOD_MS = 30 * 1000;
-const AUTONOMOUS_FAILURE_BACKOFF_MS = 2 * 60 * 60 * 1000;
+const AUTONOMOUS_FAILURE_BACKOFF_MS = 30 * 60 * 1000;
 const AUTONOMOUS_FAILURE_LOOKBACK_MS = 6 * 60 * 60 * 1000;
 const READABLE_EVIDENCE_EXTENSIONS = [".log", ".txt", ".json", ".csv", ".md", ".yaml", ".yml", ".conf"];
 /** Track recently sent report messages to prevent duplicates. */
@@ -2322,17 +2322,25 @@ export async function executeSubagentImprove(thought, ego, options) {
         .slice(0, 5)
         .map((g) => `- ${g.title}: ${g.description} (${g.progress.toFixed(0)}%)`)
         .join("\n");
-    // Recent analysis context — only include results from prior improvement
-    // tasks (requiresWritePermission === true). Analyze-problem results are
-    // generic diagnostic summaries that add noise without actionable context.
-    // Also filter out boilerplate partial/failed results that have no findings.
-    const recentAnalyses = (ego.activeTasks ?? [])
+    // Recent analysis context — include both prior improvement results AND
+    // completed analyze-problem results that have actionable findings.
+    // Analyze-problem results often identify specific bugs that subagent-improve
+    // should fix directly, rather than re-discovering them from scratch.
+    // Filter out boilerplate partial/failed results that have no findings.
+    const recentImproveResults = (ego.activeTasks ?? [])
         .filter((t) => t.status === "completed" && t.result && t.id !== undefined
         && t.requiresWritePermission === true
         && !isLowValueAutonomousFailure(t))
         .slice(-2)
-        .map((t) => t.result)
-        .join("\n\n");
+        .map((t) => t.result);
+    const recentAnalyzeResults = (ego.activeTasks ?? [])
+        .filter((t) => t.status === "completed" && t.result && t.id !== undefined
+        && t.requiresWritePermission === false
+        && !isLowValueAutonomousFailure(t)
+        && t.result.length > 100) // only substantive analyses
+        .slice(-1)
+        .map((t) => `**Prior analysis (from analyze-problem task ${t.id})**:\n${t.result}`);
+    const recentAnalyses = [...recentImproveResults, ...recentAnalyzeResults].join("\n\n");
     // Project context
     const projectContext = (ego.projectContexts ?? []).find((context) => context.root.toLowerCase() === target.dir.toLowerCase());
     const projectContinuityText = projectContext
@@ -2387,6 +2395,8 @@ ${options.workspaceContext ? `- Workspace rules:\n${options.workspaceContext}` :
 
 **Previous findings**:
 ${recentAnalyses || "None."}
+
+${recentAnalyzeResults.length > 0 ? "**IMPORTANT**: A prior analysis identified a specific issue. Implement the fix directly — do NOT re-analyze or re-discover the same problem. Go straight to editing the relevant file(s)." : ""}
 
 Work like the main OpenClaw agent would when the user directly asks for a focused improvement:
 1. Inspect only the most relevant source files, scripts, and recent logs.
@@ -2729,10 +2739,8 @@ export async function pollActiveTasks(storePath) {
     const MAX_TASKS = 20;
     const newlyCompleted = [];
     await updateEgoStore(storePath, (e) => {
-        if (!e.activeTasks) {
+        if (!e.activeTasks)
             e.activeTasks = [];
-            return e;
-        }
         for (const task of e.activeTasks) {
             if (task.status !== "in-progress")
                 continue;
@@ -2794,6 +2802,17 @@ export async function pollActiveTasks(storePath) {
                 }
             }
             e.activeTasks = sorted.slice(0, MAX_TASKS);
+        }
+        // Shrink step outputs for delivered terminal tasks — the full log
+        // text was only needed during result extraction, not for history.
+        for (const t of e.activeTasks) {
+            if ((t.status === "completed" || t.status === "failed") && t.resultDelivered) {
+                for (const s of (t.steps ?? [])) {
+                    if (typeof s.output === "string" && s.output.length > 200) {
+                        s.output = s.output.slice(0, 200) + "... [pruned]";
+                    }
+                }
+            }
         }
         // Clean up orphaned result files not referenced by any task
         const resultDir = join(resolveSoulDir(), "results");

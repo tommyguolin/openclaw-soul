@@ -134,7 +134,7 @@ test("ThoughtService uses the thought model for execution-focused opportunities"
       text: "Please search for a solution to the recurring TypeScript database timeout problem.",
     });
     await updateEgoStore(storePath, (ego) => {
-      ego.lastInteractionTime = Date.now() - 8 * 60 * 1000;
+      ego.lastInteractionTime = Date.now() - 3 * 60 * 1000;
       ego.lastThoughtTime = null;
       return ego;
     });

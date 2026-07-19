@@ -99,7 +99,7 @@ test("low thoughtFrequency shortens proactive action cooldowns for observation r
   markActionExecuted("proactive-content-push");
   const normal = getActionCooldownState("proactive-content-push", 1);
   const observation = getActionCooldownState("proactive-content-push", 0.3);
-  assert.equal(normal.cooldownMs, 90 * 60 * 1000);
+  assert.equal(normal.cooldownMs, 60 * 60 * 1000);
   assert.equal(observation.cooldownMs, 20 * 60 * 1000);
 });
 

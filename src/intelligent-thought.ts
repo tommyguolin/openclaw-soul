@@ -238,9 +238,9 @@ function analyzeRecentInteraction(timeSinceLastInteraction: number): DetectedTho
 
   const minutesSince = timeSinceLastInteraction / (1000 * 60);
 
-  // After 10-30 min, keep the first bonding impulse private. This gives a
+  // After 5-20 min, keep the first bonding impulse private. This gives a
   // recent conversation room to breathe before Soul considers following up.
-  if (minutesSince > 10 && minutesSince <= 30) {
+  if (minutesSince > 5 && minutesSince <= 20) {
     opportunities.push({
       type: "bond-deepen",
       trigger: "bonding",
@@ -252,7 +252,7 @@ function analyzeRecentInteraction(timeSinceLastInteraction: number): DetectedTho
     });
   }
 
-  if (minutesSince > 30 && minutesSince < 120) {
+  if (minutesSince > 20 && minutesSince < 90) {
     opportunities.push({
       type: "bond-deepen",
       trigger: "bonding",
@@ -265,7 +265,7 @@ function analyzeRecentInteraction(timeSinceLastInteraction: number): DetectedTho
     });
   }
 
-  if (minutesSince > 120) {
+  if (minutesSince > 90) {
     opportunities.push({
       type: "bond-deepen",
       trigger: "bonding",
@@ -703,6 +703,16 @@ export function hasUnresolvedLocalEvidenceMissingResult(ego: EgoState): boolean 
  * 4. Detect patterns: habits, challenges, skill gaps
  * 5. Proactively search for things that could benefit the user
  */
+
+/** Detect messages that are forwarded task reports (e.g. Feishu forwards of Soul's
+ * own autonomous task output). These should NOT be treated as new execution
+ * directives — they are the system echoing its own reports back to the user,
+ * which the cognitive engine misinterprets as fresh problems to analyze.
+ */
+function isForwardedTaskReport(text: string): boolean {
+  return /\u4efb\u52a1ID[:\s]|\u8fd9\u9879\u81ea\u4e3b\u4efb\u52a1|Task\s*ID[:\s]|Status:\s*(?:complete|partial|blocked|failed)|##\s*Outcome|##\s*Changes|##\s*Verification|##\s*Metrics|##\s*Next/i.test(text);
+}
+
 function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoughtOpportunity[] {
   const opportunities: DetectedThoughtOpportunity[] = [];
   const { ego } = ctx;
@@ -736,6 +746,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
     m.tags.includes("inbound") &&
     m.timestamp >= executionReplayCutoff &&
     (m.semanticSignals?.includes("execution-directive") || isExecutionDirective(m.content)) &&
+    !isForwardedTaskReport(m.content) &&
     !hasHandledDirectiveAfter(ego, m.timestamp) &&
     !hasLocalEvidenceMissingResultAfter(ego, m.content, m.timestamp) &&
     !matchesAnyTopic(m.content, topicFocus.deprioritized)
@@ -799,6 +810,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
     && isGenuineQuestion(newestInbound.content, newestInbound.semanticSignals)
     && !newestInbound.semanticSignals?.includes("closure")
     && !matchesAnyTopic(newestInbound.content, topicFocus.deprioritized)
+    && !isForwardedTaskReport(newestInbound.content)
     ? [newestInbound]
     : [];
 
@@ -880,8 +892,8 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
     const lastInteraction = recentInteractions[0];
     const minutesSinceInteraction = (now - lastInteraction.timestamp) / (1000 * 60);
 
-    // After 5-60 minutes: simple follow-up with send-message
-    if (minutesSinceInteraction >= 5 && minutesSinceInteraction <= 60) {
+    // After 3-60 minutes: simple follow-up with send-message
+    if (minutesSinceInteraction >= 3 && minutesSinceInteraction <= 60) {
       const content = lastInteraction.content.slice(0, 80);
       opportunities.push({
         type: "conversation-replay",
@@ -1077,15 +1089,24 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
     .slice(0, 8);
 
   if (recentInbound.length >= 2) {
-    // Check if proactive research was done in the last 24 hours
+    // Check if proactive research was done in the last 3 hours
     const hasRecentResearch = ego.memories.some(
       (m) =>
         m.type === "learning" &&
         m.tags.includes("proactive-research") &&
-        m.timestamp > now - 6 * 60 * 60 * 1000,  // 6 hours (scaled by thoughtFrequency below)
+        m.timestamp > now - 3 * 60 * 60 * 1000,  // 3 hours (scaled by thoughtFrequency below)
     );
 
-    if (!hasRecentResearch) {
+    // Check for consecutive irrelevant proactive-research results — if the
+    // last 3 were all irrelevant, back off for 24h to avoid wasting LLM calls
+    const researchLog = (ego.behaviorLog ?? [])
+      .filter((e) => e.actionType === "proactive-research")
+      .sort((a, b) => b.timestamp - a.timestamp);
+    const last3AllIrrelevant = researchLog.length >= 3
+      && researchLog.slice(0, 3).every((e) => e.outcome === "irrelevant")
+      && researchLog[0].timestamp > now - 6 * 60 * 60 * 1000; // within last 6h
+
+    if (!hasRecentResearch && !last3AllIrrelevant) {
       // Collect conversation snippets for the action executor to mine
       const snippets = recentInbound
         .map((m) => m.content.slice(0, 150))
@@ -1131,7 +1152,7 @@ function analyzeConversationReplay(ctx: ThoughtGenerationContext): DetectedThoug
       (m) =>
         m.type === "learning" &&
         m.tags.includes("proactive-content-push") &&
-        m.timestamp > now - 4 * 60 * 60 * 1000,  // 4 hours
+        m.timestamp > now - 2 * 60 * 60 * 1000,  // 2 hours
     );
 
     if (!hasRecentPush) {
@@ -1234,9 +1255,9 @@ function analyzeContextualTriggers(
   // that works even with autonomousActions=false.
   if (!localEvidenceBlocked) {
     const userFactsForCheckIn = activeUserFacts(ego);
-    if (userFactsForCheckIn.length > 0 && ctx.timeSinceLastInteraction > 10 * 60 * 1000) {
+    if (userFactsForCheckIn.length > 0 && ctx.timeSinceLastInteraction > 5 * 60 * 1000) {
       const recentCheckIn = (ego.behaviorLog ?? []).some(
-        (entry) => entry.actionType === "proactive-check-in" && Date.now() - entry.timestamp < 30 * 60 * 1000,
+        (entry) => entry.actionType === "proactive-check-in" && Date.now() - entry.timestamp < 15 * 60 * 1000,
       );
       if (!recentCheckIn) {
         opportunities.push({
@@ -1277,10 +1298,10 @@ function analyzeContextualTriggers(
       ? (Date.now() - recentImprove.timestamp) / (1000 * 60 * 60)
       : Infinity;
     // A failed improve task (often just a stale timeout) should not block
-    // maintenance for 3 hours — 1 hour is enough. The 2h maintenance cooldown
-    // in runMaintenanceIfDue still provides a longer floor.
-    const recentFailedImprove = recentImprove?.outcome === "failed" && hoursSinceImprove < 1;
-    const recentSuccessfulImprove = recentImprove?.outcome === "success" && hoursSinceImprove < 1;
+    // maintenance for long — 30 min is enough. The action cooldown in
+    // action-executor.ts still provides a floor.
+    const recentFailedImprove = recentImprove?.outcome === "failed" && hoursSinceImprove < 0.5;
+    const recentSuccessfulImprove = recentImprove?.outcome === "success" && hoursSinceImprove < 0.5;
 
     if (!recentFailedImprove && !recentSuccessfulImprove) {
       const basePriority = hoursSinceImprove === Infinity ? 65 : Math.min(65, 35 + hoursSinceImprove * 4);
