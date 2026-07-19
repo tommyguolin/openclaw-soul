@@ -409,8 +409,10 @@ function isTaskBlockedOrPartial(task, result) {
         return true;
     if (reportStatus === "completed")
         return false;
-    if (reportStatus === "failed" || reportStatus === "blocked" || reportStatus === "partial")
-        return true;
+    // When task.status === "completed", the task went through reportStatusToTaskStatus
+    // which maps partial/blocked → completed. Don't re-classify these as blocked
+    // in the user-facing report — the user already saw "partial" in the result text.
+    // Only flag as blocked if the result file is actually missing.
     if (task.status === "completed") {
         return isInterimTaskNarration(result)
             || (Boolean(task.resultFilePath) && !hasTaskResultFile(task));
