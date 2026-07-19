@@ -90,7 +90,7 @@ function normalizeTaskResultForReport(result: string): string {
     .replace(/<think[\s\S]*?<\/think>/gi, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim()
-    .slice(0, 4000);
+    .slice(0, 10000);  // Increased from 4000 to preserve more report content for user-facing messages
 }
 
 function isTaskBlockedResult(result: string): boolean {
@@ -1617,7 +1617,7 @@ export async function executeReportFindings(
 
   // Compose summary from all completed tasks — include git diff when available
   const taskSummaries = reportableTasks.map((t) => {
-    const summary = `**${t.title}**\n${t.result?.slice(0, 2000) ?? "No result"}`;
+    const summary = `**${t.title}**\n${t.result?.slice(0, 8000) ?? "No result"}`;
     const targetDir = t.targetProjectRoot || "";
     if (targetDir) {
       const diffStat = captureGitDiffStat(targetDir);
@@ -1717,7 +1717,7 @@ Output ONLY the message, nothing else.`;
       .trim();
   } catch {
     // Fallback: use raw task result
-    message = reportableTasks[0].result?.slice(0, 300) ?? "Analysis completed.";
+    message = reportableTasks[0].result?.slice(0, 1500) ?? "Analysis completed.";
   }
 
   // Reject messages that are clearly not useful
