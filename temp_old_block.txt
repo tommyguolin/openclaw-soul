@@ -1,0 +1,108 @@
+function buildBoundedLocalTaskReport(params: {
+  task: AutonomousTask;
+  status: "partial" | "blocked";
+  target: { dir: string; name: string; isSelf: boolean };
+  thought: Thought;
+  steps: TaskStep[];
+  evidence: string[];
+  userContext: string;
+  recentUserMessages: string;
+  activeGoals: string;
+  analysisContext: string;
+  limitation: string;
+  resultFilePath: string;
+}): string {
+  const successfulReads = params.steps.filter((s) => s.success).length;
+  const failedReads = params.steps.length - successfulReads;
+  const inspected = params.steps
+    .filter((s) => s.action.startsWith("read-"))
+    .map((s) => `- ${s.action}: ${s.input} (${s.success ? "ok" : "failed"})`)
+    .join("\n");
+  const evidence = params.evidence.length > 0
+    ? params.evidence.join("\n\n").slice(0, 5000)
+    : "No readable local evidence was found in the resolved target directory.";
+
+  return `Status: ${params.status}
+Task: ${params.task.id}
+Finished: ${new Date().toISOString()}
+Target: ${params.target.dir} (${params.target.name})
+Report: ${params.resultFilePath}
+
+## Outcome
+Soul completed a bounded local inspection for this autonomous task but did not claim a full implementation. ${params.limitation}
+
+Directive:
+${params.thought.content.slice(0, 1000)}
+
+Context used:
+- User profile: ${params.userContext || "limited"}
+- Recent user messages: ${params.recentUserMessages || "none"}
+- Active goals: ${params.activeGoals || "none"}
+${params.analysisContext ? `- Previous analysis: ${params.analysisContext.slice(0, 1000)}` : "- Previous analysis: none"}
+
+## Changes
+No files were changed by run-agent-task. This path is intentionally read-only until Soul has a trusted child-agent execution channel or the task is handled by observe-and-improve's direct local patch path.
+
+## Verification
+Local inspection steps:
+${inspected || "- No read steps ran."}
+
+Read results: ${successfulReads} succeeded, ${failedReads} failed.
+The task was not verified end-to-end because no trusted autonomous execution channel was available for write/command work.
+
+## Metrics
+Files or artifacts inspected: ${successfulReads}. No before/after performance, backtest, or benchmark metrics were produced by this bounded inspection.
+
+Evidence excerpts:
+${evidence}
+
+## Next
+Use a trusted Gateway agent RPC or execute a smaller direct observe-and-improve task that can apply one local patch and run verification. Do not route autonomous task instructions through /hooks/agent unless OpenClaw marks the source as trusted; otherwise the child agent may treat the task protocol as external untrusted content and ignore it.`;
+}
+
+function isCompleteTaskReport(result: string): boolean {
+  const text = result.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
+  if (!text) return false;
+  if (taskReportStatus(text) === "in-progress") return false;
+
+  if (!hasRequiredReportSections(text)) return false;
+  // If the report has an explicit Status: header and all required sections,
+  // accept it regardless of body keywords. The keyword check below is a
+  // fallback for reports that omit the Status: header entirely.
+  if (taskReportStatus(text) !== null) return true;
+  return /changed|implemented|verified|command|baseline|before|after|metric|files?/i.test(text);
+}
+
+function hasRequiredReportSections(result: string): boolean {
+  const text = result.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
+  const requiredSections = ["outcome", "changes", "verification", "metrics", "next"];
+  return requiredSections.every((section) =>
+    new RegExp(`^##\\s+${section}\\b`, "im").test(text),
+  );
+}
+
+function isInterimTaskNarration(result: string): boolean {
+  const normalized = result.trim();
+  return /^(?:let me|now let me|i(?:'|’)ll|i will|first i|next i|我先|我将|现在我|让我|接下来|先看|先查|准备)/i.test(normalized)
+    && !/##\s*(outcome|changes|verification|metrics|next)|验证|指标|结果|变更|完成|completed|verified|metrics/i.test(normalized);
+}
+
+function isTaskBlockedOrPartial(task: AutonomousTask, result: string): boolean {
+  if (unmetAcceptanceCriteria(task, result).length > 0) return true;
+  const reportStatus = taskReportStatus(result);
+  if (task.status === "failed") return true;
+  if (reportStatus === "completed") return false;
+  // When task.status === "completed", the task went through reportStatusToTaskStatus
+  // which maps partial/blocked → completed. Don't re-classify these as blocked
+  // in the user-facing report — the user already saw "partial" in the result text.
+  // Only flag as blocked if the result file is actually missing.
+  if (task.status === "completed") {
+    return isInterimTaskNarration(result)
+      || (Boolean(task.resultFilePath) && !hasTaskResultFile(task));
+  }
+
+  return isTaskBlockedResult(result)
+    || isInterimTaskNarration(result)
+    || (Boolean(task.resultFilePath) && !hasTaskResultFile(task));
+}
+

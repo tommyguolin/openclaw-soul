@@ -417,7 +417,6 @@ function buildBoundedLocalTaskReport(params: {
   analysisContext: string;
   limitation: string;
   resultFilePath: string;
-  zh?: boolean;
 }): string {
   const successfulReads = params.steps.filter((s) => s.success).length;
   const failedReads = params.steps.length - successfulReads;
@@ -428,48 +427,6 @@ function buildBoundedLocalTaskReport(params: {
   const evidence = params.evidence.length > 0
     ? params.evidence.join("\n\n").slice(0, 5000)
     : "No readable local evidence was found in the resolved target directory.";
-
-  if (params.zh) {
-    const zhEvidence = params.evidence.length > 0
-      ? params.evidence.join("\n\n").slice(0, 5000)
-      : "在目标目录中没有找到可读取的本地证据文件。";
-    return `Status: ${params.status}
-Task: ${params.task.id}
-Finished: ${new Date().toISOString()}
-Target: ${params.target.dir} (${params.target.name})
-Report: ${params.resultFilePath}
-
-## 结果
-Soul 完成了一次有限范围本地检查，但未执行完整实现。${params.limitation}
-
-指令：
-${params.thought.content.slice(0, 1000)}
-
-使用的上下文：
-- 用户画像: ${params.userContext || "有限"}
-- 最近用户消息: ${params.recentUserMessages || "无"}
-- 活跃目标: ${params.activeGoals || "无"}
-${params.analysisContext ? `- 之前分析: ${params.analysisContext.slice(0, 1000)}` : "- 之前分析: 无"}
-
-## 变更
-run-agent-task 路径未修改任何文件。在 Soul 具备可信子代理执行通道或 observe-and-improve 直接补丁路径之前，此路径保持只读。
-
-## 验证
-本地检查步骤：
-${inspected || "- 没有执行读取步骤。"}
-
-读取结果: 成功 ${successfulReads} 项，失败 ${failedReads} 项。
-任务未端到端验证，因为没有可信自主执行通道可用于写入/命令操作。
-
-## 指标
-检查的文件: ${successfulReads}。此次有限检查未产生前后对比性能、回测或基准指标。
-
-证据摘录：
-${zhEvidence}
-
-## 下一步
-使用可信 Gateway agent RPC 或执行更小范围 observe-and-improve 任务来应用本地补丁并运行验证。不要通过 /hooks/agent 路由自主任务指令，除非 OpenClaw 标记来源为可信。`;
-  }
 
   return `Status: ${params.status}
 Task: ${params.task.id}
@@ -1169,7 +1126,6 @@ async function executeBoundedLocalAgentTask(
       metricsChanged: [],
     };
   }
-  const zh = wantsChineseReport(ego);
   const userContext = ego.userFacts.slice(0, 5).map((f) => `[${f.category}] ${f.content}`).join("\n");
   const recentUserMessages = (ego.recentUserMessages ?? [])
     .slice(-5)
@@ -1251,7 +1207,6 @@ async function executeBoundedLocalAgentTask(
     analysisContext,
     limitation,
     resultFilePath,
-    zh,
   });
 
   writeTaskReportFile(resultFilePath, report);
