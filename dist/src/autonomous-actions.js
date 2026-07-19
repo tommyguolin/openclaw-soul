@@ -290,10 +290,32 @@ Pending.
 ## Next
 Pending.`;
 }
-function buildFailureTaskReport(task, detail) {
-    return `Status: failed
+function buildFailureTaskReport(task, detail, zh = false) {
+    const header = `Status: failed
 Task: ${task.id}
-Finished: ${new Date().toISOString()}
+Finished: ${new Date().toISOString()}`;
+    if (zh) {
+        return `${header}
+
+## 结果
+自主任务未能完成，没有产出最终报告。
+
+## 变更
+Soul 未确认任何最终变更。
+
+## 验证
+任务在验证完成前已失败。
+
+## 指标
+未捕获可靠的前后对比指标。
+
+## 下一步
+缩小任务范围，增量写入报告后再启动长耗时验证。
+
+## 失败详情
+${detail.trim().slice(0, 3000)}`;
+    }
+    return `${header}
 
 ## Outcome
 The autonomous task did not finish with a complete report.
@@ -313,10 +335,30 @@ Run a smaller bounded iteration and write the report incrementally before launch
 ## Failure Detail
 ${detail.trim().slice(0, 3000)}`;
 }
-function buildPartialTaskReport(task, detail) {
-    return `Status: partial
+function buildPartialTaskReport(task, detail, zh = false) {
+    const header = `Status: partial
 Task: ${task.id}
-Finished: ${new Date().toISOString()}
+Finished: ${new Date().toISOString()}`;
+    if (zh) {
+        return `${header}
+
+## 结果
+自主任务产出了部分发现，但在预算耗尽前未写入完整最终报告。
+
+## 变更
+Soul 未确认任何最终变更。
+
+## 验证
+下方捕获的部分输出中可能包含验证或观察结果，但任务未提供完整的命令/结果报告。
+
+## 指标
+捕获的部分输出：
+${detail.trim().slice(0, 3000)}
+
+## 下一步
+基于此次部分发现，启动更小范围后续任务。下一个任务应先写入 Status: partial，验证完成后再覆盖。`;
+    }
+    return `${header}
 
 ## Outcome
 The autonomous task produced a partial finding but did not write a complete final report before the budget expired.
@@ -441,6 +483,34 @@ function taskResultFileLine(task, zh) {
             : `Report file: missing (${task.resultFilePath})`;
     }
 }
+function extractReportField(result, field) {
+    const match = new RegExp(`^##\\s+${field}\\b[^\n]*\n([\s\S]*?)(?=^##\\s+|$)`, "im").exec(result.replace(/<think[\s\S]*?<\/think>/gi, "").trim());
+    return match ? match[1].trim() : "";
+}
+function extractChangedFiles(changesText) {
+    const files = [];
+    for (const line of changesText.split(/\r?\n/)) {
+        const m = line.match(/(?:^|[-•]\s*)([A-Za-z0-9_.\-/]+\.[A-Za-z0-9]+)/);
+        if (m && !files.includes(m[1]))
+            files.push(m[1]);
+    }
+    return files;
+}
+function captureGitDiffStat(targetDir) {
+    try {
+        const result = spawnSync("git", ["diff", "--stat", "HEAD"], {
+            cwd: targetDir,
+            encoding: "utf-8",
+            timeout: 15_000,
+            shell: process.platform === "win32",
+        });
+        if (result.status === 0 && result.stdout.trim()) {
+            return result.stdout.trim();
+        }
+    }
+    catch { /* git not available or not a git repo */ }
+    return null;
+}
 function buildDirectTaskReportMessage(tasks, ego) {
     const reportable = tasks
         .filter((t) => isReportableTask(t) && t.result && t.result.trim().length >= 20)
@@ -452,29 +522,73 @@ function buildDirectTaskReportMessage(tasks, ego) {
         const task = reportable[0];
         const result = normalizeTaskResultForReport(task.result ?? "");
         const blocked = isTaskBlockedOrPartial(task, result);
+        if (zh) {
+            // 中文报告：提取关键信息，不直接粘贴整段英文模板
+            const outcome = extractReportField(result, "outcome") || extractReportField(result, "Outcome") || result.slice(0, 600);
+            const changes = extractReportField(result, "changes") || extractReportField(result, "Changes") || "";
+            const verification = extractReportField(result, "verification") || extractReportField(result, "Verification") || "";
+            const metrics = extractReportField(result, "metrics") || extractReportField(result, "Metrics") || "";
+            const statusIcon = blocked ? "⚠️" : "✅";
+            const statusText = blocked ? "未完成" : "已完成";
+            const lines = [
+                `${statusIcon} 自主任务${statusText}`,
+                `任务: ${task.title}`,
+            ];
+            // 变更文件
+            if (changes) {
+                const changedFiles = extractChangedFiles(changes);
+                if (changedFiles.length > 0) {
+                    lines.push(`\n改动文件 (${changedFiles.length}):`);
+                    for (const f of changedFiles.slice(0, 8))
+                        lines.push(`  • ${f}`);
+                    if (changedFiles.length > 8)
+                        lines.push(`  • ...等 ${changedFiles.length} 个`);
+                }
+                lines.push(`\n变更说明:\n${changes.slice(0, 800)}`);
+            }
+            else {
+                lines.push("\n变更说明: 无文件变更");
+            }
+            // 验证
+            if (verification) {
+                lines.push(`\n验证:\n${verification.slice(0, 500)}`);
+            }
+            // 指标
+            if (metrics) {
+                lines.push(`\n指标:\n${metrics.slice(0, 400)}`);
+            }
+            // 附带 git diff（如果有 targetProjectRoot）
+            const targetDir = task.targetProjectRoot || "";
+            if (targetDir) {
+                const diffStat = captureGitDiffStat(targetDir);
+                if (diffStat) {
+                    lines.push(`\nGit diff:\n${diffStat.slice(0, 1000)}`);
+                }
+            }
+            return lines.join("\n");
+        }
+        // 英文 fallback（保持原逻辑）
         const meta = [
-            zh ? `任务ID: ${task.id}` : `Task ID: ${task.id}`,
-            zh ? `标题: ${task.title}` : `Title: ${task.title}`,
-            zh ? `状态: ${blocked ? "未完成/受阻" : "已完成"}` : `Status: ${blocked ? "blocked/partial" : "completed"}`,
-            taskResultFileLine(task, zh),
+            `Task ID: ${task.id}`,
+            `Title: ${task.title}`,
+            `Status: ${blocked ? "blocked/partial" : "completed"}`,
+            taskResultFileLine(task, false),
         ].filter((line) => Boolean(line));
-        return zh
-            ? `${blocked ? "这项自主任务没有真正完成" : "这项自主任务完成了"}\n${meta.join("\n")}\n\n结果:\n${result}`
-            : `${blocked ? "This autonomous task did not fully complete" : "This autonomous task completed"}\n${meta.join("\n")}\n\nResult:\n${result}`;
+        return `${blocked ? "This autonomous task did not fully complete" : "This autonomous task completed"}\n${meta.join("\n")}\n\nResult:\n${result}`;
     }
+    // 多任务摘要
     const body = reportable
         .map((task) => {
         const result = normalizeTaskResultForReport(task.result ?? "").replace(/\n/g, " ");
         const blocked = isTaskBlockedOrPartial(task, result);
         const status = zh
-            ? (blocked ? "未完成/受阻" : "已完成")
+            ? (blocked ? "未完成" : "已完成")
             : (blocked ? "blocked/partial" : "completed");
-        const fileLine = taskResultFileLine(task, zh);
-        return `- ${task.id} ${status} ${task.title}${fileLine ? `; ${fileLine}` : ""}: ${result.slice(0, 700)}`;
+        return `- ${task.id} ${status} ${task.title}: ${result.slice(0, 700)}`;
     })
         .join("\n");
     return zh
-        ? `这轮自主任务状态如下，含完成与受阻项:\n${body}`
+        ? `本轮自主任务状态:\n${body}`
         : `Autonomous task status:\n${body}`;
 }
 function taskContinuityFields(thought) {
@@ -1050,12 +1164,18 @@ async function executeRunAgentTaskViaSubagent(thought, ego, options) {
     const resultDir = join(resolveSoulDir(), "results");
     mkdirSync(resultDir, { recursive: true });
     const resultFilePath = join(resultDir, `${taskId}.md`);
+    const zh = wantsChineseReport(ego);
+    const langInstruction = zh
+        ? "用中文写报告。所有 section 内容用中文，不要用英文。"
+        : "Write the report in English.";
     const agentMessage = `[Soul Autonomous Task]
 ${thought.content}
 
 **IMPORTANT**: This is an AUTONOMOUS task. No one will reply to you. Do NOT ask for confirmation or permission — start working immediately.
 
 You have a hard ${AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS}s work budget. Do one bounded iteration, then stop and finalize.
+
+${langInstruction}
 
 Context:
 - Target project: ${target.isSelf ? "not explicitly specified; inspect the current workspace" : `${target.dir} (${target.name})`}
@@ -1221,8 +1341,17 @@ export async function executeReportFindings(thought, ego, options) {
         });
         return { result: { type: "report-findings", success: false, error: "Missing message sending capability" }, metricsChanged: [] };
     }
-    // Compose summary from all completed tasks
-    const taskSummaries = reportableTasks.map((t) => `**${t.title}**\n${t.result?.slice(0, 2000) ?? "No result"}`).join("\n\n");
+    // Compose summary from all completed tasks — include git diff when available
+    const taskSummaries = reportableTasks.map((t) => {
+        const summary = `**${t.title}**\n${t.result?.slice(0, 2000) ?? "No result"}`;
+        const targetDir = t.targetProjectRoot || "";
+        if (targetDir) {
+            const diffStat = captureGitDiffStat(targetDir);
+            if (diffStat)
+                return `${summary}\n\n**Git diff**:\n${diffStat.slice(0, 1000)}`;
+        }
+        return summary;
+    }).join("\n\n");
     // Do not keyword-deduplicate structured autonomous reports. Adjacent backtest
     // iterations often share vocabulary while containing different commands,
     // files, metrics, or blockers. Exact message dedup below is enough to prevent
@@ -1264,12 +1393,13 @@ export async function executeReportFindings(thought, ego, options) {
         return { result: { type: "report-findings", success: true, result: "nothing meaningful to report" }, metricsChanged: [] };
     }
     const reportLangInstruction = buildUserLanguageInstruction(ego);
+    const zhReport = wantsChineseReport(ego);
     const prompt = `You are a proactive AI. You autonomously investigated something and want to share findings with the user. ${reportLangInstruction}
 
 **What you investigated**:
 ${taskSummaries}
 
-Write a useful progress report, not a tiny notification. Use 1 short opening sentence plus 2-5 compact bullets when that is clearer. Rules:
+Write a useful progress report in , not a tiny notification. Use 1 short opening sentence plus 2-5 compact bullets when that is clearer. Rules:
 - Start by mentioning WHAT you investigated and WHY (e.g. "我后来查了一下飞书消息发送超时的问题——", "我研究了一下那个 413 错误——", "I looked into the Discord delivery issue —")
 - Then share the CONCRETE finding: actual error messages, root causes, or actionable insights
 - If you investigated multiple things, pick the ONE most interesting finding — do NOT list them all
@@ -1293,7 +1423,6 @@ Soul 插件正在产生主动行为了！                ← describing Soul's o
 **GOOD examples**:
 我后来查了一下飞书消息发送超时的问题——根因是 OpenViking 的 embedding API 有 512 token 限制，不是 Soul 本身的问题。
 我研究了一下日志里那个 413 错误，是 memory search 输入超长导致的，跟 Soul 插件没关系。
-I looked into the Discord message delivery failure — it turns out Discord requires the "user:" prefix before user IDs in the target field.
 
 For this user, code and plugin self-improvement reports ARE user-facing when they describe a concrete change, verification result, or next engineering step.
 If the work produced no concrete finding, no code change, and no useful next step, output exactly: NO_MESSAGE
@@ -1884,6 +2013,10 @@ ${reportZh
     const userContext = ego.userFacts.slice(0, 5).map((f) => `[${f.category}] ${f.content}`).join("\n");
     // --- LLM analysis ---
     const fileNames = allFiles.join(", ");
+    const zh = wantsChineseReport(ego);
+    const langInstruction = zh
+        ? "用中文写报原。所有 section 内容用中文，不要用英文。"
+        : "Write the report in English.";
     const projectDesc = target.isSelf
         ? "This is the Soul plugin itself — an autonomous AI agent with ego, thoughts, and actions."
         : `This is project at ${target.dir}.`;
@@ -2173,8 +2306,11 @@ export async function executeSubagentImprove(thought, ego, options) {
     if (activeImprove >= 1) {
         return { result: { type: "subagent-improve", success: false, error: "Improvement task already running" }, metricsChanged: [] };
     }
-    const reportZh = wantsChineseReport(ego);
+    const zh = wantsChineseReport(ego);
     const readOnlyMode = !options.autonomousActions;
+    const langInstruction = zh
+        ? "用中文写报告。所有 section 内容用中文，不要用英文。"
+        : "Write the report in English.";
     // Build context
     const userContext = ego.userFacts.slice(0, 5).map((f) => `[${f.category}] ${f.content}`).join("\n");
     const recentUserMessages = (ego.recentUserMessages ?? [])
@@ -2233,6 +2369,8 @@ ${thought.content}
 **IMPORTANT**: This is an AUTONOMOUS task. No one will reply to you. Do NOT ask for confirmation or permission — start working immediately.
 
 You have a hard ${AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS}s work budget. Do one bounded iteration, then stop and finalize.
+
+${langInstruction}
 
 Context:
 - Target project: ${target.isSelf ? "not explicitly specified; inspect the current workspace" : `${target.dir} (${target.name})`}
@@ -2442,7 +2580,7 @@ function makeSkippedStep(action, reason) {
  * interim narration.
  * Looks for sessions created after `sinceMs` that contain "Soul-Autonomous" or "[Soul Autonomous".
  */
-function extractResultFromSessions(task, sinceMs) {
+function extractResultFromSessions(task, sinceMs, zh) {
     const sessionsDir = join(homedir(), ".openclaw/agents/main/sessions");
     try {
         const markers = [task.resultFilePath, task.id, `${task.id}.md`].filter((value) => Boolean(value));
@@ -2492,7 +2630,7 @@ function extractResultFromSessions(task, sinceMs) {
                     toolFailure ? `Last tool failure: ${toolFailure}` : "",
                     lastAssistantText ? `Last assistant text: ${lastAssistantText.slice(0, 600)}` : "",
                 ].filter(Boolean).join("\n");
-                return { status: "failed", result: buildFailureTaskReport(task, detail) };
+                return { status: "failed", result: buildFailureTaskReport(task, detail, zh) };
             }
             if (lastAssistantText) {
                 if (isCompleteTaskReport(lastAssistantText) && (!task.resultFilePath || hasFinalTaskResultFile(task))) {
@@ -2502,7 +2640,7 @@ function extractResultFromSessions(task, sinceMs) {
                 const hasUsefulPartial = /\bdone\b|\bfail(?:ed|ure)?\b|\bpasses\b|\bimproved?\b|\bworse\b|\bbug\b|\broot cause\b|\bclear\b|\bmetric\b|\bresult\b|\bverified?\b|\bfixed?\b|\bapplied\b|\bcompleted\b/i.test(lastAssistantText);
                 return {
                     status: "failed",
-                    result: hasUsefulPartial ? buildPartialTaskReport(task, detail) : buildFailureTaskReport(task, detail),
+                    result: hasUsefulPartial ? buildPartialTaskReport(task, detail, zh) : buildFailureTaskReport(task, detail, zh),
                 };
             }
         }
@@ -2619,7 +2757,7 @@ export async function pollActiveTasks(storePath) {
             // is still actively running and hasn't had a chance to write its final
             // report yet.
             if (!task.result && task.requiresWritePermission && Date.now() - task.updatedAt > STALE_MS) {
-                const sessionResult = extractResultFromSessions(task, task.createdAt);
+                const sessionResult = extractResultFromSessions(task, task.createdAt, wantsChineseReport(e));
                 if (sessionResult) {
                     task.result = sessionResult.result;
                     task.status = sessionResult.status;
@@ -2634,7 +2772,7 @@ export async function pollActiveTasks(storePath) {
             if (Date.now() - task.updatedAt > STALE_MS) {
                 const detail = task.result ?? `Task timed out (stale >${Math.round(STALE_MS / 60000)} min). Required final result file was not produced${task.resultFilePath ? `: ${task.resultFilePath}` : ""}.`;
                 task.status = "failed";
-                task.result = buildFailureTaskReport(task, detail);
+                task.result = buildFailureTaskReport(task, detail, wantsChineseReport(e));
                 writeTaskReportFile(task.resultFilePath, task.result);
                 task.completedAt = Date.now();
                 task.updatedAt = Date.now();
