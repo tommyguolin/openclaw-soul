@@ -113,6 +113,12 @@ function isProviderPressureErrorText(value: unknown): boolean {
 function isLowValueAutonomousFailure(task: AutonomousTask): boolean {
   if (task.status !== "failed") return false;
   const result = task.result ?? "";
+  // Only suppress truly empty failures — ones with no diagnostic content.
+  // Failures that contain timeout/error details ARE worth reporting so the
+  // user knows what happened and why.
+  const hasContent = result.trim().length >= 50
+    && !/^Status:\s*(?:failed|partial)[\s\S]*?(?:did not finish|No confirmed final|stopped before producing|Required final result file|Task timed out)\s*\.?\s*$/i.test(result.trim());
+  if (hasContent) return false; // has diagnostic content → worth reporting
   return /did not finish with a complete report|No confirmed final change set|failed before verification|No reliable before\/after metrics|stopped before producing a final result file|Required final result file was not produced|Task timed out \(stale|request timed out|embedded run timeout|Failed to start autonomous agent task|LLM analysis failed|No concrete fix identified/i.test(result);
 }
 
@@ -514,6 +520,11 @@ function isCompleteTaskReport(result: string): boolean {
   if (!text) return false;
   if (taskReportStatus(text) === "in-progress") return false;
 
+  // Fast path: if the report has ## Outcome section and is substantial,
+  // accept it even without a Status: header — subagents sometimes omit
+  // the Status line but still write a complete report.
+  if (text.length >= 200 && /^##\s+outcome\b/im.test(text)) return true;
+
   if (!hasRequiredReportSections(text)) return false;
   // If the report has an explicit Status: header and all required sections,
   // accept it regardless of body keywords. The keyword check below is a
@@ -534,7 +545,29 @@ function isInterimTaskNarration(result: string): boolean {
   const normalized = result.trim();
   return /^(?:let me|now let me|i(?:'|’)ll|i will|first i|next i|我先|我将|现在我|让我|接下来|先看|先查|准备)/i.test(normalized)
     && !/##\s*(outcome|changes|verification|metrics|next)|验证|指标|结果|变更|完成|completed|verified|metrics/i.test(normalized);
+}
+/** Check if a subagent session for the given task has been written to recently
+ * (within the last 5 minutes), indicating the subagent is still actively running. */
+function isSubagentSessionRecentlyActive(task: AutonomousTask): boolean {
+  const sessionsDir = join(homedir(), ".openclaw/agents/main/sessions");
+  try {
+    for (const name of readdirSync(sessionsDir)) {
+      if (!name.endsWith(".jsonl")) continue;
+      const fp = join(sessionsDir, name);
+      const stat = statSync(fp);
+      if (Date.now() - stat.mtimeMs < 5 * 60 * 1000) {
+        try {
+          const content = readFileSync(fp, "utf-8");
+          if (content.includes(task.id) || content.includes("soul-task-" + task.id)) {
+            return true;
+          }
+        } catch { /* ignore */ }
+      }
+    }
+  } catch { /* sessions dir not accessible */ }
+  return false;
 }
+
 
 function isTaskBlockedOrPartial(task: AutonomousTask, result: string): boolean {
   if (unmetAcceptanceCriteria(task, result).length > 0) return true;
@@ -1391,6 +1424,10 @@ Work like the main OpenClaw agent would when the user directly asks for an impro
 - Run the most relevant verification command (build, test, typecheck) if available.
 - Do not ask for confirmation, do not stop at a proposal, and do not invent results.
 
+**Editing tips**:
+- If the edit tool fails with a matching error, the file may use CRLF line endings. Do NOT retry edit repeatedly — instead use node -e with fs.readFileSync/fs.writeFileSync to do string replacement, or use the write tool to rewrite the entire file.
+- If you cannot edit after 2 attempts, switch to exec with a node -e script immediately.
+
 Write your final report as markdown with these sections:
 ## Outcome
 What you investigated and the final result.
@@ -1537,12 +1574,30 @@ export async function executeReportFindings(
 
   const reportableTasks = completedTasks.filter((t) => !isLowValueAutonomousFailure(t));
   if (reportableTasks.length === 0) {
-    log.info(`Report-findings: suppressed ${completedTasks.length} low-value autonomous failure report(s)`);
+    // All tasks are low-value failures. Send a brief status summary so the
+    // user at least knows tasks ran and failed, rather than seeing nothing.
+    if (!options.sendMessage || !options.channel || !options.target) {
+      await markCompletedTasksDelivered();
+      return { result: { type: "report-findings", success: true, result: "suppressed-low-value-failure-report" }, metricsChanged: [] };
+    }
+    const zh = wantsChineseReport(ego);
+    const briefSummary = completedTasks.map((t) => {
+      const reason = (t.result ?? "").match(/(?:failed|partial|blocked|timeout|stale)[^\n]*/i)?.[0] ?? "unknown";
+      return zh
+        ? `\u{4efb}\u{52a1} ${t.id} \u{5931}\u{8d1f}\u{5e0f}: ${reason.slice(0, 100)}`
+        : `Task ${t.id} failed: ${reason.slice(0, 100)}`;
+    }).join("\n");
+    const briefMessage = zh
+      ? `\u{81ea}\u{4e3b}\u{4efb}\u{52a1}\u{72b6}\u{6001}\u{62a5}\u{5440}:\n${briefSummary}`
+      : `Autonomous task status:\n${briefSummary}`;
+    try {
+      await options.sendMessage({ to: options.target, content: briefMessage, channel: options.channel });
+      log.info(`Report-findings: sent brief failure summary for ${completedTasks.length} low-value tasks`);
+    } catch (err) {
+      log.warn(`Failed to send brief failure summary: ${String(err)}`);
+    }
     await markCompletedTasksDelivered();
-    return {
-      result: { type: "report-findings", success: true, result: "suppressed-low-value-failure-report" },
-      metricsChanged: [],
-    };
+    return { result: { type: "report-findings", success: true, result: `reported ${completedTasks.length} low-value failures briefly` }, metricsChanged: [] };
   }
 
   if (!options.sendMessage || !options.channel || !options.target) {
@@ -2711,6 +2766,10 @@ Work like the main OpenClaw agent would when the user directly asks for a focuse
 5. If verification fails, revert the change and report the failure.
 6. Do not ask for confirmation, do not stop at a proposal, and do not invent results.
 
+**Editing tips**:
+- If the \`edit\` tool fails with a matching error, the file may use CRLF line endings. Do NOT retry edit repeatedly — instead use \`node -e\` with \`fs.readFileSync\`/\`fs.writeFileSync\` to do string replacement, or use the \`write\` tool to rewrite the entire file.
+- If you cannot edit after 2 attempts, switch to \`exec\` with a \`node -e\` script immediately.
+
 Write your final report as markdown with these sections:
 ## Outcome
 What you investigated and the final result.
@@ -3100,7 +3159,7 @@ export async function pollActiveTasks(storePath: string): Promise<AutonomousTask
         }
       }
 
-      // Final fallback: stale timeout
+      // Final fallback: stale timeout.
       if (Date.now() - task.updatedAt > STALE_MS) {
         const detail = task.result ?? `Task timed out (stale >${Math.round(STALE_MS / 60000)} min). Required final result file was not produced${task.resultFilePath ? `: ${task.resultFilePath}` : ""}.`;
         task.status = "failed";
