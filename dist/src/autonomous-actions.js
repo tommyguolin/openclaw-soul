@@ -18,15 +18,17 @@ const log = createSoulLogger("autonomous-actions");
 const MAX_ACTIVE_TASKS = 1;
 const PROVIDER_PRESSURE_BACKOFF_MS = 60 * 60 * 1000;
 const PROVIDER_PRESSURE_TAIL_LINES = 80;
+/** The hook must outlive the advertised work budget. */
 const AUTONOMOUS_AGENT_TIMEOUT_SECONDS = 3600;
 const AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS = 3000;
 const AUTONOMOUS_AGENT_QUICK_CHECK_SECONDS = 60;
 /** Grace period to wait for a subagent that timed out or errored to finish
  * writing its result file. The subagent may still be running after
  * waitForRun returns (e.g. due to timeout) and will write the result file
- * directly via the write tool. Increased from 30s to 5min to allow slow
- * subagents to complete their final report writing. */
+ * directly via the write tool. Keep this bounded so a failed run does not
+ * occupy the thought cycle indefinitely. */
 const SUBAGENT_GRACE_PERIOD_MS = 5 * 60 * 1000;
+const SUBAGENT_STALE_SETTLE_MS = 60 * 1000;
 const AUTONOMOUS_FAILURE_BACKOFF_MS = 30 * 60 * 1000;
 const AUTONOMOUS_FAILURE_LOOKBACK_MS = 6 * 60 * 60 * 1000;
 const READABLE_EVIDENCE_EXTENSIONS = [".log", ".txt", ".json", ".csv", ".md", ".yaml", ".yml", ".conf"];
@@ -177,6 +179,28 @@ function reportStatusToTaskStatus(result) {
         return "completed";
     }
     return "failed";
+}
+/**
+ * A timed-out subagent can still be writing its final report. Poll the file
+ * during the bounded grace period instead of sleeping blindly and then
+ * overwriting a report that arrived while we waited.
+ */
+async function waitForFinalTaskReport(resultFilePath, maxWaitMs) {
+    const deadline = Date.now() + maxWaitMs;
+    while (true) {
+        try {
+            const content = readFileSync(resultFilePath, "utf-8").trim();
+            if (content && isFinalTaskReport(content))
+                return content;
+        }
+        catch {
+            // The file may not have been created yet.
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0)
+            return null;
+        await sleep(Math.min(5_000, remaining));
+    }
 }
 function writeTaskReportFile(resultFilePath, content) {
     if (!resultFilePath)
@@ -478,25 +502,15 @@ function isCompleteTaskReport(result) {
         return false;
     if (taskReportStatus(text) === "in-progress")
         return false;
-    // Fast path: if the report has ## Outcome section and is substantial,
-    // accept it even without a Status: header — subagents sometimes omit
-    // the Status line but still write a complete report.
-    if (text.length >= 200 && /^##\s+outcome\b/im.test(text))
-        return true;
-    if (!hasRequiredReportSections(text))
-        return false;
-    // If the report has an explicit Status: header and all required sections,
-    // accept it regardless of body keywords. The keyword check below is a
-    // fallback for reports that omit the Status: header entirely.
-    if (taskReportStatus(text) !== null)
-        return true;
-    return /changed|implemented|verified|command|baseline|before|after|metric|files?/i.test(text);
+    // A terminal report with at least three markdown sections is complete even
+    // when its headings are not English or it omitted the optional Status line.
+    return hasRequiredReportSections(text);
 }
 function hasRequiredReportSections(result) {
     const text = result.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
-    // Language-agnostic: check for any markdown ## section headers.
-    // The model writes sections in the user's language - we only need 3+ distinct sections.
-    const sectionHeaders = text.match(/^##\s+\w+/gm);
+    // Language-agnostic: a section title is any non-whitespace text after ##.
+    // JavaScript \w is ASCII-only and rejects headings such as "## 结果".
+    const sectionHeaders = text.match(/^##\s+\S[^\r\n]*/gm);
     if (!sectionHeaders || sectionHeaders.length < 3)
         return false;
     const unique = new Set(sectionHeaders.map(h => h.toLowerCase()));
@@ -537,12 +551,12 @@ function isTaskBlockedOrPartial(task, result) {
     const reportStatus = taskReportStatus(result);
     if (task.status === "failed")
         return true;
+    // Partial/blocked reports are internally settled as completed to avoid a
+    // failure-backoff loop, but must remain visibly incomplete to the user.
+    if (reportStatus === "failed" || reportStatus === "blocked" || reportStatus === "partial")
+        return true;
     if (reportStatus === "completed")
         return false;
-    // When task.status === "completed", the task went through reportStatusToTaskStatus
-    // which maps partial/blocked → completed. Don't re-classify these as blocked
-    // in the user-facing report — the user already saw "partial" in the result text.
-    // Only flag as blocked if the result file is actually missing.
     if (task.status === "completed") {
         return isInterimTaskNarration(result)
             || (Boolean(task.resultFilePath) && !hasTaskResultFile(task));
@@ -566,8 +580,11 @@ function taskResultFileLine(task, zh) {
             : `Report file: missing (${task.resultFilePath})`;
     }
 }
-function extractReportField(result, field) {
-    const match = new RegExp(`^##\\s+${field}\\b[^\n]*\n([\s\S]*?)(?=^##\\s+|$)`, "im").exec(result.replace(/<think[\s\S]*?<\/think>/gi, "").trim());
+function extractReportField(result, fields) {
+    const alternatives = (Array.isArray(fields) ? fields : [fields])
+        .map((field) => field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+        .join("|");
+    const match = new RegExp(`^##\\s+(?:${alternatives})(?=\\s|:|：|$)[^\\r\\n]*\\r?\\n([\\s\\S]*?)(?=^##\\s+|(?![\\s\\S]))`, "im").exec(result.replace(/<think[\s\S]*?<\/think>/gi, "").trim());
     return match ? match[1].trim() : "";
 }
 function extractChangedFiles(changesText) {
@@ -607,15 +624,16 @@ function buildDirectTaskReportMessage(tasks, ego) {
         const blocked = isTaskBlockedOrPartial(task, result);
         if (zh) {
             // 中文报告：提取关键信息，不直接粘贴整段英文模板
-            const outcome = extractReportField(result, "outcome") || extractReportField(result, "Outcome") || result.slice(0, 600);
-            const changes = extractReportField(result, "changes") || extractReportField(result, "Changes") || "";
-            const verification = extractReportField(result, "verification") || extractReportField(result, "Verification") || "";
-            const metrics = extractReportField(result, "metrics") || extractReportField(result, "Metrics") || "";
+            const outcome = extractReportField(result, ["结果", "Outcome"]) || result.slice(0, 600);
+            const changes = extractReportField(result, ["变更", "Changes"]) || "";
+            const verification = extractReportField(result, ["验证", "Verification"]) || "";
+            const metrics = extractReportField(result, ["指标", "Metrics"]) || "";
             const statusIcon = blocked ? "⚠️" : "✅";
             const statusText = blocked ? "未完成" : "已完成";
             const lines = [
                 `${statusIcon} 自主任务${statusText}`,
                 `任务: ${task.title}`,
+                `\n结果:\n${outcome.slice(0, 800)}`,
             ];
             // 变更文件
             if (changes) {
@@ -1335,33 +1353,37 @@ Remaining risk or a sensible next improvement.`;
     // running after waitForRun returns, and it will write the result file
     // directly via the write tool. Overwriting the file prematurely with
     // subResult.output would clobber the real result.
-    if (!subResult.success) {
-        await sleep(SUBAGENT_GRACE_PERIOD_MS);
-    }
+    const delayedReport = !subResult.success
+        ? await waitForFinalTaskReport(resultFilePath, SUBAGENT_GRACE_PERIOD_MS)
+        : null;
     let report;
-    try {
-        const fileContent = readFileSync(resultFilePath, "utf-8");
-        // If the file still only contains the initial report skeleton, use subagent output
-        if (fileContent.startsWith("Status: in-progress") || fileContent.length < 200) {
-            if (subResult.success) {
-                report = subResult.output;
+    if (delayedReport) {
+        report = delayedReport;
+    }
+    else
+        try {
+            const fileContent = readFileSync(resultFilePath, "utf-8");
+            // If the file still only contains the initial report skeleton, use subagent output
+            if (fileContent.startsWith("Status: in-progress") || fileContent.length < 200) {
+                if (subResult.success) {
+                    report = subResult.output;
+                }
+                else {
+                    // Subagent timed out or errored and hasn't written a final report yet.
+                    // Write "partial" instead of "failed" so the subagent's eventual write
+                    // (if it finishes later) is the canonical result.
+                    report = `Status: partial\n\n## Outcome\nSubagent did not finish within the timeout. ${subResult.error || subResult.output || "No output"}`;
+                }
+                writeTaskReportFile(resultFilePath, report);
             }
             else {
-                // Subagent timed out or errored and hasn't written a final report yet.
-                // Write "partial" instead of "failed" so the subagent's eventual write
-                // (if it finishes later) is the canonical result.
-                report = `Status: partial\n\n## Outcome\nSubagent did not finish within the timeout. ${subResult.error || subResult.output || "No output"}`;
+                report = fileContent;
             }
+        }
+        catch {
+            report = subResult.success ? subResult.output : `Status: failed\n\n## Outcome\n${subResult.error || subResult.output || "Subagent failed with no output"}`;
             writeTaskReportFile(resultFilePath, report);
         }
-        else {
-            report = fileContent;
-        }
-    }
-    catch {
-        report = subResult.success ? subResult.output : `Status: failed\n\n## Outcome\n${subResult.error || subResult.output || "Subagent failed with no output"}`;
-        writeTaskReportFile(resultFilePath, report);
-    }
     // Determine task status from the report's Status: line.
     // "completed" → completed; "partial"/"blocked" → also completed (did useful work,
     //   should NOT trigger failure backoff); everything else → failed.
@@ -2566,29 +2588,33 @@ Remaining risk or a sensible next improvement.`;
     }
     // Read what the subagent wrote to the result file, otherwise use subagent output
     // Same grace period logic as executeRunAgentTaskViaSubagent above.
-    if (!subResult.success) {
-        await sleep(SUBAGENT_GRACE_PERIOD_MS);
-    }
+    const delayedReport = !subResult.success
+        ? await waitForFinalTaskReport(resultFilePath, SUBAGENT_GRACE_PERIOD_MS)
+        : null;
     let report;
-    try {
-        const fileContent = readFileSync(resultFilePath, "utf-8");
-        if (fileContent.startsWith("Status: in-progress") || fileContent.length < 200) {
-            if (subResult.success) {
-                report = subResult.output;
+    if (delayedReport) {
+        report = delayedReport;
+    }
+    else
+        try {
+            const fileContent = readFileSync(resultFilePath, "utf-8");
+            if (fileContent.startsWith("Status: in-progress") || fileContent.length < 200) {
+                if (subResult.success) {
+                    report = subResult.output;
+                }
+                else {
+                    report = `Status: partial\n\n## Outcome\nSubagent did not finish within the timeout. ${subResult.error || subResult.output || "No output"}`;
+                }
+                writeTaskReportFile(resultFilePath, report);
             }
             else {
-                report = `Status: partial\n\n## Outcome\nSubagent did not finish within the timeout. ${subResult.error || subResult.output || "No output"}`;
+                report = fileContent;
             }
+        }
+        catch {
+            report = subResult.success ? subResult.output : `Status: failed\n\n## Outcome\n${subResult.error || subResult.output || "Subagent failed with no output"}`;
             writeTaskReportFile(resultFilePath, report);
         }
-        else {
-            report = fileContent;
-        }
-    }
-    catch {
-        report = subResult.success ? subResult.output : `Status: failed\n\n## Outcome\n${subResult.error || subResult.output || "Subagent failed with no output"}`;
-        writeTaskReportFile(resultFilePath, report);
-    }
     // Determine task status from the report's Status: line.
     // "completed" → completed; "partial"/"blocked" → also completed (did useful work,
     //   should NOT trigger failure backoff); everything else → failed.
@@ -2847,7 +2873,11 @@ async function persistTask(task) {
  * Returns list of newly completed tasks (with results from file capture).
  */
 export async function pollActiveTasks(storePath) {
-    const STALE_MS = (AUTONOMOUS_AGENT_TIMEOUT_SECONDS + 120) * 1000; // subagent timeout + 2min grace; must exceed AUTONOMOUS_AGENT_TIMEOUT_SECONDS
+    // Allow the hook timeout, the report-write grace period, and a small settle
+    // window before another polling cycle can declare the task stale.
+    const STALE_MS = AUTONOMOUS_AGENT_TIMEOUT_SECONDS * 1000
+        + SUBAGENT_GRACE_PERIOD_MS
+        + SUBAGENT_STALE_SETTLE_MS;
     const MAX_TASKS = 20;
     const newlyCompleted = [];
     await updateEgoStore(storePath, (e) => {

@@ -34,6 +34,12 @@
         "enum": ["legacy", "observe", "shadow", "primary"],
         "description": "Cognitive activation mode. primary routes private thoughts through Activation while preserving operational detectors and all expression/action safety gates"
       },
+      "checkIntervalMs": {
+        "type": "number",
+        "minimum": 1000,
+        "description": "Thought cycle check interval in milliseconds. Default: 60000 (1 minute). Set to 300000 for 5 minutes or 1800000 for 30 minutes",
+        "default": 60000
+      },
       "cognitiveTemperament": {
         "type": "string",
         "enum": ["focused", "balanced", "expansive"],
