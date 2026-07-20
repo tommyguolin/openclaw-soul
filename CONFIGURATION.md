@@ -19,6 +19,8 @@ Whether Soul can edit files and run shell commands on its own.
 - When `false` (default): Soul can read files, run diagnostic commands (cat, grep, tail, ls), and analyze problems. It cannot modify anything.
 - When `true`: Soul can additionally fix bugs, edit its own source code, and run any shell command.
 
+For periodic self-improvement, Soul uses the full `subagent-improve` tool chain when the OpenClaw subagent runtime is available. If that runtime is unavailable, it falls back to the bounded local `observe-and-improve` path instead of starting a task that cannot run.
+
 ### `thoughtFrequency`
 
 | | |

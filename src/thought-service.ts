@@ -1992,8 +1992,15 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
 
     const workItem = buildThoughtFromOpportunity(opportunity, ego);
     workItem.content = `Scheduled maintenance: ${opportunity.triggerDetail}`;
-    workItem.actionType = "subagent-improve";
-    log.info(`Running maintenance work outside thought stream: ${opportunity.triggerDetail}`);
+    if (this.subAgentRunner) {
+      workItem.actionType = "subagent-improve";
+      log.info(`Running maintenance work outside thought stream via subagent-improve: ${opportunity.triggerDetail}`);
+    } else {
+      // Fall back to the local patch path only when the subagent runner is unavailable,
+      // so we do not give up the full tool chain unnecessarily.
+      workItem.actionType = "observe-and-improve";
+      log.info(`Running maintenance work outside thought stream via observe-and-improve: ${opportunity.triggerDetail}`);
+    }
     await this.executeThoughtAction(workItem, ego);
     return true;
   }

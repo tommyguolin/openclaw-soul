@@ -50,6 +50,40 @@ test("need gaps and self-maintenance are operational work, not thought opportuni
   assert(maintenance.some((item) => item.triggerDetail.includes("Security need critically low")));
 });
 
+test("scheduled maintenance uses the subagent only when it is available", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-maintenance-route-"));
+  const storePath = path.join(directory, "ego.json");
+  const ego = context().ego;
+  await saveEgoStore(storePath, { version: 3, ego, createdAt: Date.now(), updatedAt: Date.now() });
+
+  type MaintenanceInternals = {
+    runMaintenanceIfDue(): Promise<boolean>;
+    executeThoughtAction(thought: Thought, currentEgo: EgoState): Promise<void>;
+  };
+  const captureMaintenanceAction = async (service: ThoughtService): Promise<Thought> => {
+    let captured: Thought | undefined;
+    const internals = service as unknown as MaintenanceInternals;
+    internals.executeThoughtAction = async (thought) => { captured = thought; };
+    assert.equal(await internals.runMaintenanceIfDue(), true);
+    assert(captured);
+    return captured;
+  };
+
+  try {
+    const localService = new ThoughtService({ storePath, autonomousActions: true });
+    assert.equal((await captureMaintenanceAction(localService)).actionType, "observe-and-improve");
+
+    const delegatedService = new ThoughtService({
+      storePath,
+      autonomousActions: true,
+      subAgentRunner: async () => ({ runId: "test", success: true, output: "" }),
+    });
+    assert.equal((await captureMaintenanceAction(delegatedService)).actionType, "subagent-improve");
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("goal progress remains background motivation rather than a thought stimulus", () => {
   const ego = createDefaultEgoState();
   ego.goals.push({

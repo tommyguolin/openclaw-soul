@@ -75,6 +75,7 @@ Soul can take real actions beyond thinking:
 - **`run-agent-task`** — Delegates to a full agent with write access (when enabled)
 - **`report-findings`** — Proactively sends you a summary of completed analysis
 - **`observe-and-improve`** — Self-improvement: reads its own code, identifies improvements, and implements fixes
+- **`subagent-improve`** — Uses the OpenClaw subagent runtime for one bounded inspect → patch → verify iteration when that runtime is available
 
 **Permission model:**
 - **Read operations** (reading files, running diagnostics) — always allowed
@@ -250,12 +251,16 @@ All options have sensible defaults. Only configure what you need.
 | `cognitionMode` | `legacy` | `openclaw config set plugins.entries.soul.config.cognitionMode observe` |
 | `cognitiveTemperament` | `balanced` | `openclaw config set plugins.entries.soul.config.cognitiveTemperament expansive` |
 | `expressionPolicy` | `legacy` | `openclaw config set plugins.entries.soul.config.expressionPolicy observe` |
+| `checkIntervalMs` | `60000` | `openclaw config set plugins.entries.soul.config.checkIntervalMs 300000` |
 
 - **`autonomousActions`** — Allow Soul to edit files and run commands. When `false`, Soul can still read files and run diagnostics, but cannot modify anything. When `true`, Soul can fix bugs, edit its own code, and run any command.
 - **`thoughtFrequency`** — How often Soul thinks and messages. `0.2`-`0.4` for testing and faster proactive outreach, `1.0` for default, `2.0` for quiet.
 - **`cognitionMode`** — `legacy` keeps current behavior. `observe` records activation without an LLM. `shadow` generates private thoughts into an isolated experiment pool. `primary` makes Activation/Workspace the ordinary private-thought source while keeping operational detectors and every existing expression/action safety gate; Activation-origin outreach is capped at one sent item per 24 hours.
 - **`cognitiveTemperament`** — Controls associative breadth inside private cognition: `focused` favors near continuity, `balanced` is the default, and `expansive` permits more structurally bridged material. Active troubleshooting automatically narrows regardless of this setting.
 - **`expressionPolicy`** — `legacy` disables the feedback layer. With `cognitionMode=primary`, `observe` records objective reply/no-reply observations without changing behavior, while `adaptive` lets high-confidence explicit feedback adjust expression waiting time and value threshold only. No reply is recorded as uncertain, never as automatic rejection or annoyance.
+- **`checkIntervalMs`** — Base thought-cycle interval in milliseconds. The default is 60 seconds; use a larger value to reduce background activity.
+
+When `autonomousActions` is enabled, periodic self-improvement uses `subagent-improve` when the OpenClaw subagent runtime is available. Otherwise it safely falls back to `observe-and-improve`; it does not disable an available subagent tool chain.
 
 Soul extracts project paths from user requests such as "optimize the project under `/path/to/project`". If a path cannot be read directly, Soul also tries common cross-platform mappings such as Git Bash `/c/work/project`, WSL `/mnt/c/work/project`, and Windows `C:\work\project`.
 
@@ -284,7 +289,7 @@ Any OpenAI-compatible or Anthropic API: Claude, GPT-4o, DeepSeek, Zhipu, Minimax
 |--------|-------------|
 | `intelligent-thought.ts` | Context-aware thought & opportunity detection |
 | `action-executor.ts` | Executes thought actions (learn, search, message, reflect) |
-| `autonomous-actions.ts` | Autonomous executors (analyze-problem, run-agent-task, report-findings, observe-and-improve) |
+| `autonomous-actions.ts` | Autonomous executors (analyze-problem, run-agent-task, report-findings, observe-and-improve, subagent-improve) |
 | `thought-service.ts` | Core thought generation & adaptive scheduling |
 | `thought-journal.ts` | Durable thought-cycle trace and restart diversity recovery |
 | `thought-lab.ts` | Read-only accelerated baseline and A/B experiments |
