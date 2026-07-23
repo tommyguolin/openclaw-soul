@@ -4,6 +4,9 @@
 
 ### Changes
 
+- **Make self-modification activation transactional**: Verified Soul code changes now enter an `awaiting-restart` state, persist their report before a detached gateway restart, and become reportable only after a later Soul process confirms that the new build was loaded.
+- **Converge maintenance instead of repeating it**: A maintenance domain with a recent verified success enters a 24-hour observation window, preventing the same report/reliability theme from reopening every cycle without new failure evidence.
+- **Bind built-in maintenance to the linked Soul checkout**: Internal maintenance can no longer drift into the generic OpenClaw workspace; explicit user project roots remain authoritative for user-directed work.
 - **Capability-aware autonomous maintenance**: Periodic self-improvement keeps the full `subagent-improve` inspect → patch → verify path when the OpenClaw subagent runtime is available, and falls back to bounded local `observe-and-improve` only when it is unavailable.
 - **Let Soul remain proactively present without a daily cap**: Removed the primary-mode once-per-24-hour expression limit and the proactive-message daily count limit. Frequency-based pacing, active-conversation quiet time, deduplication, and value/safety checks still prevent interruptions and empty outreach.
 - **Keep proactive conversation alive when research is unavailable**: After a no-progress proactive research or content-push attempt, a useful `send-message` candidate now takes priority instead of being repeatedly displaced by another evidence-dependent research turn.

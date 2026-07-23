@@ -86,6 +86,13 @@ export interface Goal {
   updatedAt: number;
   completedAt?: number;
   abandonedReason?: string;
+  parentId?: string;
+  childGoals?: string[];
+  goalFamily?: "knowledge" | "trust" | "improvement" | "generic";
+  targetState?: string;
+  measurementCriteria?: string[];
+  evaluationSummary?: string;
+  lastEvaluatedAt?: number;
 }
 
 export interface Desire {
@@ -231,7 +238,30 @@ export interface MentalContext {
   backgroundConcerns: string[];
   environmentalChanges: string[];
   associativeEcho: string[];
+  maintenanceBacklog: MaintenanceBacklogItem[];
   updatedAt: number;
+}
+
+export interface MaintenanceBacklogItem {
+  domain: string;
+  label: string;
+  objective: string;
+  nextStep: string;
+  preferredAction: ActionType;
+  score: number;
+  evidence: string[];
+  alignedGoals: string[];
+  alignmentSummary: string;
+  lastSeenAt: number;
+  goalPath?: string;
+  primaryGoalId?: string;
+  primaryGoalTitle?: string;
+  primaryGoalFamily?: string;
+  alignmentScore?: number;
+  convergenceState?: "actionable" | "observing" | "converged";
+  cooldownUntil?: number;
+  recentAttempts?: number;
+  recentVerifiedSuccesses?: number;
 }
 
 export type InteractionSemanticSignal =
@@ -303,7 +333,7 @@ export type ObsessionType =
 
 // --- Autonomous Task Tracking ---
 
-export type TaskStatus = "pending" | "in-progress" | "completed" | "failed";
+export type TaskStatus = "pending" | "in-progress" | "awaiting-restart" | "completed" | "failed";
 
 export interface TaskStep {
   id: string;
@@ -335,6 +365,10 @@ export interface AutonomousTask {
   workHandoffId?: string;
   targetProjectRoot?: string;
   acceptanceCriteria?: string[];
+  maintenanceDomain?: string;
+  maintenanceObjective?: string;
+  activationRequestedAt?: number;
+  activatedAt?: number;
 }
 
 /** Durable evidence connecting a host-agent work turn to a local project. */

@@ -27,6 +27,7 @@ import {
   hasUnresolvedLocalEvidenceMissingResult,
   isExecutionFocusedOpportunity,
   isLocalProjectEvidenceQuestion,
+  buildMaintenanceBacklog,
   type DetectedThoughtOpportunity,
 } from "./intelligent-thought.js";
 import { loadWorkspaceContext } from "./paths.js";
@@ -98,6 +99,7 @@ import {
 } from "./expression/feedback-store.js";
 import { ThoughtEpisodeStore, resolveThoughtEpisodeStorePath } from "./cognition/thought-store.js";
 import { buildUserLanguageInstruction, supportsLocalMessageTemplate } from "./language-context.js";
+import { buildGoalSystemSummary, recomputeGoalState } from "./goal-system.js";
 
 const log = createSoulLogger("thought-service");
 type LLMBudgetLane = "critical" | "action" | "thought" | "shadow";
@@ -969,7 +971,7 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
   }
 
   private hasActiveAutonomousTask(ego: EgoState): boolean {
-    return (ego.activeTasks ?? []).some((t) => t.status === "in-progress");
+    return (ego.activeTasks ?? []).some((t) => t.status === "in-progress" || t.status === "awaiting-restart");
   }
 
   private hasUndeliveredAutonomousTaskResult(ego: EgoState): boolean {
@@ -994,7 +996,7 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
   }
 
   private getOpportunityAction(opportunity: DetectedThoughtOpportunity, ego: EgoState): ActionType | undefined {
-    return getActionForOpportunity(opportunity, ego).actionType ?? opportunity.suggestedAction;
+    return getActionForOpportunity(opportunity, ego, Boolean(this.subAgentRunner)).actionType ?? opportunity.suggestedAction;
   }
 
   private filterCognitionPrimaryOpportunities(
@@ -1063,6 +1065,39 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
 
     const readyOpportunities = opportunities.filter((o) => this.isOpportunityActionReady(o, ego));
     const candidates = readyOpportunities.length > 0 ? readyOpportunities : opportunities;
+    const recentGroundedDiscovery = ego.memories.some((memory) =>
+      memory.timestamp > Date.now() - 6 * 60 * 60 * 1000
+      && (memory.evidenceKind === "web"
+        || memory.tags.includes("web-search")
+        || memory.tags.includes("proactive-content-push")),
+    );
+    const recentActionTypes = new Set((ego.behaviorLog ?? [])
+      .filter((entry) => entry.timestamp > Date.now() - 6 * 60 * 60 * 1000)
+      .map((entry) => entry.actionType));
+    const discoveryCandidates = candidates.filter((opportunity) => {
+      const action = this.getOpportunityAction(opportunity, ego);
+      return action === "proactive-content-push"
+        || action === "proactive-research"
+        || action === "search-web"
+        || action === "learn-topic";
+    });
+    const untriedDiscovery = discoveryCandidates.find((opportunity) => {
+      const action = this.getOpportunityAction(opportunity, ego);
+      return Boolean(action) && !recentActionTypes.has(action!);
+    });
+    if (untriedDiscovery) return untriedDiscovery;
+
+    const untriedCheckIn = candidates.find((opportunity) =>
+      this.getOpportunityAction(opportunity, ego) === "proactive-check-in"
+      && !recentActionTypes.has("proactive-check-in"));
+    if (untriedCheckIn) return untriedCheckIn;
+
+    if (!recentGroundedDiscovery && discoveryCandidates.length > 0) {
+      // Maintenance runs on its own lane. Keep the conversational lane from
+      // starving research/learning forever merely because a generic proactive
+      // message has a slightly higher static priority.
+      return discoveryCandidates[0];
+    }
     // Research and content push both require grounded external evidence. When one
     // has already made no progress in this process, do not let another protected
     // research turn crowd out a useful, ordinary conversation follow-up.
@@ -1168,6 +1203,8 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
       await this.applyDecay();
       await this.runExpiryIfDue();
       await this.resolveStalePendingEntries();
+      // 任务轮询不能被活跃对话挡住，否则子代理即使已经写完结果，也要等静默窗口结束才会被回收。
+      await this.pollActiveTasks();
       const quietRemainingMs = await this.activeConversationQuietRemainingMs();
       if (quietRemainingMs > 0) {
         log.debug(
@@ -1180,7 +1217,6 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
       await this.maybePromptForAutonomousActions();
       await this.maybeRefreshWorkspaceContext();
       await this.flushPendingMessage();
-      await this.pollActiveTasks();
       const maintenanceRan = await this.runMaintenanceIfDue();
       if (!maintenanceRan) {
         await this.checkAndGenerateThought();
@@ -1330,6 +1366,10 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
       (g) => g.status === "active" && IMPROVE_RE.test(g.title + g.description),
     );
     if (hasGoal) {
+      await updateEgoStore(this.storePath, (current) => {
+        recomputeGoalState(current);
+        return current;
+      });
       this.selfImprovementGoalSynced = true;
       return;
     }
@@ -1338,11 +1378,12 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
     const hasSelfImproveFact = (ego.userFacts ?? []).filter((fact) => fact.validity !== "superseded").some(
       (f) =>
         f.confidence >= 0.8 &&
-        /优化|observe.*log|自主|self.?improv|proactive.*optim/i.test(f.content),
+        /优化|改进|自我改进|observe.*log|自主|self[- ]?improv|improv(?:e|ing|ement)?|autonom(?:ous|ously)|proactive.*optim|human[- ]like|更主动|更像人/i.test(f.content),
     );
 
     if (!hasSelfImproveFact) {
-      this.selfImprovementGoalSynced = true;
+      // Do not latch permanently here: the directive may arrive later in the
+      // session, and we still want to create the goal once evidence appears.
       return;
     }
 
@@ -1350,6 +1391,7 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
     await updateEgoStore(this.storePath, (e) => {
       // Double-check inside lock
       if (e.goals.some((g) => g.status === "active" && IMPROVE_RE.test(g.title + g.description))) {
+        recomputeGoalState(e);
         return e;
       }
       e.goals.push({
@@ -1361,6 +1403,7 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
         createdAt: Date.now(),
         updatedAt: Date.now(),
       });
+      recomputeGoalState(e);
       return e;
     });
 
@@ -1960,7 +2003,21 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
     }
     const store = await loadEgoStore(this.storePath);
     const ego = store.ego;
+    const goalState = recomputeGoalState(ego);
     if (this.hasActiveAutonomousTask(ego) || this.hasUndeliveredAutonomousTaskResult(ego)) return false;
+
+    const maintenanceBacklog = buildMaintenanceBacklog(ego);
+    if (goalState.changed > 0) {
+      log.debug(`Goal state refreshed before maintenance: ${goalState.summary || "no summary"}`);
+    }
+    log.debug(buildGoalSystemSummary(ego, maintenanceBacklog));
+    await updateEgoStore(this.storePath, (current) => {
+      recomputeGoalState(current);
+      current.mentalContext.maintenanceBacklog = maintenanceBacklog;
+      current.mentalContext.updatedAt = Date.now();
+      return current;
+    });
+    ego.mentalContext.maintenanceBacklog = maintenanceBacklog;
 
     const lastMaintenance = [...(ego.behaviorLog ?? [])]
       .reverse()
@@ -1990,7 +2047,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
       .find((candidate) => candidate.type === "self-improvement-monitor");
     if (!opportunity) return false;
 
-    const workItem = buildThoughtFromOpportunity(opportunity, ego);
+    const workItem = buildThoughtFromOpportunity(opportunity, ego, Boolean(this.subAgentRunner));
     workItem.content = `Scheduled maintenance: ${opportunity.triggerDetail}`;
     if (this.subAgentRunner) {
       workItem.actionType = "subagent-improve";
@@ -2255,6 +2312,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
           thought = await generateIntelligentThought(ctx, {
             llmGenerator: availableLLMGenerator,
             preferOpportunity: selectedOpportunity,
+            subAgentAvailable: Boolean(this.subAgentRunner),
           });
           if (signal.aborted) {
             await recordCycle("skipped", "aborted after thought generation");
@@ -2281,6 +2339,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
                 thought = await generateIntelligentThought(ctx, {
                   llmGenerator: availableLLMGenerator,
                   preferOpportunity: selectedOpportunity,
+                  subAgentAvailable: Boolean(this.subAgentRunner),
                 });
                 if (signal.aborted) {
                   await recordCycle("skipped", "aborted after retry generation");
@@ -2349,7 +2408,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
         selectedOpportunity = this.selectBestOpportunity(novelOpportunities, ego)
           ?? this.selectBestOpportunity(nonRepeatingOpportunities, ego);
         if (selectedOpportunity) {
-          thought = buildThoughtFromOpportunity(selectedOpportunity, ego);
+          thought = buildThoughtFromOpportunity(selectedOpportunity, ego, Boolean(this.subAgentRunner));
         } else {
           // All opportunities exhausted — back off instead of generating random thoughts
           this.applySkipBackoff("no novel opportunities");
@@ -3178,7 +3237,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
 
     const opportunities = detectThoughtOpportunities(ctx);
     if (opportunities.length > 0) {
-      return buildThoughtFromOpportunity(opportunities[0], ego);
+      return buildThoughtFromOpportunity(opportunities[0], ego, Boolean(this.subAgentRunner));
     }
 
     return null;
@@ -3268,6 +3327,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
       await updateEgoStore(this.storePath, (ego) => {
         ego.userFacts = allFacts;
         updateRelationshipProfile(ego);
+        recomputeGoalState(ego);
 
         // Progress goal "Know the User" based on accumulated user facts
         const understandGoal = ego.goals.find(

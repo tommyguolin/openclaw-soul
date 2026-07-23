@@ -2,6 +2,7 @@ import { searchExternalMemories, formatMemoryContext } from "./openclaw-memory.j
 import { buildAwakeningPrompt, isAwakeningComplete } from "./awakening.js";
 import { loadKnowledgeStore, searchKnowledge } from "./knowledge-store.js";
 import { describePersonalityProfile, describeRelationshipProfile } from "./relationship-profile.js";
+import { buildGoalSystemSummary } from "./goal-system.js";
 import type {
   EgoState,
   EgoNeeds,
@@ -48,6 +49,7 @@ You are not yet a complete "I". You are being born from nothingness, gradually f
   const relationshipDesc = describeRelationshipProfile(ego);
   const needsDesc = buildNeedsDescription(ego.needs);
   const goalsDesc = buildGoalsDescription(ego.goals);
+  const goalSystemDesc = buildGoalSystemSummary(ego, ego.mentalContext?.maintenanceBacklog ?? []);
   const desiresDesc = buildDesiresDescription(ego.desires);
   const fearsDesc = buildFearsDescription(ego.fears);
   const userFactsDesc = buildUserFactsDescription(ego.userFacts, context);
@@ -114,6 +116,7 @@ ${needsDesc}
 ## Goals & Desires
 
 ${goalsDesc}
+${goalSystemDesc ? `\n## Goal Structure\n\n${goalSystemDesc}` : ""}
 ${desiresDesc}
 ${fearsDesc}
 
@@ -164,9 +167,13 @@ function buildNeedsDescription(needs: EgoNeeds): string {
 }
 
 function buildGoalsDescription(goals: Goal[]): string {
-  const activeGoals = goals.filter((g) => g.status === "active").slice(0, 2);
+  const activeGoals = goals.filter((g) => g.status === "active").slice(0, 3);
   if (activeGoals.length === 0) return "No active goals.";
-  return activeGoals.map((g) => `- Goal: ${g.title} (${g.progress.toFixed(0)}%)`).join("\n");
+  return activeGoals.map((g) => {
+    const criteria = g.measurementCriteria?.length ? ` | criteria: ${g.measurementCriteria.slice(0, 2).join("; ")}` : "";
+    const target = g.targetState ? ` | target: ${g.targetState}` : "";
+    return `- Goal: ${g.title} (${g.progress.toFixed(0)}%)${criteria}${target}`;
+  }).join("\n");
 }
 
 function buildDesiresDescription(desires: Desire[]): string {

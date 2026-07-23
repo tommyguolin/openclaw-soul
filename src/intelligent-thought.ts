@@ -13,9 +13,11 @@ import type {
   Desire,
   MetricDelta,
   ActionType,
+  MaintenanceBacklogItem,
 } from "./types.js";
 import { adjustProbability } from "./behavior-log.js";
 import { generateAdjacentContentIdeas, MEANINGLESS_QUERIES } from "./action-executor.js";
+import { buildGoalPath, selectPrimaryGoal } from "./goal-system.js";
 import { describePersonalityProfile, describeRelationshipProfile } from "./relationship-profile.js";
 import { searchExternalMemories, formatMemoryContext } from "./openclaw-memory.js";
 
@@ -51,6 +53,8 @@ export interface IntelligentThoughtOptions {
   preferOpportunity?: DetectedThoughtOpportunity;
   /** Only operational callers should expand an action into adjacent ideas. */
   expandActionIdeas?: boolean;
+  /** Whether a full subagent runtime is available for maintenance work. */
+  subAgentAvailable?: boolean;
 }
 
 export interface ThoughtTriggerContext {
@@ -79,6 +83,369 @@ type TopicFocusProfile = {
   deprioritized: string[];
   summary: string;
 };
+
+type MaintenanceFocus = {
+  domain: string;
+  label: string;
+  objective: string;
+  nextStep: string;
+  preferredAction: ActionType;
+  score: number;
+  evidence: string[];
+  alignedGoals: string[];
+  alignmentSummary: string;
+  lastSeenAt?: number;
+  goalPath?: string;
+  primaryGoalId?: string;
+  primaryGoalTitle?: string;
+  primaryGoalFamily?: string;
+  alignmentScore?: number;
+  convergenceState?: "actionable" | "observing" | "converged";
+  cooldownUntil?: number;
+  recentAttempts?: number;
+  recentVerifiedSuccesses?: number;
+};
+
+type MaintenanceSignalSpec = {
+  domain: string;
+  label: string;
+  objective: string;
+  nextStep: string;
+  preferredAction: ActionType;
+  needs: string[];
+  taskPatterns: RegExp[];
+  behaviorPatterns: RegExp[];
+  goalHints: string[];
+};
+
+function maintenanceBacklogKey(item: Pick<MaintenanceBacklogItem, "domain" | "label" | "objective">): string {
+  return `${item.domain}|${item.label}|${item.objective}`.toLowerCase();
+}
+
+const MAINTENANCE_SIGNAL_SPECS: MaintenanceSignalSpec[] = [
+  {
+    domain: "subagent-reliability",
+    label: "Subagent reliability",
+    objective: "Make autonomous improvement runs finish with a complete report instead of timing out or stopping short.",
+    nextStep: "Inspect the execution chain and remove the dominant failure bottleneck.",
+    preferredAction: "subagent-improve",
+    needs: ["growth", "security"],
+    taskPatterns: [
+      /subagent-improve/i,
+      /run-agent-task/i,
+      /observe-and-improve/i,
+      /timeout|timed out|stale|rate limit|cooldown|429|No available auth profile|Request timed out|embedded run timeout/i,
+      /partial|blocked|failed to start|no source files found|stopped before producing a final result file/i,
+    ],
+    behaviorPatterns: [
+      /subagent-improve/i,
+      /observe-and-improve/i,
+      /run-agent-task/i,
+    ],
+    goalHints: ["subagent", "agent", "reliable", "stability", "completion", "timeout", "verification", "improve"],
+  },
+  {
+    domain: "report-fidelity",
+    label: "Report fidelity",
+    objective: "Keep task reports specific enough to capture changes, verification, and evidence instead of collapsing into very short summaries.",
+    nextStep: "Compare short reports with the full task flow and patch the report assembly or truncation path.",
+    preferredAction: "observe-and-improve",
+    needs: ["growth", "meaning"],
+    taskPatterns: [
+      /Status:\s*(?:partial|failed)\b/i,
+      /No files were changed|没有修改任何文件|No verification was run|没有执行验证|No confirmed final change set/i,
+      /did not finish with a complete report|stopped before producing a final result file/i,
+    ],
+    behaviorPatterns: [
+      /report-findings/i,
+      /observe-and-improve/i,
+    ],
+    goalHints: ["report", "summary", "evidence", "useful", "concise", "quality", "clarity"],
+  },
+  {
+    domain: "goal-alignment",
+    label: "Goal alignment",
+    objective: "Keep maintenance work tied to the user's long-term request for a more proactive, useful, human-like Soul.",
+    nextStep: "Check which current behaviors best support the user's stated direction and use that as the maintenance anchor.",
+    preferredAction: "subagent-improve",
+    needs: ["meaning", "connection", "growth"],
+    taskPatterns: [
+      /self-improvement|proactive|interaction|connection|understand me|主动|了解我|像人|更像人|更主动|更积极/i,
+    ],
+    behaviorPatterns: [
+      /proactive/i,
+      /send-message/i,
+      /self-improvement-monitor/i,
+    ],
+    goalHints: ["proactive", "active", "interaction", "human", "helpful", "connection", "understand", "improve"],
+  },
+];
+
+function clipMaintenanceText(text: string, max = 140): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, max);
+}
+
+function asString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeMaintenanceText(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+const MAINTENANCE_CONVERGENCE_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+function taskMatchesMaintenanceDomain(task: EgoState["activeTasks"][number], spec: MaintenanceSignalSpec): boolean {
+  if (task.maintenanceDomain) return task.maintenanceDomain === spec.domain;
+  const text = `${task.title} ${task.description} ${task.result ?? ""}`;
+  if (spec.domain === "report-fidelity"
+      && /report|final result|result recovery|placeholder|skeleton|truncat|报告|结果回收|占位|骨架|截断/i.test(text)) {
+    return true;
+  }
+  if (spec.domain === "subagent-reliability"
+      && /subagent improvement|subagent-improve|子代理/i.test(text)
+      && /timeout|stale|result|report|recovery|完成|超时|结果|报告|回收/i.test(text)) {
+    return true;
+  }
+  return spec.taskPatterns.some((pattern) => pattern.test(text));
+}
+
+function isVerifiedMaintenanceSuccess(task: EgoState["activeTasks"][number]): boolean {
+  if (task.status !== "completed" || !task.result) return false;
+  if (/^Status:\s*(?:failed|blocked|partial|awaiting-restart)\b/im.test(task.result)) return false;
+  const verification = /##\s*(?:Verification|验证)[\s\S]*?(?=\n##\s|$)/i.exec(task.result)?.[0] ?? "";
+  return verification.length > 0
+    && !/not run|未执行|没有执行验证|failed|失败/i.test(verification)
+    && /pass|通过|success|成功|exit(?:ed)?\s*(?:code\s*)?0|\b0\s+fail/i.test(verification);
+}
+
+function countPatternHits(text: string, patterns: RegExp[]): number {
+  return patterns.reduce((count, pattern) => count + (pattern.test(text) ? 1 : 0), 0);
+}
+
+function collectEvidenceSnippets(texts: string[], patterns: RegExp[], limit = 4): string[] {
+  const evidence: string[] = [];
+  for (const text of texts) {
+    if (evidence.length >= limit) break;
+    if (patterns.some((pattern) => pattern.test(text))) {
+      const snippet = clipMaintenanceText(text, 180);
+      if (snippet && !evidence.includes(snippet)) evidence.push(snippet);
+    }
+  }
+  return evidence;
+}
+
+function scoreGoalAlignment(text: string, hints: string[]): number {
+  const normalized = normalizeMaintenanceText(text);
+  if (!normalized) return 0;
+  let score = 0;
+  for (const hint of hints) {
+    if (normalized.includes(hint.toLowerCase())) score += 1;
+  }
+  return score;
+}
+
+function summarizeGoalAlignment(ego: EgoState, spec: MaintenanceSignalSpec): { goals: string[]; summary: string } {
+  const matchedGoals = ego.goals
+    .filter((goal) => goal.status === "active")
+    .filter((goal) => scoreGoalAlignment(`${goal.title} ${goal.description}`, spec.goalHints) > 0)
+    .map((goal) => goal.title)
+    .slice(0, 4);
+
+  const matchedPrefs = (ego.userPreferences ?? [])
+    .filter((pref) => scoreGoalAlignment(`${pref.aspect} ${pref.preference}`, spec.goalHints) > 0)
+    .map((pref) => pref.preference)
+    .slice(0, 3);
+
+  const matchedFacts = activeUserFacts(ego)
+    .filter((fact) => scoreGoalAlignment(`${fact.category} ${fact.content}`, spec.goalHints) > 0)
+    .map((fact) => fact.content)
+    .slice(0, 3);
+
+  const summaryParts = [
+    matchedGoals.length > 0 ? `goals: ${matchedGoals.join("; ")}` : "",
+    matchedPrefs.length > 0 ? `preferences: ${matchedPrefs.join("; ")}` : "",
+    matchedFacts.length > 0 ? `facts: ${matchedFacts.join("; ")}` : "",
+  ].filter(Boolean);
+
+  return {
+    goals: [...matchedGoals, ...matchedPrefs, ...matchedFacts].slice(0, 6),
+    summary: summaryParts.join(" | "),
+  };
+}
+
+function collectMaintenanceFocuses(ego: EgoState): MaintenanceFocus[] {
+  const now = Date.now();
+  const primaryGoal = selectPrimaryGoal(ego);
+  const goalPath = primaryGoal ? buildGoalPath(primaryGoal, ego.goals ?? []) : undefined;
+  const taskLookbackMs = 7 * 24 * 60 * 60 * 1000;
+  const behaviorLookbackMs = 14 * 24 * 60 * 60 * 1000;
+  const recentTasks = (ego.activeTasks ?? [])
+    .filter((task) => now - Math.max(task.updatedAt ?? 0, task.createdAt ?? 0) <= taskLookbackMs)
+    .slice(-30);
+  const recentBehaviors = (ego.behaviorLog ?? [])
+    .filter((entry) => now - entry.timestamp <= behaviorLookbackMs)
+    .slice(-80);
+  const taskText = recentTasks
+    .map((task) => `${task.title} ${task.description} ${task.result ?? ""}`.trim())
+    .filter(Boolean);
+  const behaviorText = recentBehaviors
+    .map((entry) => `${entry.actionType} ${entry.thoughtType} ${entry.outcome}`)
+    .filter(Boolean);
+
+  const focuses = MAINTENANCE_SIGNAL_SPECS.map((spec) => {
+    const domainTasks = recentTasks
+      .filter((task) => taskMatchesMaintenanceDomain(task, spec))
+      .sort((left, right) => (right.updatedAt ?? right.createdAt) - (left.updatedAt ?? left.createdAt));
+    const latestDomainTask = domainTasks[0];
+    const activeDomainTask = domainTasks.some((task) => task.status === "in-progress" || task.status === "awaiting-restart");
+    const verifiedSuccesses = domainTasks.filter(isVerifiedMaintenanceSuccess);
+    const latestVerifiedSuccess = verifiedSuccesses[0];
+    const verifiedCooldownUntil = latestVerifiedSuccess
+      ? (latestVerifiedSuccess.completedAt ?? latestVerifiedSuccess.updatedAt) + MAINTENANCE_CONVERGENCE_COOLDOWN_MS
+      : undefined;
+    const converged = Boolean(
+      latestDomainTask
+      && latestVerifiedSuccess
+      && latestDomainTask.id === latestVerifiedSuccess.id
+      && verifiedCooldownUntil
+      && verifiedCooldownUntil > now,
+    );
+    const taskEvidence = collectEvidenceSnippets(taskText, spec.taskPatterns);
+    const behaviorEvidence = collectEvidenceSnippets(behaviorText, spec.behaviorPatterns);
+    const { goals, summary } = summarizeGoalAlignment(ego, spec);
+    const evidence = [...taskEvidence, ...behaviorEvidence].slice(0, 5);
+    const taskHits = taskText.reduce((count, text) => count + countPatternHits(text, spec.taskPatterns), 0);
+    const behaviorHits = behaviorText.reduce((count, text) => count + countPatternHits(text, spec.behaviorPatterns), 0);
+    const alignmentHits = scoreGoalAlignment(summary, spec.goalHints)
+      + scoreGoalAlignment(goals.join(" "), spec.goalHints);
+    const recencyBonus = evidence.length > 0 ? 8 : 0;
+    const rawScore = Math.min(100,
+      taskHits * 12
+      + behaviorHits * 8
+      + alignmentHits * 10
+      + recencyBonus,
+    );
+    const score = activeDomainTask || converged ? 0 : rawScore;
+    return {
+      domain: spec.domain,
+      label: spec.label,
+      objective: spec.objective,
+      nextStep: spec.nextStep,
+      preferredAction: spec.preferredAction,
+      score,
+      evidence,
+      alignedGoals: goals,
+      alignmentSummary: summary,
+      lastSeenAt: now,
+      goalPath,
+      primaryGoalId: primaryGoal?.id,
+      primaryGoalTitle: primaryGoal?.title,
+      primaryGoalFamily: primaryGoal?.goalFamily,
+      alignmentScore: score,
+      convergenceState: activeDomainTask ? "observing" : converged ? "converged" : "actionable",
+      cooldownUntil: converged ? verifiedCooldownUntil : undefined,
+      recentAttempts: domainTasks.length,
+      recentVerifiedSuccesses: verifiedSuccesses.length,
+    } satisfies MaintenanceFocus;
+  })
+    .sort((left, right) => right.score - left.score);
+
+  return focuses.slice(0, 3);
+}
+
+function buildMaintenanceOpportunity(
+  focus: MaintenanceFocus,
+  fallbackPriority = 65,
+): DetectedThoughtOpportunity {
+  const evidenceDetail = focus.evidence.length > 0
+    ? ` Evidence: ${focus.evidence.slice(0, 3).join(" | ")}`
+    : "";
+  const alignmentDetail = focus.alignmentSummary ? ` Alignment: ${focus.alignmentSummary}.` : "";
+  return {
+    type: "self-improvement-monitor",
+    trigger: "opportunity",
+    triggerDetail: `${focus.label}: ${focus.objective}${evidenceDetail}`,
+    priority: Math.max(fallbackPriority, focus.score),
+    source: "system-monitor",
+    relatedNeeds: focus.preferredAction === "observe-and-improve"
+      ? ["growth", "meaning"]
+      : focus.domain === "goal-alignment"
+        ? ["meaning", "connection", "growth"]
+        : ["growth", "security"],
+    motivation: `${focus.objective}${alignmentDetail}`,
+    suggestedAction: focus.preferredAction,
+    actionParams: {
+      maintenanceFocus: focus.domain,
+      maintenanceLabel: focus.label,
+      maintenanceObjective: focus.objective,
+      maintenanceNextStep: focus.nextStep,
+      maintenanceEvidence: focus.evidence,
+      maintenanceScore: focus.score,
+      maintenanceAlignedGoals: focus.alignedGoals,
+      maintenanceAlignmentSummary: focus.alignmentSummary,
+      maintenancePreferredAction: focus.preferredAction,
+    },
+  };
+}
+
+function maintenanceFocusToBacklogItem(focus: MaintenanceFocus, now = Date.now()): MaintenanceBacklogItem {
+  return {
+    domain: focus.domain,
+    label: focus.label,
+    objective: focus.objective,
+    nextStep: focus.nextStep,
+    preferredAction: focus.preferredAction,
+    score: Math.max(0, Math.min(100, Math.round(focus.score))),
+    evidence: focus.evidence.slice(0, 5),
+    alignedGoals: focus.alignedGoals.slice(0, 6),
+    alignmentSummary: focus.alignmentSummary,
+    lastSeenAt: now,
+    goalPath: focus.goalPath,
+    primaryGoalId: focus.primaryGoalId,
+    primaryGoalTitle: focus.primaryGoalTitle,
+    primaryGoalFamily: focus.primaryGoalFamily,
+    alignmentScore: focus.alignmentScore,
+    convergenceState: focus.convergenceState,
+    cooldownUntil: focus.cooldownUntil,
+    recentAttempts: focus.recentAttempts,
+    recentVerifiedSuccesses: focus.recentVerifiedSuccesses,
+  };
+}
+
+export function buildMaintenanceBacklog(ego: EgoState): MaintenanceBacklogItem[] {
+  const now = Date.now();
+  const evaluated = collectMaintenanceFocuses(ego);
+  const current = evaluated
+    .filter((focus) => focus.score > 0)
+    .map((focus) => maintenanceFocusToBacklogItem(focus, now));
+  const currentKeys = new Set(current.map((item) => maintenanceBacklogKey(item)));
+  const suppressedKeys = new Set(evaluated
+    .filter((focus) => focus.score <= 0)
+    .map((focus) => maintenanceBacklogKey(focus)));
+  const carried = (ego.mentalContext?.maintenanceBacklog ?? [])
+    .filter((item) => !currentKeys.has(maintenanceBacklogKey(item)))
+    .filter((item) => !suppressedKeys.has(maintenanceBacklogKey(item)))
+    .filter((item) => item.convergenceState !== "converged" && (!item.cooldownUntil || item.cooldownUntil <= now))
+    .map((item) => ({
+      ...item,
+      score: Math.max(0, Math.round(item.score * 0.85)),
+    }))
+    .filter((item) => item.score > 0);
+
+  return [...current, ...carried]
+    .sort((left, right) => right.score - left.score || right.lastSeenAt - left.lastSeenAt)
+    .slice(0, 5);
+}
+
+function routeMaintenanceAction(thought: Thought, subAgentAvailable?: boolean): void {
+  if (thought.type !== "self-improvement-monitor") return;
+  thought.actionType = subAgentAvailable === false ? "observe-and-improve" : "subagent-improve";
+  thought.actionParams = {
+    ...(thought.actionParams ?? {}),
+    maintenanceExecutionMode: subAgentAvailable === false ? "observe-and-improve" : "subagent-improve",
+  };
+}
 
 function uniqueTopics(items: string[]): string[] {
   const seen = new Set<string>();
@@ -563,6 +930,15 @@ function hasAutonomousExecutionContext(text: string, ego: EgoState): boolean {
     /\u56de\u6d4b|\u4f18\u5316|\u7b56\u7565|\u53c2\u6570|\u6307\u6807|\u6536\u76ca|\u56de\u64a4|\u6cdb\u5316|\u9ad8\u9891/i.test(contextText);
 }
 
+function hasRecentVerifiedImprovement(ego: EgoState, now = Date.now()): boolean {
+  return (ego.activeTasks ?? []).some((task) => {
+    const finishedAt = task.completedAt ?? task.updatedAt ?? task.createdAt;
+    return now - finishedAt <= MAINTENANCE_CONVERGENCE_COOLDOWN_MS
+      && /improvement/i.test(task.title)
+      && isVerifiedMaintenanceSuccess(task);
+  });
+}
+
 function suppressOrRerouteLowValueMessageThought(
   thought: Thought,
   opportunity: DetectedThoughtOpportunity,
@@ -581,10 +957,25 @@ function suppressOrRerouteLowValueMessageThought(
   if (!isMetaWorkPromiseText(combined)) return;
 
   if (hasAutonomousExecutionContext(combined, ctx.ego)) {
+    if (hasRecentVerifiedImprovement(ctx.ego)) {
+      thought.actionType = "none";
+      thought.actionParams = {
+        suppressedLowValueMessage: true,
+        reason: "A verified improvement completed recently; wait for new evidence before reopening maintenance.",
+      };
+      thought.content = "Suppressed a repetitive maintenance promise after a verified recent improvement.";
+      thought.expectedOutcome = "Observe the verified change before starting another maintenance task.";
+      log.info("Suppressed low-value maintenance reroute during convergence cooldown");
+      return;
+    }
     thought.actionType = "subagent-improve";
     thought.actionParams = {
       reason: combined.slice(0, 500),
       suppressedLowValueMessage: true,
+      maintenanceFocus: "goal-alignment",
+      maintenanceLabel: "Goal alignment",
+      maintenanceObjective: "Turn a concrete user-directed Soul improvement into a verified result.",
+      maintenanceNextStep: "Make one bounded change and verify it before reporting.",
     };
     thought.content = "Suppressed a meta status message; continue concrete autonomous optimization work and report only measured results.";
     thought.expectedOutcome = "Run concrete autonomous optimization work instead of sending a promise/status message.";
@@ -1278,46 +1669,52 @@ function analyzeContextualTriggers(
   // When user has assigned Soul a self-improvement goal, generate opportunities
   // to observe and improve itself via the agent.
   if (includeMaintenance) {
-  const IMPROVE_RE = /优化|improve|self|自主|观察|self-improvement|助理/i;
-  const improvementGoals = ego.goals.filter(
-    (g) => g.status === "active" && IMPROVE_RE.test(g.title + g.description),
-  );
-  // Also check userFacts/userPreferences for self-improvement directives
-  const hasImproveFact = activeUserFacts(ego).some(
-    (f) => f.confidence >= 0.8 && /优化|observe.*log|自主|self.?improv|proactive.*optim/i.test(f.content),
-  );
-  const hasImprovePref = (ego.userPreferences ?? []).some(
-    (p) => p.confidence >= 0.8 && /优化|improve|self.?improv/i.test(p.preference),
-  );
+    const IMPROVE_RE = /优化|improve|self|自主|观察|self-improvement|助理/i;
+    const improvementGoals = ego.goals.filter(
+      (g) => g.status === "active" && IMPROVE_RE.test(g.title + g.description),
+    );
+    // Also check userFacts/userPreferences for self-improvement directives.
+    const hasImproveFact = activeUserFacts(ego).some(
+      (f) => f.confidence >= 0.8 && /优化|改进|自我改进|observe.*log|自主|self[- ]?improv|improv(?:e|ing|ement)?|autonom(?:ous|ously)|proactive.*optim|human[- ]like|更主动|更像人/i.test(f.content),
+    );
+    const hasImprovePref = (ego.userPreferences ?? []).some(
+      (p) => p.confidence >= 0.8 && /优化|improve|self.?improv|proactive|active|interactive/i.test(p.preference),
+    );
+    const maintenanceFocuses = buildMaintenanceBacklog(ego);
+    const topFocus = maintenanceFocuses[0];
 
-  if (improvementGoals.length > 0 || hasImproveFact || hasImprovePref) {
-    const recentImprove = [...(ego.behaviorLog ?? [])]
-      .reverse()
-      .find((entry) => entry.actionType === "observe-and-improve" || entry.actionType === "subagent-improve");
-    const hoursSinceImprove = recentImprove
-      ? (Date.now() - recentImprove.timestamp) / (1000 * 60 * 60)
-      : Infinity;
-    // A failed improve task (often just a stale timeout) should not block
-    // maintenance for long — 30 min is enough. The action cooldown in
-    // action-executor.ts still provides a floor.
-    const recentFailedImprove = recentImprove?.outcome === "failed" && hoursSinceImprove < 0.5;
-    const recentSuccessfulImprove = recentImprove?.outcome === "success" && hoursSinceImprove < 0.5;
+    if (improvementGoals.length > 0 || hasImproveFact || hasImprovePref || topFocus) {
+      const recentImprove = [...(ego.behaviorLog ?? [])]
+        .reverse()
+        .find((entry) => entry.actionType === "observe-and-improve" || entry.actionType === "subagent-improve");
+      const hoursSinceImprove = recentImprove
+        ? (Date.now() - recentImprove.timestamp) / (1000 * 60 * 60)
+        : Infinity;
+      // A recent improve task should not immediately retrigger maintenance.
+      const recentFailedImprove = recentImprove?.outcome === "failed" && hoursSinceImprove < 0.5;
+      const recentSuccessfulImprove = recentImprove?.outcome === "success" && hoursSinceImprove < 0.5;
 
-    if (!recentFailedImprove && !recentSuccessfulImprove) {
-      const basePriority = hoursSinceImprove === Infinity ? 65 : Math.min(65, 35 + hoursSinceImprove * 4);
-      const goalTitle = improvementGoals[0]?.title ?? "self-improvement directive from user";
-      opportunities.push({
-        type: "self-improvement-monitor",
-        trigger: "opportunity",
-        triggerDetail: `Periodic self-improvement goal: ${goalTitle}`,
-        priority: basePriority,
-        source: "system-monitor",
-        relatedNeeds: ["growth", "meaning"],
-        motivation: `I have a periodic goal to improve myself: ${goalTitle}`,
-        suggestedAction: "subagent-improve",
-      });
+      if (!recentFailedImprove && !recentSuccessfulImprove) {
+        const basePriority = topFocus
+          ? Math.max(65, topFocus.score)
+          : hoursSinceImprove === Infinity
+            ? 65
+            : Math.min(65, 35 + hoursSinceImprove * 4);
+        const goalTitle = improvementGoals[0]?.title ?? topFocus?.label ?? "self-improvement directive from user";
+        const selectedFocus: MaintenanceFocus = topFocus ?? {
+          domain: "goal-alignment",
+          label: goalTitle,
+          objective: `Keep maintenance aligned to the user's current direction: ${goalTitle}`,
+          nextStep: "Review the current goal and pick the most evidence-backed improvement point.",
+          preferredAction: "subagent-improve",
+          score: basePriority,
+          evidence: [],
+          alignedGoals: improvementGoals.slice(0, 3).map((goal) => goal.title),
+          alignmentSummary: improvementGoals.slice(0, 3).map((goal) => goal.title).join("; "),
+        };
+        opportunities.push(buildMaintenanceOpportunity(selectedFocus, basePriority));
+      }
     }
-  }
   }
 
   return opportunities;
@@ -1351,7 +1748,7 @@ export function detectThoughtOpportunities(
 export function detectMaintenanceOpportunities(
   ctx: ThoughtGenerationContext,
 ): DetectedThoughtOpportunity[] {
-  const maintenance = [
+  const maintenance: DetectedThoughtOpportunity[] = [
     ...analyzeNeedGaps(ctx.ego.needs),
     ...analyzeContextualTriggers(ctx, true).filter((opportunity) =>
       opportunity.type === "self-improvement-monitor"),
@@ -1471,10 +1868,22 @@ function getThoughtContentForOpportunity(
 
   switch (opportunity.type) {
     case "self-improvement-monitor":
-      return {
-        content: `I have a self-improvement goal active — time to observe my logs and find things to optimize`,
-        expectedOutcome: "Identify issues in my own behavior and fix them",
-      };
+      {
+        const focusLabel = asString(opportunity.actionParams?.maintenanceLabel) || "self-improvement";
+        const focusObjective = asString(opportunity.actionParams?.maintenanceObjective);
+        const focusNextStep = asString(opportunity.actionParams?.maintenanceNextStep);
+        const focusEvidence = Array.isArray(opportunity.actionParams?.maintenanceEvidence)
+          ? (opportunity.actionParams?.maintenanceEvidence as string[]).slice(0, 2).join("; ")
+          : "";
+        return {
+          content: [
+            focusObjective ? `Focus: ${focusLabel}. ${focusObjective}` : `I have a self-improvement goal active — time to observe my logs and find things to optimize`,
+            focusNextStep ? `Next step: ${focusNextStep}` : "",
+            focusEvidence ? `Evidence: ${focusEvidence}` : "",
+          ].filter(Boolean).join(" "),
+          expectedOutcome: focusObjective || "Identify the highest-value improvement and fix it",
+        };
+      }
 
     case "opportunity-detected":
       if (opportunity.relatedNeeds.includes("connection")) {
@@ -1596,17 +2005,19 @@ function calculateMetricDeltas(opportunity: DetectedThoughtOpportunity): MetricD
 export function getActionForOpportunity(
   opportunity: DetectedThoughtOpportunity,
   ego: EgoState,
+  subAgentAvailable?: boolean,
 ): { actionType: ActionType; actionParams?: Record<string, unknown> } {
-  return determineActionForOpportunity(opportunity, ego);
+  return determineActionForOpportunity(opportunity, ego, subAgentAvailable);
 }
 
 export function buildThoughtFromOpportunity(
   opportunity: DetectedThoughtOpportunity,
   ego: EgoState,
+  subAgentAvailable?: boolean,
 ): Thought {
   const { content, expectedOutcome } = getThoughtContentForOpportunity(opportunity, ego);
   const deltas = calculateMetricDeltas(opportunity);
-  const { actionType, actionParams } = getActionForOpportunity(opportunity, ego);
+  const { actionType, actionParams } = getActionForOpportunity(opportunity, ego, subAgentAvailable);
 
   return {
     id: randomBytes(8).toString("hex"),
@@ -1641,6 +2052,7 @@ function isInternalNeedGapOpportunity(opportunity: DetectedThoughtOpportunity): 
 function determineActionForOpportunity(
   opportunity: DetectedThoughtOpportunity,
   ego: EgoState,
+  subAgentAvailable?: boolean,
 ): { actionType: ActionType; actionParams?: Record<string, unknown> } {
   const completedUndeliveredTasks = (ego.activeTasks ?? []).filter(
     (t) => (t.status === "completed" || t.status === "failed") && !t.resultDelivered && t.result,
@@ -1739,6 +2151,13 @@ function determineActionForOpportunity(
   // tool chain: exec, write, read, git), otherwise fall back to observe-and-improve
   // (local LLM + spawnSync, limited to npm scripts / python / node --check).
   if (type === "self-improvement-monitor") {
+    const preferred = opportunity.actionParams?.maintenancePreferredAction;
+    if (preferred === "observe-and-improve" || preferred === "subagent-improve") {
+      return { actionType: preferred };
+    }
+    if (subAgentAvailable === false) {
+      return { actionType: "observe-and-improve" };
+    }
     return { actionType: "subagent-improve" };
   }
 
@@ -2074,7 +2493,7 @@ export async function generateIntelligentThought(
   ctx: ThoughtGenerationContext,
   options?: IntelligentThoughtOptions,
 ): Promise<Thought> {
-  const { llmGenerator, preferOpportunity, expandActionIdeas = false } = options ?? {};
+  const { llmGenerator, preferOpportunity, expandActionIdeas = false, subAgentAvailable } = options ?? {};
 
   const opportunities = detectThoughtOpportunities(ctx);
 
@@ -2123,6 +2542,7 @@ export async function generateIntelligentThought(
 
       const thought = buildThoughtFromOpportunity(selectedOpportunity, ctx.ego);
       thought.content = refinedContent;
+      routeMaintenanceAction(thought, subAgentAvailable);
 
       // LLM content may indicate a specific intent to investigate or fix a problem.
       // Only override to analyze-problem when the LLM explicitly describes a concrete
@@ -2172,6 +2592,7 @@ export async function generateIntelligentThought(
   }
 
   const thought = buildThoughtFromOpportunity(selectedOpportunity, ctx.ego);
+  routeMaintenanceAction(thought, subAgentAvailable);
   suppressOrRerouteLowValueMessageThought(thought, selectedOpportunity, ctx);
   if (llmGenerator && expandActionIdeas) {
     await expandThoughtActionWithAdjacentIdea(thought, selectedOpportunity, ctx, llmGenerator);
@@ -2228,6 +2649,7 @@ async function generateLLMThoughtPrompt(
     `Residue: ${ego.mentalContext.residue.join("; ") || "none"}`,
     `Background concerns: ${ego.mentalContext.backgroundConcerns.join("; ") || "none"}`,
     `Environmental changes: ${ego.mentalContext.environmentalChanges.join("; ") || "none"}`,
+    `Maintenance backlog: ${(ego.mentalContext.maintenanceBacklog ?? []).slice(0, 3).map((item) => `${item.label} (${item.score})`).join("; ") || "none"}`,
   ].join("\n");
 
   // Search external memory plugins for relevant context

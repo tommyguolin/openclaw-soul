@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { assessOutgoingProactiveMessage, getActionCooldownState, getProactiveMessageLimitReasonForMemories, isLocalProjectEvidenceQuery, markActionExecuted } from "../src/action-executor.js";
 import { createDefaultEgoState, saveEgoStore } from "../src/ego-store.js";
-import { collectKnownLocalEvidenceTargets, detectMaintenanceOpportunities, detectThoughtOpportunities, generateIntelligentThought, getActionForOpportunity, type DetectedThoughtOpportunity } from "../src/intelligent-thought.js";
+import { buildMaintenanceBacklog, collectKnownLocalEvidenceTargets, detectMaintenanceOpportunities, detectThoughtOpportunities, generateIntelligentThought, getActionForOpportunity, type DetectedThoughtOpportunity } from "../src/intelligent-thought.js";
 import { ThoughtService } from "../src/thought-service.js";
 import { ThoughtPool } from "../src/thought-pool.js";
 import { buildUserLanguageInstruction, supportsLocalMessageTemplate } from "../src/language-context.js";
@@ -82,6 +82,50 @@ test("scheduled maintenance uses the subagent only when it is available", async 
   } finally {
     await fs.promises.rm(directory, { recursive: true, force: true });
   }
+});
+
+test("verified maintenance converges instead of reopening the same domain", () => {
+  const ego = context().ego;
+  const now = Date.now();
+  ego.activeTasks = [{
+    id: "verified-maintenance",
+    title: "Subagent improvement: openclaw-soul",
+    description: "Fix subagent reliability",
+    status: "completed",
+    createdAt: now - 60_000,
+    updatedAt: now,
+    completedAt: now,
+    maintenanceDomain: "subagent-reliability",
+    steps: [],
+    requiresWritePermission: true,
+    resultDelivered: true,
+    result: `Status: completed\n\n## Outcome\nFixed the final report path.\n\n## Changes\nChanged src/autonomous-actions.ts.\n\n## Verification\nnpm test passed with 156 tests and 0 failures.`,
+  }];
+
+  const backlog = buildMaintenanceBacklog(ego);
+  assert.equal(backlog.some((item) => item.domain === "subagent-reliability"), false);
+});
+
+test("legacy verified report fixes migrate into convergence without domain metadata", () => {
+  const ego = context().ego;
+  const now = Date.now();
+  ego.activeTasks = [{
+    id: "legacy-report-fix",
+    title: "Subagent improvement: openclaw-soul",
+    description: "Improve final report recovery",
+    status: "completed",
+    createdAt: now - 60_000,
+    updatedAt: now,
+    completedAt: now,
+    steps: [],
+    requiresWritePermission: true,
+    resultDelivered: true,
+    result: `## Outcome\nFixed placeholder final report recovery.\n\n## Changes\nChanged src/autonomous-actions.ts.\n\n## Verification\nnpm test passed with 160 tests and 0 failures.`,
+  }];
+
+  const backlog = buildMaintenanceBacklog(ego);
+  assert.equal(backlog.some((item) => item.domain === "report-fidelity"), false);
+  assert.equal(backlog.some((item) => item.domain === "subagent-reliability"), false);
 });
 
 test("goal progress remains background motivation rather than a thought stimulus", () => {
@@ -208,6 +252,99 @@ test("active inbound conversation defers the Soul background cycle for two minut
       await (service as unknown as QuietInternals).activeConversationQuietRemainingMs(afterWindow),
       0,
     );
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("active inbound conversation still polls autonomous tasks before deferring the rest of the cycle", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-conversation-poll-"));
+  try {
+    const storePath = path.join(directory, "ego.json");
+    const service = new ThoughtService({ storePath });
+    let pollCalls = 0;
+    let syncCalls = 0;
+    type TickInternals = {
+      tick(): Promise<void>;
+      applyDecay(): Promise<void>;
+      runExpiryIfDue(): Promise<void>;
+      resolveStalePendingEntries(): Promise<void>;
+      activeConversationQuietRemainingMs(now?: number): Promise<number>;
+      pollActiveTasks(): Promise<void>;
+      syncSelfImprovementGoal(): Promise<void>;
+      maybePromptForAutonomousActions(): Promise<void>;
+      maybeRefreshWorkspaceContext(): Promise<void>;
+      flushPendingMessage(): Promise<void>;
+      runMaintenanceIfDue(): Promise<boolean>;
+      checkAndGenerateThought(): Promise<void>;
+      runCognitionObserverIfEnabled(): Promise<void>;
+      maybeGenerateShadowThought(): Promise<void>;
+      maybeAttendThoughtPoolCandidate(): Promise<void>;
+      maybeExpressMatureThought(): Promise<void>;
+    };
+    const internals = service as unknown as TickInternals;
+    internals.applyDecay = async () => {};
+    internals.runExpiryIfDue = async () => {};
+    internals.resolveStalePendingEntries = async () => {};
+    internals.activeConversationQuietRemainingMs = async () => 60 * 1000;
+    internals.pollActiveTasks = async () => { pollCalls += 1; };
+    internals.syncSelfImprovementGoal = async () => { syncCalls += 1; };
+    internals.maybePromptForAutonomousActions = async () => {};
+    internals.maybeRefreshWorkspaceContext = async () => {};
+    internals.flushPendingMessage = async () => {};
+    internals.runMaintenanceIfDue = async () => false;
+    internals.checkAndGenerateThought = async () => {};
+    internals.runCognitionObserverIfEnabled = async () => {};
+    internals.maybeGenerateShadowThought = async () => {};
+    internals.maybeAttendThoughtPoolCandidate = async () => {};
+    internals.maybeExpressMatureThought = async () => {};
+
+    await internals.tick();
+
+    assert.equal(pollCalls, 1);
+    assert.equal(syncCalls, 0);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("self-improvement goal sync keeps checking until a directive actually appears", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-self-improve-sync-"));
+  try {
+    const storePath = path.join(directory, "ego.json");
+    const ego = createDefaultEgoState();
+    await saveEgoStore(storePath, { version: 3, ego, createdAt: Date.now(), updatedAt: Date.now() });
+
+    const service = new ThoughtService({ storePath });
+    type SyncInternals = {
+      syncSelfImprovementGoal(): Promise<void>;
+      getEgoState(): Promise<EgoState>;
+    };
+    const internals = service as unknown as SyncInternals;
+
+    await internals.syncSelfImprovementGoal();
+    let state = await internals.getEgoState();
+    assert.equal(state.goals.some((goal) => goal.id === "goal-self-improve"), false);
+
+    ego.userFacts.push({
+      id: "late-directive",
+      category: "project",
+      content: "openclaw-soul should keep improving autonomously",
+      confidence: 0.95,
+      source: "explicit",
+      firstMentionedAt: Date.now(),
+      updatedAt: Date.now(),
+      timesConfirmed: 1,
+      validity: "active",
+    });
+    await saveEgoStore(storePath, { version: 3, ego, createdAt: Date.now(), updatedAt: Date.now() });
+
+    await internals.syncSelfImprovementGoal();
+    state = await internals.getEgoState();
+    const goal = state.goals.find((item) => item.id === "goal-self-improve");
+    assert.ok(goal);
+    assert.equal(goal?.progress > 0, true);
+    assert.ok((goal?.measurementCriteria?.length ?? 0) > 0);
   } finally {
     await fs.promises.rm(directory, { recursive: true, force: true });
   }
@@ -388,9 +525,39 @@ test("a stalled research lane yields to a useful proactive message", () => {
   assert.equal(internals.selectBestOpportunity([research, message], ego), message);
 });
 
-test("a higher-priority proactive message is not displaced by lower-priority research", () => {
+test("external discovery gets a turn when no grounded discovery happened recently", () => {
   const service = new ThoughtService();
   const ego = createDefaultEgoState();
+  const message = {
+    type: "bond-deepen", trigger: "bonding", triggerDetail: "meaningful continuity",
+    priority: 75, source: "user-interaction", relatedNeeds: [], motivation: "connect",
+    suggestedAction: "send-message",
+  } as const;
+  const research = {
+    type: "conversation-replay", trigger: "curiosity", triggerDetail: "research topic",
+    priority: 72, source: "user-interaction", relatedNeeds: [], motivation: "research",
+    suggestedAction: "proactive-research",
+  } as const;
+  type SelectionInternals = {
+    selectBestOpportunity<T>(items: T[], ego: EgoState): T | undefined;
+  };
+  const internals = service as unknown as SelectionInternals;
+  assert.equal(internals.selectBestOpportunity([message, research], ego), research);
+});
+
+test("a recent grounded discovery lets a higher-priority proactive message win", () => {
+  const service = new ThoughtService();
+  const ego = createDefaultEgoState();
+  ego.memories.push({
+    id: "recent-web-result", type: "learning", content: "A useful external finding",
+    emotion: 0, valence: "neutral", importance: 0.7, timestamp: Date.now() - 30 * 60 * 1000,
+    tags: ["web-search"], evidenceKind: "web", evidenceSources: ["https://example.com"],
+  });
+  const recentActionTypes = ["proactive-research", "search-web", "learn-topic"] as const;
+  ego.behaviorLog.push(...recentActionTypes.map((actionType, index) => ({
+    id: `recent-action-${index}`, actionType, thoughtType: "conversation-replay" as const,
+    hourOfDay: 12, urgentNeeds: [], outcome: "success" as const, timestamp: Date.now() - 20 * 60 * 1000,
+  })));
   const message = {
     type: "bond-deepen", trigger: "bonding", triggerDetail: "meaningful continuity",
     priority: 75, source: "user-interaction", relatedNeeds: [], motivation: "connect",
@@ -408,9 +575,67 @@ test("a higher-priority proactive message is not displaced by lower-priority res
   assert.equal(internals.selectBestOpportunity([message, research], ego), message);
 });
 
+test("discovery actions rotate toward a type not attempted recently", () => {
+  const service = new ThoughtService();
+  const ego = createDefaultEgoState();
+  ego.behaviorLog.push({
+    id: "recent-content", actionType: "proactive-content-push", thoughtType: "opportunity-detected",
+    hourOfDay: 12, urgentNeeds: [], outcome: "success", timestamp: Date.now() - 30 * 60 * 1000,
+  });
+  const content = {
+    type: "opportunity-detected", trigger: "curiosity", triggerDetail: "content",
+    priority: 73, source: "user-interaction", relatedNeeds: [], motivation: "share",
+    suggestedAction: "proactive-content-push",
+  } as const;
+  const learn = {
+    type: "learn-topic", trigger: "curiosity", triggerDetail: "learn",
+    priority: 60, source: "user-interaction", relatedNeeds: [], motivation: "learn",
+    suggestedAction: "learn-topic",
+  } as const;
+  type SelectionInternals = { selectBestOpportunity<T>(items: T[], ego: EgoState): T | undefined };
+  const internals = service as unknown as SelectionInternals;
+  assert.equal(internals.selectBestOpportunity([content, learn], ego), learn);
+});
+
+test("an untried proactive check-in is not permanently starved by chat messages", () => {
+  const service = new ThoughtService();
+  const ego = createDefaultEgoState();
+  ego.behaviorLog.push(...(["proactive-content-push", "proactive-research", "search-web", "learn-topic"] as const)
+    .map((actionType, index) => ({
+      id: `discovery-${index}`, actionType, thoughtType: "conversation-replay" as const,
+      hourOfDay: 12, urgentNeeds: [], outcome: "success" as const, timestamp: Date.now() - 30 * 60 * 1000,
+    })));
+  ego.memories.push({
+    id: "grounded", type: "learning", content: "Grounded result", emotion: 0, valence: "neutral",
+    importance: 0.6, timestamp: Date.now() - 30 * 60 * 1000, tags: ["web-search"],
+    evidenceKind: "web", evidenceSources: ["https://example.com"],
+  });
+  const message = {
+    type: "bond-deepen", trigger: "bonding", triggerDetail: "message", priority: 75,
+    source: "user-interaction", relatedNeeds: [], motivation: "connect", suggestedAction: "send-message",
+  } as const;
+  const checkIn = {
+    type: "opportunity-detected", trigger: "need", triggerDetail: "check in", priority: 58,
+    source: "user-interaction", relatedNeeds: [], motivation: "check in", suggestedAction: "proactive-check-in",
+  } as const;
+  type SelectionInternals = { selectBestOpportunity<T>(items: T[], ego: EgoState): T | undefined };
+  const internals = service as unknown as SelectionInternals;
+  assert.equal(internals.selectBestOpportunity([message, checkIn], ego), checkIn);
+});
+
 test("an unsent proactive message is not removed by thought-type repetition filtering", () => {
   const service = new ThoughtService();
   const ego = createDefaultEgoState();
+  ego.memories.push({
+    id: "recent-discovery-for-repetition-test", type: "learning", content: "Recent web discovery",
+    emotion: 0, valence: "neutral", importance: 0.6, timestamp: Date.now() - 10 * 60 * 1000,
+    tags: ["web-search"], evidenceKind: "web", evidenceSources: ["https://example.com"],
+  });
+  ego.behaviorLog.push(...(["proactive-content-push", "proactive-research", "search-web", "learn-topic"] as const)
+    .map((actionType, index) => ({
+      id: `repetition-discovery-${index}`, actionType, thoughtType: "conversation-replay" as const,
+      hourOfDay: 12, urgentNeeds: [], outcome: "success" as const, timestamp: Date.now() - 10 * 60 * 1000,
+    })));
   const message = {
     type: "bond-deepen", trigger: "bonding", triggerDetail: "meaningful continuity",
     priority: 75, source: "user-interaction", relatedNeeds: [], motivation: "connect",
@@ -761,6 +986,49 @@ test("proactive content push pauses while a recent local-evidence miss is unreso
 
   const opportunities = detectThoughtOpportunities(context(ego));
   assert.equal(opportunities.some((item) => item.suggestedAction === "proactive-content-push"), false);
+});
+
+test("goal-alignment maintenance coexists with proactive content discovery", () => {
+  const ego = createDefaultEgoState();
+  const now = Date.now();
+  ego.lastInteractionTime = now - 30 * 60 * 1000;
+  ego.goals.push({
+    id: "goal-alignment",
+    title: "Make Soul more proactive, useful, and human-like",
+    description: "Keep maintenance tied to a more proactive, useful, human-like Soul.",
+    progress: 10,
+    status: "active",
+    createdAt: now - 24 * 60 * 60 * 1000,
+    updatedAt: now - 24 * 60 * 60 * 1000,
+  });
+  ego.userPreferences.push({
+    id: "goal-alignment-pref",
+    aspect: "communication_style",
+    preference: "more proactive and human-like",
+    confidence: 0.95,
+    source: "explicit",
+    firstMentionedAt: now - 24 * 60 * 60 * 1000,
+    updatedAt: now - 24 * 60 * 60 * 1000,
+    timesObserved: 1,
+  });
+  ego.userFacts.push({
+    id: "goal-alignment-fact",
+    category: "project",
+    content: "openclaw-soul should keep improving autonomously",
+    confidence: 0.9,
+    source: "explicit",
+    firstMentionedAt: now - 24 * 60 * 60 * 1000,
+    updatedAt: now - 24 * 60 * 60 * 1000,
+    timesConfirmed: 1,
+  });
+
+  const maintenance = buildMaintenanceBacklog(ego);
+  assert.equal(maintenance[0]?.domain, "goal-alignment");
+  assert(maintenance[0] && maintenance[0].score >= 60);
+
+  const opportunities = detectThoughtOpportunities(context(ego));
+  assert.equal(opportunities.some((item) => item.suggestedAction === "proactive-content-push"), true);
+  assert(detectMaintenanceOpportunities(context(ego)).some((item) => item.type === "self-improvement-monitor"));
 });
 
 test("local-evidence missing state suppresses relationship and generic learning nudges", () => {

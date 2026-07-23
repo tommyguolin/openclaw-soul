@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { readFile, access as accessFile } from "node:fs/promises";
 import { dirname, join, normalize, parse as parsePath, relative, resolve, isAbsolute } from "node:path";
@@ -17,9 +17,10 @@ import type { Thought, EgoState, ActionResult, MetricDelta, AutonomousTask, Task
 import type { MessageSender } from "./soul-actions.js";
 import { updateEgoStore, resolveEgoStorePath } from "./ego-store.js";
 import { resolveSoulDir } from "./paths.js";
-import { buildUserLanguageInstruction, supportsLocalMessageTemplate } from "./language-context.js";
+import { buildUserLanguageInstruction } from "./language-context.js";
 
 const log = createSoulLogger("autonomous-actions");
+const PROCESS_STARTED_AT = Date.now();
 
 /** Max concurrent active tasks. Soul is a background worker; run heavy work serially. */
 const MAX_ACTIVE_TASKS = 1;
@@ -35,7 +36,15 @@ const AUTONOMOUS_AGENT_QUICK_CHECK_SECONDS = 60;
  * waitForRun returns (e.g. due to timeout) and will write the result file
  * directly via the write tool. Keep this bounded so a failed run does not
  * occupy the thought cycle indefinitely. */
-const SUBAGENT_GRACE_PERIOD_MS = 5 * 60 * 1000;
+// Allow extra time for a subagent that hit its run timeout to finish writing
+// the final report file. The write-out path is often the last thing to land
+// under load, so keep a wider but still bounded recovery window.
+const SUBAGENT_GRACE_PERIOD_MS = 15 * 60 * 1000;
+// Successful runs can still take a few extra seconds to flush their final
+// report after the runner returns. Keep this longer than the common write
+// latency so we prefer a complete report over a premature partial fallback.
+const SUBAGENT_SUCCESS_SETTLE_MS = 30_000;
+const SUBAGENT_SUCCESS_POLL_MS = 2_000;
 const SUBAGENT_STALE_SETTLE_MS = 60 * 1000;
 const AUTONOMOUS_FAILURE_BACKOFF_MS = 30 * 60 * 1000;
 const AUTONOMOUS_FAILURE_LOOKBACK_MS = 6 * 60 * 60 * 1000;
@@ -43,6 +52,10 @@ const READABLE_EVIDENCE_EXTENSIONS = [".log", ".txt", ".json", ".csv", ".md", ".
 
 /** Track recently sent report messages to prevent duplicates. */
 const recentReportedMessages: Map<string, number> = new Map();
+
+function isTaskOccupyingWorker(task: AutonomousTask): boolean {
+  return task.status === "in-progress" || task.status === "awaiting-restart";
+}
 
 function hasRecentProviderPressure(windowMs = PROVIDER_PRESSURE_BACKOFF_MS): boolean {
   const sessionsDir = join(homedir(), ".openclaw/agents/main/sessions");
@@ -83,8 +96,55 @@ function isReportableTask(task: AutonomousTask): boolean {
   return (task.status === "completed" || task.status === "failed") && Boolean(task.result);
 }
 
-function wantsChineseReport(ego: EgoState): boolean {
-  return ego.userLanguage === "zh-CN" || (ego.recentUserMessages ?? []).some((m) => /[\u4e00-\u9fff]/.test(m));
+/** The stored task status can be "completed" even when its final report is
+ * partial. Prefer the report's terminal status when choosing user-facing
+ * wording, so a recovery summary never masquerades as completed work. */
+function isCompletedTaskForUserReport(task: AutonomousTask): boolean {
+  const reportStatus = task.result ? taskReportStatus(task.result) : null;
+  return (reportStatus ?? task.status) === "completed";
+}
+
+function normalizeCompletedReportOpening(message: string, userLanguage?: string): string {
+  if (userLanguage === "zh-CN" || /[\u4e00-\u9fff]/.test(message)) {
+    return message.replace(
+      /^(?:这次(?:我)?(?:检查了|查了|分析了|排查了)|我(?:检查了|查了|分析了|排查了))\s*/u,
+      "已完成：",
+    );
+  }
+  return message.replace(
+    /^I\s+(?:checked|investigated|looked into|analyzed)\s+/i,
+    "Completed: ",
+  );
+}
+
+function formatMaintenanceFocus(thought: Thought): string {
+  const params = thought.actionParams ?? {};
+  const label = typeof params.maintenanceLabel === "string" ? params.maintenanceLabel : "";
+  const objective = typeof params.maintenanceObjective === "string" ? params.maintenanceObjective : "";
+  const nextStep = typeof params.maintenanceNextStep === "string" ? params.maintenanceNextStep : "";
+  const evidence = Array.isArray(params.maintenanceEvidence)
+    ? params.maintenanceEvidence.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 3)
+    : [];
+  const alignment = typeof params.maintenanceAlignmentSummary === "string" ? params.maintenanceAlignmentSummary : "";
+  const mode = typeof params.maintenanceExecutionMode === "string" ? params.maintenanceExecutionMode : "";
+
+  const lines: string[] = [];
+  if (label || objective) {
+    lines.push(`- Focus: ${[label, objective].filter(Boolean).join(" - ")}`);
+  }
+  if (nextStep) {
+    lines.push(`- Next step: ${nextStep}`);
+  }
+  if (alignment) {
+    lines.push(`- Goal alignment: ${alignment}`);
+  }
+  if (evidence.length > 0) {
+    lines.push(`- Evidence: ${evidence.map((item) => item.slice(0, 180)).join(" | ")}`);
+  }
+  if (mode) {
+    lines.push(`- Execution mode: ${mode}`);
+  }
+  return lines.join("\n");
 }
 
 function normalizeTaskResultForReport(result: string): string {
@@ -163,26 +223,28 @@ function hasFinalTaskResultFile(task: AutonomousTask): boolean {
   }
 }
 
-type ReportStatus = "in-progress" | "completed" | "failed" | "blocked" | "partial";
+type ReportStatus = "in-progress" | "awaiting-restart" | "completed" | "failed" | "blocked" | "partial";
 
 function taskReportStatus(result: string): ReportStatus | null {
-  const match = result.match(/^Status:\s*(in-progress|completed|failed|blocked|partial)\b/im);
+  const match = result.match(/^Status:\s*(in-progress|awaiting-restart|completed|failed|blocked|partial)\b/im);
   return match ? match[1].toLowerCase() as ReportStatus : null;
 }
 
 function isFinalTaskReport(result: string): boolean {
   const status = taskReportStatus(result);
   if (status === "in-progress") return false;
-  if (status) return hasRequiredReportSections(result);
-  return isCompleteTaskReport(result);
+  if (isPlaceholderTaskReport(result)) return false;
+  if (hasUnresolvedTemplatePlaceholders(result)) return false;
+  return hasRequiredReportSections(result) && hasMeaningfulTaskReportBody(result);
 }
 
-function reportStatusToTaskStatus(result: string): "completed" | "failed" {
+function reportStatusToTaskStatus(result: string): "awaiting-restart" | "completed" | "failed" {
   // "partial" and "blocked" indicate the subagent did useful work but
   // could not fully complete (timeout, acceptance-criteria-not-met, etc.).
   // Treat them as "completed" to avoid triggering failure backoff that
   // would block future subagent-improve tasks for hours.
   const status = taskReportStatus(result);
+  if (status === "awaiting-restart") return "awaiting-restart";
   if (status === "completed" || status === "partial" || status === "blocked") {
     return "completed";
   }
@@ -195,12 +257,79 @@ function reportStatusToTaskStatus(result: string): "completed" | "failed" {
   return "failed";
 }
 
+function reportRepresentsSuccessfulCompletion(result: string): boolean {
+  const status = taskReportStatus(result);
+  // A runner returning successfully only says that its process stopped
+  // normally. The autonomous task is successful only when the report itself
+  // claims a complete (or activation-pending) outcome.
+  return status === "completed" || status === "awaiting-restart" || status === null;
+}
+
+function reportShowsVerifiedCodeChange(result: string): boolean {
+  const changes = /##\s*(?:Changes|变更)[\s\S]*?(?=\n##\s|$)/i.exec(result)?.[0] ?? "";
+  const verification = /##\s*(?:Verification|验证)[\s\S]*?(?=\n##\s|$)/i.exec(result)?.[0] ?? "";
+  const changed = changes.length > 0
+    && !/No files were changed|没有修改任何文件|修改文件[：:]\s*0/i.test(changes);
+  const explicitNonZeroFailure = /\b(?:[1-9]\d*)\s+(?:tests?\s+)?(?:failed|failures?|errors?)\b|\b(?:failed|failures?|errors?)\s*[:=]\s*[1-9]\d*\b|(?:[1-9]\d*)\s*(?:项|个|次)?\s*(?:失败|错误)|(?:失败|错误)(?:数)?\s*[:：=]\s*[1-9]\d*/i.test(verification);
+  // Remove zero-count failure summaries before looking for generic failure
+  // words. "174/174 passed, 0 failed" is a successful verification, while
+  // "1 failed" or "command failed" must still block activation.
+  const withoutZeroFailures = verification
+    .replace(/\b0\s+(?:tests?\s+)?(?:failed|failures?|errors?)\b/gi, "")
+    .replace(/\b(?:failed|failures?|errors?)\s*[:=]\s*0\b/gi, "")
+    .replace(/0\s*(?:项|个|次)?\s*(?:失败|错误)/g, "")
+    .replace(/(?:失败|错误)(?:数)?\s*[:：=]\s*0/g, "");
+  const verified = verification.length > 0
+    && !/not run|未执行|没有执行验证/i.test(verification)
+    && !explicitNonZeroFailure
+    && !/\b(?:failed|failure|error)\b|失败|错误/i.test(withoutZeroFailures)
+    && /pass|通过|success|成功|exit(?:ed)?\s*(?:code\s*)?0|\b0\s+(?:failures?|errors?)\b|0\s*(?:项|个|次)?\s*(?:失败|错误)|零(?:失败|错误)/i.test(verification);
+  return changed && verified;
+}
+
+function markReportAwaitingRestart(result: string): string {
+  const clean = result.trim();
+  if (/^Status:\s*/im.test(clean)) {
+    return clean.replace(/^Status:\s*[^\r\n]+/im, "Status: awaiting-restart");
+  }
+  return `Status: awaiting-restart\n\n${clean}`;
+}
+
+function markReportActivated(result: string): string {
+  const completed = result.replace(/^Status:\s*awaiting-restart\b/im, "Status: completed").trim();
+  if (/##\s*Activation\b/i.test(completed)) return completed;
+  return `${completed}\n\n## Activation\nGateway restarted and loaded this build at ${new Date(PROCESS_STARTED_AT).toISOString()}.`;
+}
+
+function scheduleGatewayRestart(taskId: string): void {
+  const executable = process.platform === "win32" ? (process.env.ComSpec || "cmd.exe") : "openclaw";
+  const args = process.platform === "win32"
+    // Use the scheduled-task restart path recorded in TOOLS.md so we stop and
+    // relaunch the gateway without depending on the brittle direct restart command.
+    ? ["/d", "/s", "/c", 'schtasks /end /tn "OpenClaw Gateway" && schtasks /run /tn "OpenClaw Gateway"']
+    : ["gateway", "restart"];
+  setTimeout(() => {
+    try {
+      const child = spawn(executable, args, {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      child.on("error", (err) => log.warn(`Failed to schedule gateway restart for ${taskId}: ${String(err)}`));
+      child.unref();
+      log.info(`Gateway restart scheduled after persisted report for ${taskId}`);
+    } catch (err) {
+      log.warn(`Failed to schedule gateway restart for ${taskId}: ${String(err)}`);
+    }
+  }, 1_500);
+}
+
 /**
  * A timed-out subagent can still be writing its final report. Poll the file
  * during the bounded grace period instead of sleeping blindly and then
  * overwriting a report that arrived while we waited.
  */
-async function waitForFinalTaskReport(resultFilePath: string, maxWaitMs: number): Promise<string | null> {
+async function waitForFinalTaskReport(resultFilePath: string, maxWaitMs: number, pollMs = 5_000): Promise<string | null> {
   const deadline = Date.now() + maxWaitMs;
   while (true) {
     try {
@@ -211,7 +340,86 @@ async function waitForFinalTaskReport(resultFilePath: string, maxWaitMs: number)
     }
     const remaining = deadline - Date.now();
     if (remaining <= 0) return null;
-    await sleep(Math.min(5_000, remaining));
+    await sleep(Math.min(pollMs, remaining));
+  }
+}
+
+async function resolveSubagentFinalReport(
+  task: AutonomousTask,
+  resultFilePath: string,
+  subResult: SubAgentRunResult,
+  zh: boolean,
+): Promise<string> {
+  const readResolvedReports = (): string[] => {
+    const candidates: string[] = [];
+    try {
+      const fileContent = readFileSync(resultFilePath, "utf-8").trim();
+      if (fileContent && isFinalTaskReport(fileContent)) {
+        candidates.push(fileContent);
+      }
+    } catch {
+      // The result file may not exist yet.
+    }
+
+    const sessionReport = extractResultFromSessions(task, task.createdAt, zh);
+    if (sessionReport) {
+      candidates.push(sessionReport.result);
+    }
+
+    const output = subResult.output.trim();
+    if (output && isFinalTaskReport(output)) {
+      candidates.push(output);
+    }
+
+    return candidates;
+  };
+
+  // Do not let an early session-derived partial/failed summary beat a complete
+  // result file that is still being flushed. This was the main cause of
+  // "success=true, Status: partial" runs even though a complete report existed.
+  const immediateCandidates = readResolvedReports();
+  const immediateComplete = immediateCandidates.find(reportRepresentsSuccessfulCompletion);
+  if (immediateComplete) return immediateComplete;
+
+  const delayedReport = await waitForFinalTaskReport(
+    resultFilePath,
+    subResult.success ? SUBAGENT_SUCCESS_SETTLE_MS : SUBAGENT_GRACE_PERIOD_MS,
+    subResult.success ? SUBAGENT_SUCCESS_POLL_MS : 5_000,
+  );
+  if (delayedReport) return delayedReport;
+
+  const settledCandidates = readResolvedReports();
+  const settledComplete = settledCandidates.find(reportRepresentsSuccessfulCompletion);
+  if (settledComplete) return settledComplete;
+
+  // If no complete report arrived, preserve the best real terminal report
+  // before synthesizing a fallback. Prefer partial/blocked evidence over a
+  // generic failure because it contains useful work and next steps.
+  const terminalCandidates = [...settledCandidates, ...immediateCandidates];
+  const partial = terminalCandidates.find((candidate) => {
+    const status = taskReportStatus(candidate);
+    return status === "partial" || status === "blocked";
+  });
+  if (partial) return partial;
+  const failed = terminalCandidates.find((candidate) => taskReportStatus(candidate) === "failed");
+  if (failed) return failed;
+
+  try {
+    const output = subResult.output.trim();
+    if (subResult.success && output) {
+      return `Status: partial\n\n## Outcome\nSubagent finished but did not produce a complete final report before settle.\n\n### Captured output\n${output.slice(0, 800)}\n\n## Changes\nNo files were confirmed changed.\n\n## Verification\nNo verification was run.\n\n## Metrics\nSubagent output: ${output.length} chars.\n\n## Next\nReduce iteration scope so subagent can finish within budget.`;
+    }
+
+    return `Status: failed\n\n## Outcome\nSubagent failed with no recoverable output.\n\n### Details\n${(subResult.error || subResult.output || "Subagent failed with no output").slice(0, 800)}\n\n## Changes\nNo files were changed.\n\n## Verification\nNo verification was run.\n\n## Metrics\nNone.\n\n## Next\nCheck subagent runtime availability and gateway connectivity before retrying.`;
+  } catch {
+    if (subResult.success) {
+      const output = subResult.output.trim();
+      if (output) {
+        return `Status: partial\n\n## Outcome\nSubagent finished but did not produce a complete final report.\n\n### Captured output\n${output.slice(0, 800)}\n\n## Changes\nNo files were confirmed changed.\n\n## Verification\nNo verification was run.\n\n## Metrics\nSubagent output: ${output.length} chars.\n\n## Next\nReduce iteration scope so subagent can finish within budget.`;
+      }
+    }
+
+    return `Status: failed\n\n## Outcome\n${subResult.error || subResult.output || "Subagent failed with no output"}`;
   }
 }
 
@@ -240,7 +448,7 @@ function runCommand(cwd: string, command: string, args: string[], timeoutMs: num
     .filter(Boolean)
     .join("\n")
     .trim()
-    .slice(-2000);
+    .slice(-8000);
   const commandText = [command, ...args].join(" ");
   if (result.error) {
     return { ok: false, summary: `${commandText} failed to start: ${result.error.message}${output ? `\n${output}` : ""}` };
@@ -345,31 +553,10 @@ Pending.
 Pending.`;
 }
 
-function buildFailureTaskReport(task: AutonomousTask, detail: string, zh = false): string {
+function buildFailureTaskReport(task: AutonomousTask, detail: string): string {
   const header = `Status: failed
 Task: ${task.id}
 Finished: ${new Date().toISOString()}`;
-  if (zh) {
-    return `${header}
-
-## 结果
-自主任务未能完成，没有产出最终报告。
-
-## 变更
-Soul 未确认任何最终变更。
-
-## 验证
-任务在验证完成前已失败。
-
-## 指标
-未捕获可靠的前后对比指标。
-
-## 下一步
-缩小任务范围，增量写入报告后再启动长耗时验证。
-
-## 失败详情
-${detail.trim().slice(0, 3000)}`;
-  }
   return `${header}
 
 ## Outcome
@@ -388,32 +575,13 @@ No reliable before/after metrics were captured.
 Run a smaller bounded iteration and write the report incrementally before launching any long benchmark or backtest.
 
 ## Failure Detail
-${detail.trim().slice(0, 3000)}`;
+${detail.trim().slice(0, 8000)}`;
 }
 
-function buildPartialTaskReport(task: AutonomousTask, detail: string, zh = false): string {
+function buildPartialTaskReport(task: AutonomousTask, detail: string): string {
   const header = `Status: partial
 Task: ${task.id}
 Finished: ${new Date().toISOString()}`;
-  if (zh) {
-    return `${header}
-
-## 结果
-自主任务产出了部分发现，但在预算耗尽前未写入完整最终报告。
-
-## 变更
-Soul 未确认任何最终变更。
-
-## 验证
-下方捕获的部分输出中可能包含验证或观察结果，但任务未提供完整的命令/结果报告。
-
-## 指标
-捕获的部分输出：
-${detail.trim().slice(0, 3000)}
-
-## 下一步
-基于此次部分发现，启动更小范围后续任务。下一个任务应先写入 Status: partial，验证完成后再覆盖。`;
-  }
   return `${header}
 
 ## Outcome
@@ -427,7 +595,7 @@ Partial verification or observations may exist in the captured output below, but
 
 ## Metrics
 Captured partial output:
-${detail.trim().slice(0, 3000)}
+${detail.trim().slice(0, 8000)}
 
 ## Next
 Continue from this partial finding with a smaller follow-up task. The next task should write Status: partial before attempting any fix, then overwrite it only after verification is complete.`;
@@ -446,7 +614,6 @@ function buildBoundedLocalTaskReport(params: {
   analysisContext: string;
   limitation: string;
   resultFilePath: string;
-  zh?: boolean;
 }): string {
   const successfulReads = params.steps.filter((s) => s.success).length;
   const failedReads = params.steps.length - successfulReads;
@@ -455,50 +622,8 @@ function buildBoundedLocalTaskReport(params: {
     .map((s) => `- ${s.action}: ${s.input} (${s.success ? "ok" : "failed"})`)
     .join("\n");
   const evidence = params.evidence.length > 0
-    ? params.evidence.join("\n\n").slice(0, 5000)
+    ? params.evidence.join("\n\n").slice(0, 10000)
     : "No readable local evidence was found in the resolved target directory.";
-
-  if (params.zh) {
-    const zhEvidence = params.evidence.length > 0
-      ? params.evidence.join("\n\n").slice(0, 5000)
-      : "在目标目录中没有找到可读取的本地证据文件。";
-    return `Status: ${params.status}
-Task: ${params.task.id}
-Finished: ${new Date().toISOString()}
-Target: ${params.target.dir} (${params.target.name})
-Report: ${params.resultFilePath}
-
-## 结果
-Soul 完成了一次有限范围本地检查，但未执行完整实现。${params.limitation}
-
-指令：
-${params.thought.content.slice(0, 1000)}
-
-使用的上下文：
-- 用户画像: ${params.userContext || "有限"}
-- 最近用户消息: ${params.recentUserMessages || "无"}
-- 活跃目标: ${params.activeGoals || "无"}
-${params.analysisContext ? `- 之前分析: ${params.analysisContext.slice(0, 1000)}` : "- 之前分析: 无"}
-
-## 变更
-run-agent-task 路径未修改任何文件。在 Soul 具备可信子代理执行通道或 observe-and-improve 直接补丁路径之前，此路径保持只读。
-
-## 验证
-本地检查步骤：
-${inspected || "- 没有执行读取步骤。"}
-
-读取结果: 成功 ${successfulReads} 项，失败 ${failedReads} 项。
-任务未端到端验证，因为没有可信自主执行通道可用于写入/命令操作。
-
-## 指标
-检查的文件: ${successfulReads}。此次有限检查未产生前后对比性能、回测或基准指标。
-
-证据摘录：
-${zhEvidence}
-
-## 下一步
-使用可信 Gateway agent RPC 或执行更小范围 observe-and-improve 任务来应用本地补丁并运行验证。不要通过 /hooks/agent 路由自主任务指令，除非 OpenClaw 标记来源为可信。`;
-  }
 
   return `Status: ${params.status}
 Task: ${params.task.id}
@@ -542,10 +667,12 @@ function isCompleteTaskReport(result: string): boolean {
   const text = result.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
   if (!text) return false;
   if (taskReportStatus(text) === "in-progress") return false;
+  if (isPlaceholderTaskReport(text)) return false;
+  if (hasUnresolvedTemplatePlaceholders(text)) return false;
 
   // A terminal report with at least three markdown sections is complete even
   // when its headings are not English or it omitted the optional Status line.
-  return hasRequiredReportSections(text);
+  return hasRequiredReportSections(text) && hasMeaningfulTaskReportBody(text);
 }
 
 function hasRequiredReportSections(result: string): boolean {
@@ -558,10 +685,76 @@ function hasRequiredReportSections(result: string): boolean {
   return unique.size >= 3;
 }
 
+function hasMeaningfulTaskReportBody(result: string): boolean {
+  const text = result.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const bodyLines = lines.filter((line) =>
+    !/^Status:\s*/i.test(line)
+    && !/^(?:Task|Title|Target|Started|Finished|Budget|Report):\s*/i.test(line)
+    && !/^##\s+\S/.test(line)
+    && !/^[-=]{3,}$/.test(line)
+  );
+  if (bodyLines.length === 0) return false;
+
+  return bodyLines.some((line) =>
+    !/^(?:Pending\.?|TBD|TODO|To be determined|To be done|N\/A|None|暂无|待补充|待完善|待完成|进行中|处理中|占位)$/i.test(line)
+    && isReportLikeBodyLine(line)
+  );
+}
+
+function hasUnresolvedTemplatePlaceholders(result: string): boolean {
+  const text = result.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
+  return /\$\{[^}]+\}/.test(text)
+    || /\bparams\.[A-Za-z_]\w*/.test(text)
+    || /\btask\.[A-Za-z_]\w*/.test(text);
+}
+
+function isReportLikeBodyLine(line: string): boolean {
+  if (!/[A-Za-z0-9\u4e00-\u9fff]/.test(line)) return false;
+  if (/^(?:\/\/|\/\*|\*|#|```|function\b|const\b|let\b|var\b|class\b|import\b|export\b|return\b)/i.test(line)) return false;
+  if (/[{};]/.test(line) || /=>|\$\{/.test(line)) return false;
+  if (/^(?:[-•*]\s+|\d+[.)]\s+)/.test(line)) return true;
+  if (/[。！？.!?]$/.test(line)) return true;
+  return line.split(/\s+/).length >= 3;
+}
+
+function isPlaceholderTaskReport(result: string): boolean {
+  const text = result.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
+  if (!text) return false;
+  const pendingCount = (text.match(/^Pending\.$/gmi) ?? []).length;
+  return /Autonomous work has started\./i.test(text)
+    || /This placeholder must be replaced with a final report before the task is considered done\./i.test(text)
+    || pendingCount >= 3;
+}
+
 function isInterimTaskNarration(result: string): boolean {
   const normalized = result.trim();
   return /^(?:let me|now let me|i(?:'|’)ll|i will|first i|next i|我先|我将|现在我|让我|接下来|先看|先查|准备)/i.test(normalized)
     && !/##\s*(outcome|changes|verification|metrics|next)|验证|指标|结果|变更|完成|completed|verified|metrics/i.test(normalized);
+}
+
+function extractSessionText(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => extractSessionText(item))
+      .filter((item) => item.length > 0)
+      .join("\n")
+      .trim();
+  }
+  if (value && typeof value === "object") {
+    const record = value as {
+      text?: unknown;
+      output?: unknown;
+      content?: unknown;
+      message?: unknown;
+    };
+    if (typeof record.text === "string") return record.text.trim();
+    if (typeof record.output === "string") return record.output.trim();
+    if (record.content !== undefined) return extractSessionText(record.content);
+    if (record.message !== undefined) return extractSessionText(record.message);
+  }
+  return "";
 }
 
 /** Check if a subagent session for the given task has been written to recently
@@ -594,9 +787,14 @@ function isTaskBlockedOrPartial(task: AutonomousTask, result: string): boolean {
   // Partial/blocked reports are internally settled as completed to avoid a
   // failure-backoff loop, but must remain visibly incomplete to the user.
   if (reportStatus === "failed" || reportStatus === "blocked" || reportStatus === "partial") return true;
-  if (reportStatus === "completed") return false;
+  if (reportStatus === "completed") {
+    return isInterimTaskNarration(result)
+      || isPlaceholderTaskReport(result)
+      || (Boolean(task.resultFilePath) && !hasTaskResultFile(task));
+  }
   if (task.status === "completed") {
     return isInterimTaskNarration(result)
+      || isPlaceholderTaskReport(result)
       || (Boolean(task.resultFilePath) && !hasTaskResultFile(task));
   }
 
@@ -654,96 +852,6 @@ function captureGitDiffStat(targetDir: string): string | null {
   return null;
 }
 
-function buildDirectTaskReportMessage(tasks: AutonomousTask[], ego: EgoState): string | null {
-  const reportable = tasks
-    .filter((t) => isReportableTask(t) && t.result && t.result.trim().length >= 20)
-    .slice(0, 3);
-  if (reportable.length === 0) return null;
-
-  const zh = wantsChineseReport(ego);
-
-  if (reportable.length === 1) {
-    const task = reportable[0];
-    const result = normalizeTaskResultForReport(task.result ?? "");
-    const blocked = isTaskBlockedOrPartial(task, result);
-
-    if (zh) {
-      // 中文报告：提取关键信息，不直接粘贴整段英文模板
-      const outcome = extractReportField(result, ["结果", "Outcome"]) || result.slice(0, 600);
-      const changes = extractReportField(result, ["变更", "Changes"]) || "";
-      const verification = extractReportField(result, ["验证", "Verification"]) || "";
-      const metrics = extractReportField(result, ["指标", "Metrics"]) || "";
-
-      const statusIcon = blocked ? "⚠️" : "✅";
-      const statusText = blocked ? "未完成" : "已完成";
-
-      const lines: string[] = [
-        `${statusIcon} 自主任务${statusText}`,
-        `任务: ${task.title}`,
-        `\n结果:\n${outcome.slice(0, 800)}`,
-      ];
-
-      // 变更文件
-      if (changes) {
-        const changedFiles = extractChangedFiles(changes);
-        if (changedFiles.length > 0) {
-          lines.push(`\n改动文件 (${changedFiles.length}):`);
-          for (const f of changedFiles.slice(0, 8)) lines.push(`  • ${f}`);
-          if (changedFiles.length > 8) lines.push(`  • ...等 ${changedFiles.length} 个`);
-        }
-        lines.push(`\n变更说明:\n${changes.slice(0, 800)}`);
-      } else {
-        lines.push("\n变更说明: 无文件变更");
-      }
-
-      // 验证
-      if (verification) {
-        lines.push(`\n验证:\n${verification.slice(0, 500)}`);
-      }
-
-      // 指标
-      if (metrics) {
-        lines.push(`\n指标:\n${metrics.slice(0, 400)}`);
-      }
-
-      // 附带 git diff（如果有 targetProjectRoot）
-      const targetDir = task.targetProjectRoot || "";
-      if (targetDir) {
-        const diffStat = captureGitDiffStat(targetDir);
-        if (diffStat) {
-          lines.push(`\nGit diff:\n${diffStat.slice(0, 1000)}`);
-        }
-      }
-
-      return lines.join("\n");
-    }
-
-    // 英文 fallback（保持原逻辑）
-    const meta = [
-      `Task ID: ${task.id}`,
-      `Title: ${task.title}`,
-      `Status: ${blocked ? "blocked/partial" : "completed"}`,
-      taskResultFileLine(task, false),
-    ].filter((line): line is string => Boolean(line));
-    return `${blocked ? "This autonomous task did not fully complete" : "This autonomous task completed"}\n${meta.join("\n")}\n\nResult:\n${result}`;
-  }
-
-  // 多任务摘要
-  const body = reportable
-    .map((task) => {
-      const result = normalizeTaskResultForReport(task.result ?? "").replace(/\n/g, " ");
-      const blocked = isTaskBlockedOrPartial(task, result);
-      const status = zh
-        ? (blocked ? "未完成" : "已完成")
-        : (blocked ? "blocked/partial" : "completed");
-      return `- ${task.id} ${status} ${task.title}: ${result.slice(0, 700)}`;
-    })
-    .join("\n");
-  return zh
-    ? `本轮自主任务状态:\n${body}`
-    : `Autonomous task status:\n${body}`;
-}
-
 export type SubAgentRunResult = {
   runId: string;
   success: boolean;
@@ -771,7 +879,7 @@ export type AutonomousActionOptions = {
 };
 
 function taskContinuityFields(thought: Thought): Pick<AutonomousTask,
-  "intentionId" | "workHandoffId" | "targetProjectRoot" | "acceptanceCriteria"> {
+  "intentionId" | "workHandoffId" | "targetProjectRoot" | "acceptanceCriteria" | "maintenanceDomain" | "maintenanceObjective"> {
   const params = thought.actionParams ?? {};
   return {
     ...(typeof params.intentionId === "string" ? { intentionId: params.intentionId } : {}),
@@ -780,6 +888,8 @@ function taskContinuityFields(thought: Thought): Pick<AutonomousTask,
     ...(Array.isArray(params.acceptanceCriteria)
       ? { acceptanceCriteria: params.acceptanceCriteria.filter((item): item is string => typeof item === "string") }
       : {}),
+    ...(typeof params.maintenanceFocus === "string" ? { maintenanceDomain: params.maintenanceFocus } : {}),
+    ...(typeof params.maintenanceObjective === "string" ? { maintenanceObjective: params.maintenanceObjective } : {}),
   };
 }
 
@@ -915,7 +1025,6 @@ function buildRuleBasedAnalysis(
   gatheredInfo: string[],
   steps: TaskStep[],
 ): string {
-  const zh = wantsChineseReport(ego);
   const combined = gatheredInfo.join("\n\n");
   const lines = combined
     .split(/\r?\n/)
@@ -927,24 +1036,6 @@ function buildRuleBasedAnalysis(
   const successfulReads = steps.filter((s) => s.success).length;
   const failedReads = steps.length - successfulReads;
   const context = thought.content.replace(/\s+/g, " ").slice(0, 240);
-
-  if (zh) {
-    const findings = signalLines.length > 0
-      ? signalLines.map((line) => `- ${line.slice(0, 260)}`).join("\n")
-      : "- 没有在读取到的内容里发现明显 error/warn/timeout/rate limit 信号。";
-    return [
-      "## 分析",
-      "",
-      `上下文：${context}`,
-      "",
-      `读取结果：成功 ${successfulReads} 项，失败 ${failedReads} 项。`,
-      "",
-      "关键线索：",
-      findings,
-      "",
-      "下一步：如果这些线索不足以定位根因，应交给受冷却限制的完整 agent 任务处理；后台 analyze-problem 不再直接调用模型或启动工具链，避免放大 API 调用量。",
-    ].join("\n");
-  }
 
   const findings = signalLines.length > 0
     ? signalLines.map((line) => `- ${line.slice(0, 260)}`).join("\n")
@@ -1054,7 +1145,7 @@ export async function executeAnalyzeProblem(
   const title = thought.motivation.slice(0, 100);
 
   // Check task limit
-  const activeCount = (ego.activeTasks ?? []).filter((t) => t.status === "in-progress").length;
+  const activeCount = (ego.activeTasks ?? []).filter(isTaskOccupyingWorker).length;
   if (activeCount >= MAX_ACTIVE_TASKS) {
     log.info("Too many active tasks, skipping analyze-problem");
     return { result: { type: "analyze-problem", success: false, error: "Too many active tasks" }, metricsChanged: [] };
@@ -1226,7 +1317,6 @@ async function executeBoundedLocalAgentTask(
       metricsChanged: [],
     };
   }
-  const zh = wantsChineseReport(ego);
   const userContext = ego.userFacts.slice(0, 5).map((f) => `[${f.category}] ${f.content}`).join("\n");
   const recentUserMessages = (ego.recentUserMessages ?? [])
     .slice(-5)
@@ -1282,13 +1372,13 @@ async function executeBoundedLocalAgentTask(
   for (const file of sourceFiles.slice(0, 5)) {
     const step = await readLocalFile("read-source", join(target.dir, file));
     steps.push(step);
-    if (step.success && step.output) evidence.push(`### ${file}\n${step.output.slice(0, 1200)}`);
+    if (step.success && step.output) evidence.push(`### ${file}\n${normalizeTaskResultForReport(step.output).slice(0, 8000)}`);
   }
 
   for (const file of ["package.json", "README.md"]) {
     const step = await readLocalFile(`read-${file}`, join(target.dir, file));
     steps.push(step);
-    if (step.success && step.output) evidence.push(`### ${file}\n${step.output.slice(0, 1200)}`);
+    if (step.success && step.output) evidence.push(`### ${file}\n${normalizeTaskResultForReport(step.output).slice(0, 8000)}`);
   }
 
   const status: "partial" | "blocked" = evidence.length > 0 ? "partial" : "blocked";
@@ -1308,7 +1398,6 @@ async function executeBoundedLocalAgentTask(
     analysisContext,
     limitation,
     resultFilePath,
-    zh,
   });
 
   writeTaskReportFile(resultFilePath, report);
@@ -1353,7 +1442,7 @@ export async function executeRunAgentTask(
   ego: EgoState,
   options: AutonomousActionOptions,
 ): Promise<{ result: ActionResult; metricsChanged: MetricDelta[] }> {
-  if ((ego.activeTasks ?? []).filter((t) => t.status === "in-progress").length >= MAX_ACTIVE_TASKS) {
+  if ((ego.activeTasks ?? []).filter(isTaskOccupyingWorker).length >= MAX_ACTIVE_TASKS) {
     return { result: { type: "run-agent-task", success: false, error: "Too many active tasks" }, metricsChanged: [] };
   }
 
@@ -1412,16 +1501,14 @@ async function executeRunAgentTaskViaSubagent(
   const analysisContext = latestAnalysis
     ? `\n\n**Previous analysis result** (use this to implement the fix):\n${latestAnalysis.result?.slice(0, 1000)}`
     : "";
+  const maintenanceFocusText = formatMaintenanceFocus(thought);
 
   const taskId = randomBytes(4).toString("hex");
   const resultDir = join(resolveSoulDir(), "results");
   mkdirSync(resultDir, { recursive: true });
   const resultFilePath = join(resultDir, `${taskId}.md`);
 
-  const zh = wantsChineseReport(ego);
-  const langInstruction = zh
-    ? "用中文写报告。所有 section 内容用中文，不要用英文。"
-    : "Write the report in English.";
+  const langInstruction = buildUserLanguageInstruction(ego);
 
   const agentMessage = `[Soul Autonomous Task]
 ${thought.content}
@@ -1432,14 +1519,15 @@ You have a hard ${AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS}s work budget. Do one bou
 
 ${langInstruction}
 
-Context:
-- Target project: ${target.isSelf ? "not explicitly specified; inspect the current workspace" : `${target.dir} (${target.name})`}
+ Context:
+- Target project: ${target.dir} (${target.name})
 - User profile: ${userContext || "limited"}
 - Recent user messages:
 ${recentUserMessages || "none"}
 - Active goals:
 ${activeGoals || "none"}
 - Trigger: ${thought.triggerDetail}${readOnlyInstruction}${analysisContext}${options.workspaceContext ? `\n- Workspace rules:\n${options.workspaceContext}` : ""}
+${maintenanceFocusText ? `- Maintenance focus:\n${maintenanceFocusText}\n` : ""}
 
 Work like the main OpenClaw agent would when the user directly asks for an improvement:
 - Inspect only the most relevant code, scripts, docs, recent logs.
@@ -1451,6 +1539,10 @@ Work like the main OpenClaw agent would when the user directly asks for an impro
 **Editing tips**:
 - If the edit tool fails with a matching error, the file may use CRLF line endings. Do NOT retry edit repeatedly — instead use node -e with fs.readFileSync/fs.writeFileSync to do string replacement, or use the write tool to rewrite the entire file.
 - If you cannot edit after 2 attempts, switch to exec with a node -e script immediately.
+
+**Write your final report to the result file, not in the chat.** Persist your complete report to this path using the write tool:
+${resultFilePath}
+Then write a brief summary to the chat.
 
 Write your final report as markdown with these sections:
 ## Outcome
@@ -1503,39 +1595,11 @@ Remaining risk or a sensible next improvement.`;
     subResult = { runId: "", success: false, output: "", error: String(err) };
   }
 
-  // Read what the subagent wrote to the result file (it may have updated it),
-  // otherwise use the subagent output directly.
-  // When the subagent timed out or errored, wait a grace period for the
-  // subagent to finish writing its result — the subagent may still be
-  // running after waitForRun returns, and it will write the result file
-  // directly via the write tool. Overwriting the file prematurely with
-  // subResult.output would clobber the real result.
-  const delayedReport = !subResult.success
-    ? await waitForFinalTaskReport(resultFilePath, SUBAGENT_GRACE_PERIOD_MS)
-    : null;
-  let report: string;
-  if (delayedReport) {
-    report = delayedReport;
-  } else try {
-    const fileContent = readFileSync(resultFilePath, "utf-8");
-    // If the file still only contains the initial report skeleton, use subagent output
-    if (fileContent.startsWith("Status: in-progress") || fileContent.length < 200) {
-      if (subResult.success) {
-        report = subResult.output;
-      } else {
-        // Subagent timed out or errored and hasn't written a final report yet.
-        // Write "partial" instead of "failed" so the subagent's eventual write
-        // (if it finishes later) is the canonical result.
-        report = `Status: partial\n\n## Outcome\nSubagent did not finish within the timeout. ${subResult.error || subResult.output || "No output"}`;
-      }
-      writeTaskReportFile(resultFilePath, report);
-    } else {
-      report = fileContent;
-    }
-  } catch {
-    report = subResult.success ? subResult.output : `Status: failed\n\n## Outcome\n${subResult.error || subResult.output || "Subagent failed with no output"}`;
-    writeTaskReportFile(resultFilePath, report);
-  }
+  // The subagent may time out before its final write lands. Prefer the
+  // completed result file, otherwise recover a final session report, and only
+  // then fall back to the subagent output or a synthetic partial/failed report.
+  const report = await resolveSubagentFinalReport(task, resultFilePath, subResult, false);
+  writeTaskReportFile(resultFilePath, report);
 
   // Determine task status from the report's Status: line.
   // "completed" → completed; "partial"/"blocked" → also completed (did useful work,
@@ -1547,7 +1611,7 @@ Remaining risk or a sensible next improvement.`;
     if (t) {
       t.status = taskStatus;
       t.result = report;
-      t.completedAt = Date.now();
+      t.completedAt = taskStatus === "awaiting-restart" ? undefined : Date.now();
       t.updatedAt = Date.now();
       t.resultDelivered = false;
     }
@@ -1564,7 +1628,7 @@ Remaining risk or a sensible next improvement.`;
   // Success if the report indicates a terminal state (completed/partial/blocked),
   // regardless of whether subResult.success was false (e.g. timeout — the subagent
   // may have finished writing during the grace period).
-  const success = taskStatus === "completed" || subResult.success;
+  const success = reportRepresentsSuccessfulCompletion(report);
   log.info(`Subagent run-agent-task ${taskId}: status=${taskStatus}, success=${success}`);
 
   return {
@@ -1600,30 +1664,9 @@ export async function executeReportFindings(
 
   const reportableTasks = completedTasks.filter((t) => !isLowValueAutonomousFailure(t));
   if (reportableTasks.length === 0) {
-    // All tasks are low-value failures. Send a brief status summary so the
-    // user at least knows tasks ran and failed, rather than seeing nothing.
-    if (!options.sendMessage || !options.channel || !options.target) {
-      await markCompletedTasksDelivered();
-      return { result: { type: "report-findings", success: true, result: "suppressed-low-value-failure-report" }, metricsChanged: [] };
-    }
-    const zh = wantsChineseReport(ego);
-    const briefSummary = completedTasks.map((t) => {
-      const reason = (t.result ?? "").match(/(?:failed|partial|blocked|timeout|stale)[^\n]*/i)?.[0] ?? "unknown";
-      return zh
-        ? `\u{4efb}\u{52a1} ${t.id} \u{5931}\u{8d1f}\u{5e0f}: ${reason.slice(0, 100)}`
-        : `Task ${t.id} failed: ${reason.slice(0, 100)}`;
-    }).join("\n");
-    const briefMessage = zh
-      ? `\u{81ea}\u{4e3b}\u{4efb}\u{52a1}\u{72b6}\u{6001}\u{62a5}\u{5440}:\n${briefSummary}`
-      : `Autonomous task status:\n${briefSummary}`;
-    try {
-      await options.sendMessage({ to: options.target, content: briefMessage, channel: options.channel });
-      log.info(`Report-findings: sent brief failure summary for ${completedTasks.length} low-value tasks`);
-    } catch (err) {
-      log.warn(`Failed to send brief failure summary: ${String(err)}`);
-    }
+    // No user-value evidence means no proactive natural-language message.
     await markCompletedTasksDelivered();
-    return { result: { type: "report-findings", success: true, result: `reported ${completedTasks.length} low-value failures briefly` }, metricsChanged: [] };
+    return { result: { type: "report-findings", success: true, result: "suppressed-low-value-failure-report" }, metricsChanged: [] };
   }
 
   if (!options.sendMessage || !options.channel || !options.target) {
@@ -1639,7 +1682,8 @@ export async function executeReportFindings(
 
   // Compose summary from all completed tasks — include git diff when available
   const taskSummaries = reportableTasks.map((t) => {
-    const summary = `**${t.title}**\n${t.result?.slice(0, 8000) ?? "No result"}`;
+    const deliveryStatus = isCompletedTaskForUserReport(t) ? "COMPLETED" : "NOT_COMPLETED";
+    const summary = `**${t.title}**\nDelivery status: ${deliveryStatus}\n${t.result?.slice(0, 8000) ?? "No result"}`;
     const targetDir = t.targetProjectRoot || "";
     if (targetDir) {
       const diffStat = captureGitDiffStat(targetDir);
@@ -1653,54 +1697,32 @@ export async function executeReportFindings(
   // files, metrics, or blockers. Exact message dedup below is enough to prevent
   // repeated sends without swallowing useful work.
 
-  const templateLanguage = supportsLocalMessageTemplate(ego);
-  // Local reports intentionally have only two audited templates. Every other
-  // language goes through the multilingual model instead of receiving English.
-  const directMessage = templateLanguage ? buildDirectTaskReportMessage(reportableTasks, ego) : null;
-  if (directMessage) {
-    const msgNorm = directMessage.trim().toLowerCase().slice(0, 200);
-    const dedupCutoff = Date.now() - 4 * 60 * 60 * 1000;
-    const isDuplicate = recentReportedMessages.has(msgNorm)
-      && (recentReportedMessages.get(msgNorm) ?? 0) > dedupCutoff;
-    if (isDuplicate) {
-      log.info("Report-findings: duplicate of recently sent direct report, skipping");
-      await markCompletedTasksDelivered();
-      return { result: { type: "report-findings", success: true, result: "skipped-duplicate" }, metricsChanged: [] };
-    }
-
-    try {
-      await options.sendMessage({ to: options.target, content: directMessage, channel: options.channel });
-      recentReportedMessages.set(msgNorm, Date.now());
-      log.info(`Reported findings directly: ${reportableTasks.length} tasks, message ${directMessage.length} chars`);
-    } catch (err) {
-      log.warn(`Failed to send direct report: ${String(err)}`);
-      return { result: { type: "report-findings", success: false, error: String(err) }, metricsChanged: [] };
-    }
-
-    await markCompletedTasksDelivered();
-    return {
-      result: { type: "report-findings", success: true, result: `Reported ${reportableTasks.length} tasks` },
-      metricsChanged: [
-        { need: "connection", delta: 10, reason: "proactively shared useful findings" },
-        { need: "meaning", delta: 8, reason: "delivered value to user" },
-      ],
-    };
-  }
-
   if (!options.llmGenerator) {
+    // Natural-language reports are model-composed. Do not leak an English
+    // implementation report merely because the multilingual composer is down.
+    log.info("Report-findings deferred: no multilingual LLM available");
     await markCompletedTasksDelivered();
-    return { result: { type: "report-findings", success: true, result: "nothing meaningful to report" }, metricsChanged: [] };
+    return { result: { type: "report-findings", success: true, result: "report-deferred-no-llm" }, metricsChanged: [] };
   }
 
   const reportLangInstruction = buildUserLanguageInstruction(ego);
-  const zhReport = wantsChineseReport(ego);
+  const allReportedTasksCompleted = reportableTasks.every(isCompletedTaskForUserReport);
+  const reportFramingInstruction = allReportedTasksCompleted
+    ? `Every task below is COMPLETED. This is a completion notification, not an investigation update.
+- Open with a direct completion statement (for example, "已完成：…" in Chinese or "Completed: …" in English).
+- Do NOT open with "我查了", "我检查了", "我分析了", "I checked", or "I investigated".
+- State what changed and how it was verified before mentioning any follow-up work.`
+    : `At least one task below is NOT_COMPLETED. Frame it honestly as a diagnosis or progress update.
+- Do not claim that a NOT_COMPLETED task is done.
+- Clearly distinguish completed changes from partial work, failures, and remaining next steps.`;
   const prompt = `You are a proactive AI. You autonomously investigated something and want to share findings with the user. ${reportLangInstruction}
 
 **What you investigated**:
 ${taskSummaries}
 
-Write a useful progress report in , not a tiny notification. Use 1 short opening sentence plus 2-5 compact bullets when that is clearer. Rules:
-- Start by mentioning WHAT you investigated and WHY (e.g. "我后来查了一下飞书消息发送超时的问题——", "我研究了一下那个 413 错误——", "I looked into the Discord delivery issue —")
+Write a useful progress report in the user's language, not a tiny notification. Use 1 short opening sentence plus 2-5 compact bullets when that is clearer. Rules:
+- ${reportFramingInstruction}
+- Start by mentioning WHAT you investigated and WHY.
 - Then share the CONCRETE finding: actual error messages, root causes, or actionable insights
 - If you investigated multiple things, pick the ONE most interesting finding — do NOT list them all
 - Sound natural, like a knowledgeable friend sharing something useful they discovered
@@ -1710,19 +1732,6 @@ Write a useful progress report in , not a tiny notification. Use 1 short opening
 - If you verified the work, mention the command and result
 - Reports about code improvements, fixes, verification, and remaining risks are valuable when they are concrete
 - Output NO_MESSAGE only if there is no concrete finding, no code change, and no useful next step
-
-**BAD examples** (NEVER do this):
-收到，问题已定位：...                          ← assistant-like prefix
-我查了日志，发现两个问题：1.xxx 2.xxx       ← numbered list, gets truncated
-我研究了一下那个问题——根因是...             ← WHAT problem? Too vague
-Soul 插件正在产生主动行为了！                ← describing Soul's own behavior
-好的，根据日志分析...                        ← assistant-like prefix
-我已经把旅游住宿相关的关键词加入了时效敏感模式 ← self-modification, NOT a user-facing finding
-我研究了一下 Soul 为什么没执行——根因是...    ← self-debugging, user doesn't care
-
-**GOOD examples**:
-我后来查了一下飞书消息发送超时的问题——根因是 OpenViking 的 embedding API 有 512 token 限制，不是 Soul 本身的问题。
-我研究了一下日志里那个 413 错误，是 memory search 输入超长导致的，跟 Soul 插件没关系。
 
 For this user, code and plugin self-improvement reports ARE user-facing when they describe a concrete change, verification result, or next engineering step.
 If the work produced no concrete finding, no code change, and no useful next step, output exactly: NO_MESSAGE
@@ -1737,9 +1746,14 @@ Output ONLY the message, nothing else.`;
       // Match prefix + optional punctuation + everything up to first sentence break
       .replace(/^(?:收到|好的|Got it|OK)[，。、！？：:\s]*[^。！？\n]*[，：:]\s*/i, "")
       .trim();
-  } catch {
-    // Fallback: use raw task result
-    message = reportableTasks[0].result?.slice(0, 1500) ?? "Analysis completed.";
+    if (allReportedTasksCompleted) {
+      message = normalizeCompletedReportOpening(message, ego.userLanguage ?? undefined);
+    }
+  } catch (err) {
+    // Raw reports are internal protocol, not a safe localization fallback.
+    log.warn(`Report-findings composition failed: ${String(err)}`);
+    await markCompletedTasksDelivered();
+    return { result: { type: "report-findings", success: false, error: "report-composition-failed" }, metricsChanged: [] };
   }
 
   // Reject messages that are clearly not useful
@@ -2110,6 +2124,18 @@ function resolveTargetProject(
   thought?: Thought,
   workspaceContext?: string,
 ): { dir: string; name: string; isSelf: boolean; resolutionError?: string } {
+  const explicitProjectRoot = typeof thought?.actionParams?.projectRoot === "string"
+    ? thought.actionParams.projectRoot.trim()
+    : "";
+  const internalMaintenance = typeof thought?.actionParams?.maintenanceFocus === "string";
+
+  // A built-in maintenance focus belongs to the linked Soul checkout. A
+  // generic OpenClaw workspace must not steal this target. Explicit roots from
+  // user-directed work still take precedence by opting out of this shortcut.
+  if (internalMaintenance && !explicitProjectRoot && isProjectDirectory(SOUL_PROJECT_DIR)) {
+    return { dir: SOUL_PROJECT_DIR, name: "openclaw-soul", isSelf: true };
+  }
+
   const candidates = gatherTargetCandidates(ego, thought, workspaceContext);
   const tried: string[] = [];
 
@@ -2146,6 +2172,14 @@ function resolveTargetProject(
   }
 
   return { dir: SOUL_PROJECT_DIR, name: "Soul plugin (self-improvement)", isSelf: true };
+}
+
+export function __testOnlyResolveTargetProject(
+  ego: EgoState,
+  thought?: Thought,
+  workspaceContext?: string,
+): { dir: string; name: string; isSelf: boolean; resolutionError?: string } {
+  return resolveTargetProject(ego, thought, workspaceContext);
 }
 
 function isProjectDirectory(dir: string): boolean {
@@ -2203,11 +2237,10 @@ export async function executeObserveAndImprove(
     return { result: { type: "observe-and-improve", success: false, error: "No LLM generator" }, metricsChanged: [] };
   }
   const readOnlyMode = !options.autonomousActions;
-  const reportZh = wantsChineseReport(ego);
 
   // Only 1 concurrent improvement task
   const activeImprove = (ego.activeTasks ?? []).filter(
-    (t) => t.status === "in-progress" && t.title?.toLowerCase().includes("improvement"),
+    (t) => isTaskOccupyingWorker(t) && t.title?.toLowerCase().includes("improvement"),
   ).length;
   if (activeImprove >= 1) {
     return { result: { type: "observe-and-improve", success: false, error: "Improvement task already running" }, metricsChanged: [] };
@@ -2240,23 +2273,19 @@ Task: ${taskId}
 Finished: ${new Date().toISOString()}
 
 ## Outcome
-${reportZh
-    ? `未启动代码优化：${target.resolutionError}。`
-    : `No code improvement was started: ${target.resolutionError}.`}
+No code improvement was started: ${target.resolutionError}.
 
 ## Changes
-${reportZh ? "没有修改任何文件。" : "No files were changed."}
+No files were changed.
 
 ## Verification
-${reportZh ? "目标解析失败，因此没有读取源码或运行验证命令。" : "No source or verification command was run because target resolution failed."}
+No source or verification command was run because target resolution failed.
 
 ## Metrics
-${reportZh ? "读取文件：0；修改文件：0；验证：未执行。" : "Files read: 0. Files modified: 0. Verification: not run."}
+Files read: 0. Files modified: 0. Verification: not run.
 
 ## Next
-${reportZh
-    ? "需要从用户明确路径或主 Agent 的成功工具轨迹获得可信项目根目录后才能重试。"
-    : "Retry only after a trusted project root is available from an explicit user path or successful host-agent tool evidence."}`;
+Retry only after a trusted project root is available from an explicit user path or successful host-agent tool evidence.`;
     await completeTask(taskId, result, "failed");
     return {
       result: { type: "observe-and-improve", success: false, error: target.resolutionError },
@@ -2310,6 +2339,7 @@ ${reportZh
 - Prior verification: ${Array.isArray(thought.actionParams.priorVerificationCommands) ? thought.actionParams.priorVerificationCommands.join(" | ") : "none recorded"}
 - Prior failed tools: ${Array.isArray(thought.actionParams.priorFailedTools) ? thought.actionParams.priorFailedTools.join(", ") : "none"}`
     : "";
+  const maintenanceFocusText = formatMaintenanceFocus(thought);
 
   // --- Read source files ---
   const allFiles = [...new Set([...contextFiles, ...getSourceFiles(target.dir)])]
@@ -2318,7 +2348,7 @@ ${reportZh
   for (const fname of allFiles) {
     const step = await readLocalFile("read-source", `${target.dir}/${fname}`);
     if (step.success && step.output) {
-      fileContents.push(`=== ${fname} ===\n${step.output.slice(0, 4000)}`);
+      fileContents.push(`=== ${fname} ===\n${normalizeTaskResultForReport(step.output).slice(0, 8000)}`);
     }
   }
 
@@ -2330,27 +2360,19 @@ Task: ${taskId}
 Finished: ${new Date().toISOString()}
 
 ## Outcome
-${reportZh
-    ? `未执行代码优化：${target.dir} 不是可读取的源码项目。`
-    : `No improvement was performed because ${target.dir} does not resolve to a readable source project.`}
+No improvement was performed because ${target.dir} does not resolve to a readable source project.
 
 ## Changes
-${reportZh ? "没有修改任何文件。" : "No files were changed."}
+No files were changed.
 
 ## Verification
-${reportZh
-    ? "源码扫描已检查目标目录，符合条件的源码文件为 0。"
-    : "Source discovery inspected the resolved target and found 0 eligible source files."}
+Source discovery inspected the resolved target and found 0 eligible source files.
 
 ## Metrics
-${reportZh
-    ? "检查文件：0；修改文件：0；通过验证命令：0。"
-    : "Files inspected: 0. Files modified: 0. Verification commands passed: 0."}
+Files inspected: 0. Files modified: 0. Verification commands passed: 0.
 
 ## Next
-${reportZh
-    ? "下一次 Improvement 必须先解析到具体项目根目录，不能再把项目集合目录当成源码项目。"
-    : "Resolve the directive to a concrete project root before starting another improvement."}`;
+Resolve the directive to a concrete project root before starting another improvement.`;
     await completeTask(taskId, noSourceReport, "failed");
     return { result: { type: "observe-and-improve", success: false, error: `No source files found in ${target.dir}` }, metricsChanged: [] };
   }
@@ -2372,10 +2394,7 @@ ${reportZh
 
   // --- LLM analysis ---
   const fileNames = allFiles.join(", ");
-    const zh = wantsChineseReport(ego);
-  const langInstruction = zh
-    ? "用中文写报原。所有 section 内容用中文，不要用英文。"
-    : "Write the report in English.";
+  const langInstruction = buildUserLanguageInstruction(ego);
 
 const projectDesc = target.isSelf
     ? "This is the Soul plugin itself — an autonomous AI agent with ego, thoughts, and actions."
@@ -2529,36 +2548,26 @@ Rules:
 
   log.info(`Improvement analysis done: fixApplied=${fixApplied}, ${fixDescription || "no fix"}`);
 
-  const taskStatus: "completed" | "failed" =
+  const verifiedTaskStatus: "completed" | "failed" =
     fixApplied || (readOnlyMode && analysisCompleted && !analysisFailure)
       ? "completed"
       : "failed";
-  const outcomeText = reportZh
-    ? fixApplied
-      ? `已完成并验证一项明确优化：${proposedProblem || fixDescription}。`
-      : readOnlyMode && analysisCompleted && !analysisFailure
-        ? `只读分析已完成：${fixDescription || proposedProblem || "没有发现足够明确的优化项"}。`
-        : `本次没有完成代码优化：${fixDescription || analysisFailure || "没有找到可安全实施的修改"}。`
-    : fixApplied
-      ? `Applied and verified one concrete improvement: ${proposedProblem || fixDescription}.`
-      : readOnlyMode && analysisCompleted && !analysisFailure
-        ? `Completed a read-only analysis: ${fixDescription || proposedProblem || "no concrete improvement was identified"}.`
-        : `No autonomous code improvement was completed: ${fixDescription || analysisFailure || "no safe change was identified"}.`;
+  const requiresActivation = target.isSelf && fixApplied && options.autonomousActions;
+  const taskStatus: TaskStatus = requiresActivation ? "awaiting-restart" : verifiedTaskStatus;
+  const outcomeText = fixApplied
+    ? `Applied and verified one concrete improvement: ${proposedProblem || fixDescription}.`
+    : readOnlyMode && analysisCompleted && !analysisFailure
+      ? `Completed a read-only analysis: ${fixDescription || proposedProblem || "no concrete improvement was identified"}.`
+      : `No autonomous code improvement was completed: ${fixDescription || analysisFailure || "no safe change was identified"}.`;
   const changesText = fixApplied
-    ? reportZh
-      ? `- 修改文件：${proposedFile}\n- 修复问题：${proposedProblem || "未说明"}\n- 功能优化：${proposedExplanation || fixDescription}`
-      : `- File: ${proposedFile}\n- Problem fixed: ${proposedProblem || "not specified"}\n- Functional improvement: ${proposedExplanation || fixDescription}`
-    : reportZh
-      ? `没有修改任何文件。${proposedFile ? `候选文件：${proposedFile}。` : ""}`
-      : `No files were changed.${proposedFile ? ` Candidate file: ${proposedFile}.` : ""}`;
+    ? `- File: ${proposedFile}\n- Problem fixed: ${proposedProblem || "not specified"}\n- Functional improvement: ${proposedExplanation || fixDescription}`
+    : `No files were changed.${proposedFile ? ` Candidate file: ${proposedFile}.` : ""}`;
   const verificationText = fixApplied
-    ? verificationSummary || (reportZh ? "配置的验证命令已通过。" : "The configured verification command passed.")
+    ? verificationSummary || "The configured verification command passed."
     : readOnlyMode
-      ? reportZh ? "自主写入未启用，因此没有执行验证命令。" : "No command was run because autonomous write mode was disabled."
-      : analysisFailure || (reportZh ? "没有应用修改，因此没有执行验证。" : "No verification was run because no change was applied.");
-  const metricsText = reportZh
-    ? `发现源码文件：${allFiles.length}；读取文件：${fileContents.length}；修改文件：${fixApplied ? 1 : 0}；验证：${fixApplied ? "通过" : "未执行"}。`
-    : `Source files discovered: ${allFiles.length}. Files read: ${fileContents.length}. Files modified: ${fixApplied ? 1 : 0}. Verification: ${fixApplied ? "passed" : "not run"}.`;
+      ? "No command was run because autonomous write mode was disabled."
+      : analysisFailure || "No verification was run because no change was applied.";
+  const metricsText = `Source files discovered: ${allFiles.length}. Files read: ${fileContents.length}. Files modified: ${fixApplied ? 1 : 0}. Verification: ${fixApplied ? "passed" : "not run"}.`;
   const acceptanceText = (task.acceptanceCriteria ?? []).length > 0
     ? (task.acceptanceCriteria ?? []).map((criterion) => {
       const requiresChange = /changed files/i.test(criterion);
@@ -2566,14 +2575,10 @@ Rules:
       const met = requiresChange ? fixApplied : requiresVerification ? fixApplied : /outcome report/i.test(criterion);
       return `- [${met ? "x" : " "}] ${criterion}`;
     }).join("\n")
-    : reportZh ? "没有记录独立的验收条件。" : "No explicit acceptance criteria were recorded.";
-  const nextText = reportZh
-    ? fixApplied
-      ? "在正常使用中观察这项修改；只有出现不同且有证据的问题时，才启动下一次 Improvement。"
-      : "不能把本次任务汇报成已完成的代码优化；必须先收窄目标或补充证据再重试。"
-    : fixApplied
-      ? "Review the verified change in normal use and only start another improvement when there is a distinct issue."
-      : "Do not report this as a completed code improvement; refine the target or evidence before retrying.";
+    : "No explicit acceptance criteria were recorded.";
+  const nextText = fixApplied
+    ? "Review the verified change in normal use and only start another improvement when there is a distinct issue."
+    : "Do not report this as a completed code improvement; refine the target or evidence before retrying.";
   const result = `Status: ${taskStatus}
 Task: ${taskId}
 Finished: ${new Date().toISOString()}
@@ -2598,15 +2603,16 @@ ${acceptanceText}
 ${nextText}`;
 
   await completeTask(taskId, result, taskStatus);
+  if (taskStatus === "awaiting-restart") scheduleGatewayRestart(taskId);
 
   return {
     result: {
       type: "observe-and-improve",
-      success: taskStatus === "completed",
+      success: taskStatus === "completed" || taskStatus === "awaiting-restart",
       result: result.slice(0, 500),
       data: { readOnly: readOnlyMode, fixApplied, analysisCompleted },
     },
-    metricsChanged: taskStatus === "completed"
+    metricsChanged: taskStatus === "completed" || taskStatus === "awaiting-restart"
       ? [
           { need: "growth", delta: fixApplied ? 20 : 10, reason: fixApplied ? "applied improvement fix" : "code analysis" },
           { need: "meaning", delta: fixApplied ? 15 : 8, reason: readOnlyMode ? "observing self-improvement opportunities" : "working on user's assigned goal" },
@@ -2674,18 +2680,15 @@ export async function executeSubagentImprove(
 
   // Only 1 concurrent improvement task
   const activeImprove = (ego.activeTasks ?? []).filter(
-    (t) => t.status === "in-progress" && t.title?.toLowerCase().includes("improvement"),
+    (t) => isTaskOccupyingWorker(t) && t.title?.toLowerCase().includes("improvement"),
   ).length;
   if (activeImprove >= 1) {
     return { result: { type: "subagent-improve", success: false, error: "Improvement task already running" }, metricsChanged: [] };
   }
 
-  const zh = wantsChineseReport(ego);
   const readOnlyMode = !options.autonomousActions;
 
-  const langInstruction = zh
-    ? "用中文写报告。所有 section 内容用中文，不要用英文。"
-    : "Write the report in English.";
+  const langInstruction = buildUserLanguageInstruction(ego);
 
   // Build context
   const userContext = ego.userFacts.slice(0, 5).map((f) => `[${f.category}] ${f.content}`).join("\n");
@@ -2752,6 +2755,7 @@ export async function executeSubagentImprove(
   const readOnlyInstruction = readOnlyMode
     ? "\n\nIMPORTANT: You are in READ-ONLY mode. Only READ files and RUN diagnostic commands. Do NOT edit, write, or modify any files."
     : "";
+  const maintenanceFocusText = formatMaintenanceFocus(thought);
 
   const projectDesc = target.isSelf
     ? "This is the Soul plugin itself — an autonomous AI agent with ego, thoughts, and actions."
@@ -2767,7 +2771,7 @@ You have a hard ${AUTONOMOUS_AGENT_WORK_BUDGET_SECONDS}s work budget. Do one bou
 ${langInstruction}
 
 Context:
-- Target project: ${target.isSelf ? "not explicitly specified; inspect the current workspace" : `${target.dir} (${target.name})`}
+- Target project: ${target.dir} (${target.name})
 - ${projectDesc}
 - User profile: ${userContext || "limited"}
 - Recent user messages:
@@ -2778,6 +2782,7 @@ ${activeGoals || "none"}
 ${projectContinuityText ? `- ${projectContinuityText}` : ""}
 ${handoffText ? `- ${handoffText}` : ""}
 ${options.workspaceContext ? `- Workspace rules:\n${options.workspaceContext}` : ""}
+${maintenanceFocusText ? `- Maintenance focus:\n${maintenanceFocusText}` : ""}
 
 **Previous findings**:
 ${recentAnalyses || "None."}
@@ -2791,10 +2796,15 @@ Work like the main OpenClaw agent would when the user directly asks for a focuse
 4. Run the most relevant verification command (build, test, typecheck, compile) to confirm the fix works.
 5. If verification fails, revert the change and report the failure.
 6. Do not ask for confirmation, do not stop at a proposal, and do not invent results.
+7. Do NOT restart the OpenClaw gateway yourself. Soul persists the final report first and coordinates restart from the parent process so the task cannot be orphaned.
 
 **Editing tips**:
 - If the \`edit\` tool fails with a matching error, the file may use CRLF line endings. Do NOT retry edit repeatedly — instead use \`node -e\` with \`fs.readFileSync\`/\`fs.writeFileSync\` to do string replacement, or use the \`write\` tool to rewrite the entire file.
 - If you cannot edit after 2 attempts, switch to \`exec\` with a \`node -e\` script immediately.
+
+**Write your final report to the result file, not in the chat.** Persist your complete report to this path using the write tool first:
+${resultFilePath}
+Then write a brief summary to the chat.
 
 Write your final report as markdown with these sections:
 ## Outcome
@@ -2847,30 +2857,12 @@ Remaining risk or a sensible next improvement.`;
     subResult = { runId: "", success: false, output: "", error: String(err) };
   }
 
-  // Read what the subagent wrote to the result file, otherwise use subagent output
-  // Same grace period logic as executeRunAgentTaskViaSubagent above.
-  const delayedReport = !subResult.success
-    ? await waitForFinalTaskReport(resultFilePath, SUBAGENT_GRACE_PERIOD_MS)
-    : null;
-  let report: string;
-  if (delayedReport) {
-    report = delayedReport;
-  } else try {
-    const fileContent = readFileSync(resultFilePath, "utf-8");
-    if (fileContent.startsWith("Status: in-progress") || fileContent.length < 200) {
-      if (subResult.success) {
-        report = subResult.output;
-      } else {
-        report = `Status: partial\n\n## Outcome\nSubagent did not finish within the timeout. ${subResult.error || subResult.output || "No output"}`;
-      }
-      writeTaskReportFile(resultFilePath, report);
-    } else {
-      report = fileContent;
-    }
-  } catch {
-    report = subResult.success ? subResult.output : `Status: failed\n\n## Outcome\n${subResult.error || subResult.output || "Subagent failed with no output"}`;
-    writeTaskReportFile(resultFilePath, report);
-  }
+  // Use the same final-report recovery logic as run-agent-task so both
+  // maintenance paths converge on the same completion behavior.
+  let report = await resolveSubagentFinalReport(task, resultFilePath, subResult, false);
+  const requiresActivation = target.isSelf && options.autonomousActions && reportShowsVerifiedCodeChange(report);
+  if (requiresActivation) report = markReportAwaitingRestart(report);
+  writeTaskReportFile(resultFilePath, report);
 
   // Determine task status from the report's Status: line.
   // "completed" → completed; "partial"/"blocked" → also completed (did useful work,
@@ -2882,9 +2874,10 @@ Remaining risk or a sensible next improvement.`;
     if (t) {
       t.status = taskStatus;
       t.result = report;
-      t.completedAt = Date.now();
+      t.completedAt = taskStatus === "awaiting-restart" ? undefined : Date.now();
       t.updatedAt = Date.now();
       t.resultDelivered = false;
+      if (taskStatus === "awaiting-restart") t.activationRequestedAt = Date.now();
     }
     return e;
   });
@@ -2892,15 +2885,24 @@ Remaining risk or a sensible next improvement.`;
   // Success if the report indicates a terminal state (completed/partial/blocked),
   // regardless of whether subResult.success was false (e.g. timeout — the subagent
   // may have finished writing during the grace period).
-  const success = taskStatus === "completed" || subResult.success;
+  const success = reportRepresentsSuccessfulCompletion(report);
   log.info(`Subagent-improve ${taskId}: status=${taskStatus}, success=${success}`);
+
+  if (taskStatus === "awaiting-restart") scheduleGatewayRestart(taskId);
 
   return {
     result: {
       type: "subagent-improve",
       success,
       result: report.slice(0, 500),
-      data: { taskId, resultFilePath, status: taskStatus, runId: subResult.runId, fixApplied: success, readOnly: readOnlyMode },
+      data: {
+        taskId,
+        resultFilePath,
+        status: taskStatus,
+        runId: subResult.runId,
+        fixApplied: reportShowsVerifiedCodeChange(report),
+        readOnly: readOnlyMode,
+      },
     },
     metricsChanged: [
       { need: "growth", delta: success ? 20 : 3, reason: success ? "completed subagent improvement with full tool-chain verification" : "subagent improvement did not fully complete" },
@@ -2912,7 +2914,7 @@ Remaining risk or a sensible next improvement.`;
 async function completeTask(
   taskId: string,
   result: string,
-  status: "completed" | "failed" = "completed",
+  status: "completed" | "failed" | "awaiting-restart" = "completed",
   resultDelivered = false,
 ): Promise<void> {
   let linkedIntentionId: string | undefined;
@@ -2947,9 +2949,10 @@ Run a focused verification command or a smaller follow-up improvement if the res
         ? "failed"
         : reportStatusToTaskStatus(finalResult);
       t.result = finalResult;
-      t.completedAt = Date.now();
+      t.completedAt = status === "awaiting-restart" ? undefined : Date.now();
       t.updatedAt = Date.now();
       t.resultDelivered = resultDelivered;
+      if (status === "awaiting-restart") t.activationRequestedAt = Date.now();
     }
     return e;
   });
@@ -2961,7 +2964,9 @@ Run a focused verification command or a smaller follow-up improvement if the res
       const requiresVerification = intention.evidenceNeeded.some((item) => /verification command/i.test(item));
       const reportsNoChange = /No files were changed|没有修改任何文件|Files modified:\s*0|修改文件：0/i.test(result);
       const reportsNoVerification = /Verification:\s*not run|验证：未执行|没有执行验证|No verification was run/i.test(result);
-      intention.status = status === "failed"
+      intention.status = status === "awaiting-restart"
+        ? "active"
+        : status === "failed"
         || !linkedAcceptanceMet
         || (requiresChange && reportsNoChange)
         || (requiresVerification && reportsNoVerification)
@@ -2971,7 +2976,7 @@ Run a focused verification command or a smaller follow-up improvement if the res
     });
     const handoffStore = new WorkHandoffStore(resolveWorkHandoffStorePath(resolveEgoStorePath()));
     await handoffStore.updateForIntention(linkedIntentionId, (handoff) => {
-      handoff.phase = intentionFulfilled ? "verified" : "blocked";
+      handoff.phase = status === "awaiting-restart" ? "implementing" : intentionFulfilled ? "verified" : "blocked";
     });
   }
 }
@@ -3013,6 +3018,7 @@ function extractResultFromSessions(task: AutonomousTask, sinceMs: number, zh: bo
       let lastAssistantText = "";
       let promptError = "";
       let toolFailure = "";
+      const reportCandidates: string[] = [];
       for (const line of content.split("\n")) {
         try {
           const obj = JSON.parse(line.trim());
@@ -3020,23 +3026,39 @@ function extractResultFromSessions(task: AutonomousTask, sinceMs: number, zh: bo
             promptError = String(obj.data?.error ?? "prompt error");
           }
           if (obj.type === "message" && obj.message?.role === "assistant") {
-            const mc = obj.message.content;
-            if (Array.isArray(mc)) {
-              for (const c of mc) {
-                if (c.type === "text" && c.text && c.text.trim().length > 20) {
-                  lastAssistantText = c.text.trim();
-                }
-              }
+            const assistantText = extractSessionText(obj.message.content);
+            if (assistantText.length > 20) {
+              lastAssistantText = assistantText;
+              reportCandidates.push(assistantText);
             }
           }
           if (obj.type === "message" && obj.message?.role === "toolResult") {
-            const text = JSON.stringify(obj.message.content ?? "");
-            if (/ParserError|Command exited with code [1-9]|EnvironmentLocationNotFound|timed out|timeout|error/i.test(text)) {
-              toolFailure = text.slice(0, 600);
+            const toolText = extractSessionText(obj.message.content);
+            if (toolText.length > 0) {
+              reportCandidates.push(toolText);
+            }
+            if (/ParserError|Command exited with code [1-9]|EnvironmentLocationNotFound|timed out|timeout|error/i.test(toolText)) {
+              toolFailure = toolText.slice(0, 600);
+            }
+          }
+          if (obj.type === "tool.result" || obj.type === "toolResult") {
+            const toolText = extractSessionText(obj.data?.output ?? obj.data?.result?.output ?? obj.output ?? obj.result?.output ?? obj.message?.content);
+            if (toolText.length > 0) {
+              reportCandidates.push(toolText);
+            }
+            if (/ParserError|Command exited with code [1-9]|EnvironmentLocationNotFound|timed out|timeout|error/i.test(toolText)) {
+              toolFailure = toolText.slice(0, 600);
             }
           }
         } catch { /* skip malformed lines */ }
       }
+      for (const candidate of reportCandidates.reverse()) {
+        if (isCompleteTaskReport(candidate)) {
+          return { status: reportStatusToTaskStatus(candidate) === "failed" ? "failed" : "completed", result: candidate };
+        }
+      }
+      // A prompt/tool error can occur before a later recovery write. Only turn
+      // it into a failure after scanning the whole session for a final report.
       if (promptError) {
         const detail = [
           `Agent session ${name.name} failed before writing the required result file.`,
@@ -3044,22 +3066,36 @@ function extractResultFromSessions(task: AutonomousTask, sinceMs: number, zh: bo
           toolFailure ? `Last tool failure: ${toolFailure}` : "",
           lastAssistantText ? `Last assistant text: ${lastAssistantText.slice(0, 600)}` : "",
         ].filter(Boolean).join("\n");
-        return { status: "failed", result: buildFailureTaskReport(task, detail, zh) };
+        return { status: "failed", result: buildFailureTaskReport(task, detail) };
       }
       if (lastAssistantText) {
-        if (isCompleteTaskReport(lastAssistantText) && (!task.resultFilePath || hasFinalTaskResultFile(task))) {
-          return { status: "completed", result: lastAssistantText };
-        }
         const detail = `Agent session ${name.name} stopped before producing a final result file${task.resultFilePath ? ` (${task.resultFilePath})` : ""}. Last partial output: ${lastAssistantText.slice(0, 1200)}`;
         const hasUsefulPartial = /\bdone\b|\bfail(?:ed|ure)?\b|\bpasses\b|\bimproved?\b|\bworse\b|\bbug\b|\broot cause\b|\bclear\b|\bmetric\b|\bresult\b|\bverified?\b|\bfixed?\b|\bapplied\b|\bcompleted\b/i.test(lastAssistantText);
         return {
           status: "failed",
-          result: hasUsefulPartial ? buildPartialTaskReport(task, detail, zh) : buildFailureTaskReport(task, detail, zh),
+          result: hasUsefulPartial ? buildPartialTaskReport(task, detail) : buildFailureTaskReport(task, detail),
         };
       }
     }
   } catch { /* sessions dir not accessible */ }
   return null;
+}
+
+export function __testOnlyExtractResultFromSessions(task: AutonomousTask, sinceMs: number, zh: boolean): { status: "completed" | "failed"; result: string } | null {
+  return extractResultFromSessions(task, sinceMs, zh);
+}
+
+export async function __testOnlyResolveSubagentFinalReport(
+  task: AutonomousTask,
+  resultFilePath: string,
+  subResult: SubAgentRunResult,
+  zh: boolean,
+): Promise<string> {
+  return resolveSubagentFinalReport(task, resultFilePath, subResult, zh);
+}
+
+export function __testOnlyReportShowsVerifiedCodeChange(result: string): boolean {
+  return reportShowsVerifiedCodeChange(result);
 }
 
 async function readLocalFile(actionName: string, filePath: string): Promise<TaskStep> {
@@ -3156,6 +3192,25 @@ export async function pollActiveTasks(storePath: string): Promise<AutonomousTask
     if (!e.activeTasks) e.activeTasks = [];
 
     for (const task of e.activeTasks) {
+      if (task.status === "awaiting-restart") {
+        if (task.activationRequestedAt && task.activationRequestedAt < PROCESS_STARTED_AT) {
+          task.status = "completed";
+          task.result = markReportActivated(task.result ?? "Status: awaiting-restart");
+          writeTaskReportFile(task.resultFilePath, task.result);
+          task.activatedAt = PROCESS_STARTED_AT;
+          task.completedAt = Date.now();
+          task.updatedAt = Date.now();
+          newlyCompleted.push({ ...task });
+        } else if (task.activationRequestedAt && Date.now() - task.activationRequestedAt > 10 * 60 * 1000) {
+          task.status = "failed";
+          task.result = buildFailureTaskReport(task, "Gateway restart was requested but a later Soul process start was not observed within 10 minutes.");
+          writeTaskReportFile(task.resultFilePath, task.result);
+          task.completedAt = Date.now();
+          task.updatedAt = Date.now();
+          newlyCompleted.push({ ...task });
+        }
+        continue;
+      }
       if (task.status !== "in-progress") continue;
 
       // Check result file first
@@ -3179,7 +3234,7 @@ export async function pollActiveTasks(storePath: string): Promise<AutonomousTask
       // is still actively running and hasn't had a chance to write its final
       // report yet.
       if (!task.result && task.requiresWritePermission && Date.now() - task.updatedAt > STALE_MS) {
-        const sessionResult = extractResultFromSessions(task, task.createdAt, wantsChineseReport(e));
+        const sessionResult = extractResultFromSessions(task, task.createdAt, false);
         if (sessionResult) {
           task.result = sessionResult.result;
           task.status = sessionResult.status;
@@ -3193,9 +3248,16 @@ export async function pollActiveTasks(storePath: string): Promise<AutonomousTask
 
       // Final fallback: stale timeout.
       if (Date.now() - task.updatedAt > STALE_MS) {
+        // But check if the subagent session is still being actively written to
+        // before marking the task as failed. A long-running verification command
+        // or slow report write can keep `task.updatedAt` old even though the
+        // subagent is actively working.
+        if (isSubagentSessionRecentlyActive(task)) {
+          continue;
+        }
         const detail = task.result ?? `Task timed out (stale >${Math.round(STALE_MS / 60000)} min). Required final result file was not produced${task.resultFilePath ? `: ${task.resultFilePath}` : ""}.`;
         task.status = "failed";
-        task.result = buildFailureTaskReport(task, detail, wantsChineseReport(e));
+        task.result = buildFailureTaskReport(task, detail);
         writeTaskReportFile(task.resultFilePath, task.result);
         task.completedAt = Date.now();
         task.updatedAt = Date.now();

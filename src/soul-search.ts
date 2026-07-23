@@ -31,12 +31,24 @@ export type OpenClawSearchCompat = {
     };
   };
   skills?: { entries?: Record<string, Record<string, unknown>> };
+  plugins?: {
+    entries?: {
+      duckduckgo?: {
+        config?: {
+          webSearch?: {
+            region?: string;
+            safeSearch?: "strict" | "moderate" | "off";
+          };
+        };
+      };
+    };
+  };
 };
 
 /** The search config subsection type (tools.web.search) */
 type SearchConfig = NonNullable<NonNullable<NonNullable<OpenClawSearchCompat["tools"]>["web"]>["search"]>;
 
-type ProviderName = "brave" | "gemini" | "grok" | "kimi" | "perplexity" | "bocha";
+type ProviderName = "brave" | "gemini" | "grok" | "kimi" | "perplexity" | "bocha" | "duckduckgo";
 
 // --- API key resolution helpers ---
 
@@ -75,7 +87,7 @@ function resolveBochaApiKey(openclawConfig?: OpenClawSearchCompat, pluginKey?: s
 function detectProvider(search: SearchConfig | undefined, openclawConfig?: OpenClawSearchCompat): ProviderName | null {
   // 1. Explicit provider setting
   const explicit = search?.provider?.trim().toLowerCase();
-  if (explicit === "brave" || explicit === "gemini" || explicit === "grok" || explicit === "kimi" || explicit === "perplexity") {
+  if (explicit === "brave" || explicit === "gemini" || explicit === "grok" || explicit === "kimi" || explicit === "perplexity" || explicit === "duckduckgo") {
     return explicit;
   }
 
@@ -96,6 +108,92 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   return promise.finally(() => clearTimeout(timer));
+}
+
+// DuckDuckGo is OpenClaw's key-free search provider. Soul cannot call another
+// plugin's registered tool directly from its background worker, so mirror the
+// provider's documented HTML endpoint here instead of treating the configured
+// provider as unavailable.
+function decodeHtmlEntities(text: string): string {
+  return text.replace(/&(?:lt|gt|quot|apos|#39|#x27|#x2F|nbsp|ndash|mdash|hellip|amp|#\d+|#x[0-9a-f]+);/gi, (entity) => {
+    const normalized = entity.toLowerCase();
+    const named: Record<string, string> = {
+      "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&apos;": "'", "&#39;": "'", "&#x27;": "'",
+      "&#x2f;": "/", "&nbsp;": " ", "&ndash;": "-", "&mdash;": "--", "&hellip;": "...", "&amp;": "&",
+    };
+    if (named[normalized] !== undefined) return named[normalized];
+    const radix = normalized.startsWith("&#x") ? 16 : 10;
+    const digits = normalized.slice(radix === 16 ? 3 : 2, -1);
+    const codePoint = Number.parseInt(digits, radix);
+    return Number.isInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff
+      && (codePoint < 0xd800 || codePoint > 0xdfff)
+      ? String.fromCodePoint(codePoint)
+      : entity;
+  });
+}
+
+function stripHtml(html: string): string {
+  return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function decodeDuckDuckGoUrl(rawUrl: string): string {
+  try {
+    const normalized = rawUrl.startsWith("//") ? `https:${rawUrl}` : rawUrl;
+    return new URL(normalized).searchParams.get("uddg") || rawUrl;
+  } catch {
+    return rawUrl;
+  }
+}
+
+function parseDuckDuckGoHtml(html: string): SoulSearchResult[] {
+  const results: SoulSearchResult[] = [];
+  const resultRegex = /<a\b(?=[^>]*\bclass="[^"]*\bresult__a\b[^"]*")([^>]*)>([\s\S]*?)<\/a>/gi;
+  const nextResultRegex = /<a\b(?=[^>]*\bclass="[^"]*\bresult__a\b[^"]*")[^>]*>/i;
+  const snippetRegex = /<a\b(?=[^>]*\bclass="[^"]*\bresult__snippet\b[^"]*")[^>]*>([\s\S]*?)<\/a>/i;
+  for (const match of html.matchAll(resultRegex)) {
+    const href = /\bhref="([^"]*)"/i.exec(match[1] ?? "")?.[1] ?? "";
+    const trailing = html.slice((match.index ?? 0) + match[0].length);
+    const nextIndex = trailing.search(nextResultRegex);
+    const scoped = nextIndex >= 0 ? trailing.slice(0, nextIndex) : trailing;
+    const title = decodeHtmlEntities(stripHtml(match[2] ?? ""));
+    const url = decodeDuckDuckGoUrl(decodeHtmlEntities(href));
+    const snippet = decodeHtmlEntities(stripHtml(snippetRegex.exec(scoped)?.[1] ?? ""));
+    if (title && url) results.push({ title, url, snippet });
+  }
+  return results;
+}
+
+async function duckDuckGoSearch(query: string, openclawConfig?: OpenClawSearchCompat): Promise<SoulSearchResult[]> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20_000);
+  try {
+    const ddgConfig = openclawConfig?.plugins?.entries?.duckduckgo?.config?.webSearch;
+    const url = new URL("https://html.duckduckgo.com/html");
+    url.searchParams.set("q", query);
+    if (ddgConfig?.region?.trim()) url.searchParams.set("kl", ddgConfig.region.trim());
+    const safeSearch = ddgConfig?.safeSearch ?? "moderate";
+    url.searchParams.set("kp", safeSearch === "strict" ? "1" : safeSearch === "off" ? "-2" : "-1");
+    const response = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122 Safari/537.36" },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      log.warn(`DuckDuckGo search returned ${response.status}`);
+      return [];
+    }
+    const html = await response.text();
+    if (!/result__a/i.test(html) && /g-recaptcha|are you a human|challenge-form/i.test(html)) {
+      log.warn("DuckDuckGo returned a bot-detection challenge");
+      return [];
+    }
+    return parseDuckDuckGoHtml(html).slice(0, 8);
+  } catch (err) {
+    if ((err as { name?: string })?.name === "AbortError") log.warn("DuckDuckGo search timed out (20s)");
+    else log.warn(`DuckDuckGo search failed: ${String(err)}`);
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // --- Provider implementations ---
@@ -626,6 +724,10 @@ export async function soulWebSearch(
     case "bocha": {
       const apiKey = resolveBochaApiKey(openclawConfig)!;
       results = await bochaSearch(query, apiKey);
+      break;
+    }
+    case "duckduckgo": {
+      results = await duckDuckGoSearch(query, openclawConfig);
       break;
     }
     default:

@@ -15,6 +15,7 @@ import type {
   SoulMemory,
   PersonalityProfile,
   RelationshipProfile,
+  MaintenanceBacklogItem,
 } from "./types.js";
 
 const log = createSoulLogger("ego-store");
@@ -91,6 +92,18 @@ function createDefaultGoals(): Goal[] {
       status: "active",
       createdAt: Date.now(),
       updatedAt: Date.now(),
+      goalFamily: "knowledge",
+      targetState: "A reliable user model that captures identity, projects, preferences, and habits.",
+      measurementCriteria: [
+        "collect stable facts across core categories",
+        "confirm user preferences and communication style",
+        "keep factual memory current and superseded data retired",
+      ],
+      childGoals: [
+        "Identify the user's current projects",
+        "Capture stable preferences and habits",
+        "Keep factual memory accurate and current",
+      ],
     },
     {
       id: "goal-build-trust",
@@ -100,6 +113,18 @@ function createDefaultGoals(): Goal[] {
       status: "active",
       createdAt: Date.now(),
       updatedAt: Date.now(),
+      goalFamily: "trust",
+      targetState: "The user can rely on Soul for accurate, useful, and verified help.",
+      measurementCriteria: [
+        "deliver complete and verified outcomes",
+        "avoid false claims or unsupported completion",
+        "recover cleanly from failures and timeouts",
+      ],
+      childGoals: [
+        "Return complete and verified reports",
+        "Reduce failed or blocked autonomous actions",
+        "Keep proactive messages useful and timely",
+      ],
     },
   ];
 }
@@ -201,8 +226,13 @@ export function createDefaultEgoState(): EgoState {
     projectContexts: [],
     activeProjectRoot: null,
     mentalContext: {
-      foreground: [], residue: [], backgroundConcerns: [],
-      environmentalChanges: [], associativeEcho: [], updatedAt: Date.now(),
+      foreground: [],
+      residue: [],
+      backgroundConcerns: [],
+      environmentalChanges: [],
+      associativeEcho: [],
+      maintenanceBacklog: [] as MaintenanceBacklogItem[],
+      updatedAt: Date.now(),
     },
   };
 }
@@ -219,7 +249,11 @@ function mergeWithDefaultsV2(loaded: Partial<EgoState>): EgoState {
     }
   }
   if (loaded.mentalContext) {
-    result.mentalContext = { ...defaults.mentalContext, ...loaded.mentalContext };
+    result.mentalContext = {
+      ...defaults.mentalContext,
+      ...loaded.mentalContext,
+      maintenanceBacklog: loaded.mentalContext.maintenanceBacklog ?? defaults.mentalContext.maintenanceBacklog,
+    };
   }
 
   for (const key of [

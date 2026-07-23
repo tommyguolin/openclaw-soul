@@ -63,10 +63,10 @@ test("autonomous improvement reports concrete verified changes and never complet
     const completed = store.ego.activeTasks.find((task: any) => task.sourceThoughtId === thought.id);
     assert.equal(completed.status, "completed");
     assert.match(completed.title, /sample-project/);
-    assert.match(completed.result, /修改文件：app\.js/);
-    assert.match(completed.result, /功能优化：Enable one retry/);
+    assert.match(completed.result, /File: app\.js/);
+    assert.match(completed.result, /Functional improvement: Enable one retry/);
     assert.match(completed.result, /npm run typecheck passed/);
-    assert.match(completed.result, /修改文件：1/);
+    assert.match(completed.result, /Files modified: 1/);
 
     const noChangeThought = {
       ...thought,
@@ -91,8 +91,8 @@ test("autonomous improvement reports concrete verified changes and never complet
     store = JSON.parse(await fs.promises.readFile(storePath, "utf8"));
     const failed = store.ego.activeTasks.find((task: any) => task.sourceThoughtId === noChangeThought.id);
     assert.equal(failed.status, "failed");
-    assert.match(failed.result, /没有修改任何文件/);
-    assert.match(failed.result, /不能把本次任务汇报成已完成的代码优化/);
+    assert.match(failed.result, /No files were changed/);
+    assert.match(failed.result, /Do not report this as a completed code improvement/);
 
     const containerDir = path.join(directory, "project-container");
     await fs.promises.mkdir(path.join(containerDir, "nested-project"), { recursive: true });
@@ -263,6 +263,73 @@ test("autonomous improvement reports concrete verified changes and never complet
     assert.equal(namedSoul.result.success, true);
     assert.match(namedSoulPrompt, /This is the Soul plugin itself/);
     assert.doesNotMatch(namedSoulPrompt, /This is project at K:\\test_code/);
+  } finally {
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("autonomous improvement keeps deep evidence excerpts in the final report", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-improvement-evidence-"));
+  const projectDir = path.join(directory, "sample-project");
+  const stateDir = path.join(directory, "state");
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  process.env.OPENCLAW_STATE_DIR = stateDir;
+
+  try {
+    await fs.promises.mkdir(projectDir, { recursive: true });
+    await fs.promises.writeFile(path.join(projectDir, "package.json"), JSON.stringify({
+      scripts: { typecheck: "node --check app.js" },
+    }), "utf8");
+
+    const filler = Array.from({ length: 220 }, (_, i) => `// filler ${String(i).padStart(3, "0")} xxxx`).join("\n");
+    await fs.promises.writeFile(
+      path.join(projectDir, "app.js"),
+      `const retries = 0;\n${filler}\n// EVIDENCE_MARKER_20260721\nconsole.log(retries);\n`,
+      "utf8",
+    );
+
+    const [{ executeObserveAndImprove }, { createDefaultEgoState }] = await Promise.all([
+      import(`../src/autonomous-actions.js?improvement-evidence=${Date.now()}`),
+      import("../src/ego-store.js"),
+    ]);
+    const ego = createDefaultEgoState();
+    ego.userLanguage = "zh-CN";
+    const thought = {
+      id: "improvement-evidence-test",
+      type: "self-improvement-monitor",
+      content: `Improve ${projectDir}`,
+      motivation: "preserve deep evidence in the final report",
+      targetMetrics: [],
+      priority: 90,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      actionType: "observe-and-improve",
+    } as any;
+
+    let prompt = "";
+    const applied = await executeObserveAndImprove(thought, ego, {
+      autonomousActions: true,
+      gatewayPort: 18789,
+      llmGenerator: async (value: string) => {
+        prompt = value;
+        return JSON.stringify({
+          problem: "The retry default prevents one initial retry.",
+          file: "app.js",
+          oldCode: "const retries = 0;",
+          newCode: "const retries = 1;",
+          explanation: "Enable one retry by default for transient failures.",
+        });
+      },
+    });
+
+    assert.equal(applied.result.success, true);
+    assert.match(prompt, /EVIDENCE_MARKER_20260721/);
+    const storePath = path.join(stateDir, "soul", "ego.json");
+    const store = JSON.parse(await fs.promises.readFile(storePath, "utf8"));
+    const completed = store.ego.activeTasks.find((task: any) => task.sourceThoughtId === thought.id);
+    assert.equal(completed.status, "completed");
   } finally {
     if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
     else process.env.OPENCLAW_STATE_DIR = previousStateDir;
