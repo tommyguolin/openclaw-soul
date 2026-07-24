@@ -368,6 +368,12 @@ export interface AutonomousTask {
   maintenanceDomain?: string;
   maintenanceObjective?: string;
   activationRequestedAt?: number;
+  /** Number of durable attempts made to restart the gateway for this build. */
+  activationAttempts?: number;
+  /** Timestamp of the most recent restart scheduling attempt. */
+  lastActivationAttemptAt?: number;
+  /** Last restart scheduling error, retained for diagnosis and retry. */
+  activationError?: string;
   activatedAt?: number;
 }
 

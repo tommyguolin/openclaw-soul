@@ -48,6 +48,9 @@ const SUBAGENT_SUCCESS_POLL_MS = 2_000;
 const SUBAGENT_STALE_SETTLE_MS = 60 * 1000;
 const AUTONOMOUS_FAILURE_BACKOFF_MS = 30 * 60 * 1000;
 const AUTONOMOUS_FAILURE_LOOKBACK_MS = 6 * 60 * 60 * 1000;
+const ACTIVATION_RETRY_INTERVAL_MS = 5 * 60 * 1000;
+const ACTIVATION_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_ACTIVATION_ATTEMPTS = 3;
 const READABLE_EVIDENCE_EXTENSIONS = [".log", ".txt", ".json", ".csv", ".md", ".yaml", ".yml", ".conf"];
 
 /** Track recently sent report messages to prevent duplicates. */
@@ -232,7 +235,11 @@ function taskReportStatus(result: string): ReportStatus | null {
 
 function isFinalTaskReport(result: string): boolean {
   const status = taskReportStatus(result);
-  if (status === "in-progress") return false;
+  // The autonomous protocol requires an explicit terminal status. Ordinary
+  // markdown documents can easily contain three substantial sections and
+  // must never be mistaken for a task report merely because their shape is
+  // report-like.
+  if (status === null || status === "in-progress") return false;
   if (isPlaceholderTaskReport(result)) return false;
   if (hasUnresolvedTemplatePlaceholders(result)) return false;
   return hasRequiredReportSections(result) && hasMeaningfulTaskReportBody(result);
@@ -248,12 +255,6 @@ function reportStatusToTaskStatus(result: string): "awaiting-restart" | "complet
   if (status === "completed" || status === "partial" || status === "blocked") {
     return "completed";
   }
-  // No Status: line found. If the report has all required sections and
-  // looks like a complete task report, treat it as completed — the
-  // subagent did the work but simply omitted the "Status:" header.
-  if (status === null && isCompleteTaskReport(result)) {
-    return "completed";
-  }
   return "failed";
 }
 
@@ -262,7 +263,8 @@ function reportRepresentsSuccessfulCompletion(result: string): boolean {
   // A runner returning successfully only says that its process stopped
   // normally. The autonomous task is successful only when the report itself
   // claims a complete (or activation-pending) outcome.
-  return status === "completed" || status === "awaiting-restart" || status === null;
+  if (status === "completed" || status === "awaiting-restart") return true;
+  return false;
 }
 
 function reportShowsVerifiedCodeChange(result: string): boolean {
@@ -295,33 +297,147 @@ function markReportAwaitingRestart(result: string): string {
   return `Status: awaiting-restart\n\n${clean}`;
 }
 
-function markReportActivated(result: string): string {
+function markReportActivated(result: string, processStartedAt = PROCESS_STARTED_AT): string {
   const completed = result.replace(/^Status:\s*awaiting-restart\b/im, "Status: completed").trim();
   if (/##\s*Activation\b/i.test(completed)) return completed;
-  return `${completed}\n\n## Activation\nGateway restarted and loaded this build at ${new Date(PROCESS_STARTED_AT).toISOString()}.`;
+  return `${completed}\n\n## Activation\nGateway restarted and loaded this build at ${new Date(processStartedAt).toISOString()}.`;
 }
 
-function scheduleGatewayRestart(taskId: string): void {
-  const executable = process.platform === "win32" ? (process.env.ComSpec || "cmd.exe") : "openclaw";
-  const args = process.platform === "win32"
-    // Use the scheduled-task restart path recorded in TOOLS.md so we stop and
-    // relaunch the gateway without depending on the brittle direct restart command.
-    ? ["/d", "/s", "/c", 'schtasks /end /tn "OpenClaw Gateway" && schtasks /run /tn "OpenClaw Gateway"']
-    : ["gateway", "restart"];
-  setTimeout(() => {
+function markReportActivationFailed(result: string, detail: string): string {
+  const failed = result.replace(/^Status:\s*awaiting-restart\b/im, "Status: failed").trim();
+  const withoutOldActivation = failed.replace(/\n##\s*Activation\b[\s\S]*$/i, "").trim();
+  return `${withoutOldActivation}\n\n## Activation\n${detail}`;
+}
+
+type GatewayRestartScheduleResult = {
+  ok: boolean;
+  error?: string;
+  markerPath?: string;
+};
+
+type GatewayRestartScheduler = (taskId: string) => GatewayRestartScheduleResult;
+
+function cleanupOldRestartHelpers(directory: string): void {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  try {
+    for (const name of readdirSync(directory)) {
+      if (!/^restart-[a-f0-9-]+\.(?:cjs|json)$/i.test(name)) continue;
+      const filePath = join(directory, name);
+      if (statSync(filePath).mtimeMs < cutoff) unlinkSync(filePath);
+    }
+  } catch {
+    // Cleanup is best-effort and must never prevent activation.
+  }
+}
+
+/**
+ * Launch restart work outside the gateway process. On Windows a one-shot
+ * Scheduled Task owns the helper, so ending "OpenClaw Gateway" cannot also
+ * kill the process responsible for starting it again.
+ */
+function scheduleGatewayRestart(taskId: string): GatewayRestartScheduleResult {
+  if (process.platform !== "win32") {
     try {
-      const child = spawn(executable, args, {
+      const child = spawn("openclaw", ["gateway", "restart"], {
         detached: true,
         stdio: "ignore",
-        windowsHide: true,
       });
-      child.on("error", (err) => log.warn(`Failed to schedule gateway restart for ${taskId}: ${String(err)}`));
+      child.on("error", (err) => log.warn(`Gateway restart process failed for ${taskId}: ${String(err)}`));
       child.unref();
-      log.info(`Gateway restart scheduled after persisted report for ${taskId}`);
+      log.info(`Gateway restart process launched for ${taskId}`);
+      return { ok: true };
     } catch (err) {
-      log.warn(`Failed to schedule gateway restart for ${taskId}: ${String(err)}`);
+      const error = String(err);
+      log.warn(`Failed to launch gateway restart for ${taskId}: ${error}`);
+      return { ok: false, error };
     }
-  }, 1_500);
+  }
+
+  try {
+    const helperDir = join(resolveSoulDir(), "restart-helpers");
+    mkdirSync(helperDir, { recursive: true });
+    cleanupOldRestartHelpers(helperDir);
+
+    const token = `${Date.now()}-${randomBytes(4).toString("hex")}`;
+    const helperPath = join(helperDir, `restart-${token}.cjs`);
+    const markerPath = join(helperDir, `restart-${token}.json`);
+    const scheduledTaskName = `OpenClaw Soul Restart ${token}`;
+    const helperSource = [
+      'const { spawnSync } = require("node:child_process");',
+      'const { writeFileSync } = require("node:fs");',
+      `const markerPath = ${JSON.stringify(markerPath)};`,
+      `const helperTask = ${JSON.stringify(scheduledTaskName)};`,
+      "const run = (args) => spawnSync('schtasks.exe', args, { encoding: 'utf8', windowsHide: true });",
+      "const wait = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);",
+      "wait(5000);",
+      "const ended = run(['/End', '/TN', 'OpenClaw Gateway']);",
+      "wait(3000);",
+      "const started = run(['/Run', '/TN', 'OpenClaw Gateway']);",
+      "writeFileSync(markerPath, JSON.stringify({ timestamp: Date.now(), endStatus: ended.status, startStatus: started.status, endError: ended.stderr || '', startError: started.stderr || '' }, null, 2));",
+      "wait(2000);",
+      "run(['/Delete', '/TN', helperTask, '/F']);",
+    ].join("\n");
+    writeFileSync(helperPath, helperSource, "utf-8");
+
+    const scheduledAt = new Date(Date.now() + 2 * 60 * 1000);
+    const startTime = `${String(scheduledAt.getHours()).padStart(2, "0")}:${String(scheduledAt.getMinutes()).padStart(2, "0")}`;
+    const taskCommand = `"${process.execPath}" "${helperPath}"`;
+    const created = spawnSync("schtasks.exe", [
+      "/Create", "/TN", scheduledTaskName, "/TR", taskCommand,
+      "/SC", "ONCE", "/ST", startTime, "/F",
+    ], { encoding: "utf-8", windowsHide: true });
+    if (created.status !== 0) {
+      const error = (created.stderr || created.stdout || `schtasks /Create exited ${created.status}`).trim();
+      log.warn(`Failed to create gateway restart task for ${taskId}: ${error}`);
+      return { ok: false, error, markerPath };
+    }
+
+    const launched = spawnSync("schtasks.exe", ["/Run", "/TN", scheduledTaskName], {
+      encoding: "utf-8",
+      windowsHide: true,
+    });
+    if (launched.status !== 0) {
+      const error = (launched.stderr || launched.stdout || `schtasks /Run exited ${launched.status}`).trim();
+      log.warn(`Failed to run gateway restart task for ${taskId}: ${error}`);
+      return { ok: false, error, markerPath };
+    }
+
+    log.info(`Gateway restart helper launched for ${taskId}; confirmation=${markerPath}`);
+    return { ok: true, markerPath };
+  } catch (err) {
+    const error = String(err);
+    log.warn(`Failed to schedule gateway restart for ${taskId}: ${error}`);
+    return { ok: false, error };
+  }
+}
+
+async function requestGatewayRestart(
+  taskId: string,
+  storePath = resolveEgoStorePath(),
+  scheduler: GatewayRestartScheduler = scheduleGatewayRestart,
+  now = Date.now(),
+): Promise<GatewayRestartScheduleResult> {
+  await updateEgoStore(storePath, (e) => {
+    const task = e.activeTasks?.find((candidate) => candidate.id === taskId);
+    if (task?.status === "awaiting-restart") {
+      task.activationAttempts = (task.activationAttempts ?? 0) + 1;
+      task.lastActivationAttemptAt = now;
+      task.activationError = undefined;
+      task.updatedAt = now;
+    }
+    return e;
+  });
+
+  const result = scheduler(taskId);
+  await updateEgoStore(storePath, (e) => {
+    const task = e.activeTasks?.find((candidate) => candidate.id === taskId);
+    if (task?.status === "awaiting-restart") {
+      task.activationError = result.ok ? undefined : (result.error ?? "unknown restart scheduling failure");
+      task.updatedAt = Date.now();
+    }
+    return e;
+  });
+  return result;
 }
 
 /**
@@ -666,12 +782,13 @@ Use a trusted Gateway agent RPC or execute a smaller direct observe-and-improve 
 function isCompleteTaskReport(result: string): boolean {
   const text = result.replace(/<think[\s\S]*?<\/think>/gi, "").trim();
   if (!text) return false;
-  if (taskReportStatus(text) === "in-progress") return false;
+  const status = taskReportStatus(text);
+  if (status === null || status === "in-progress") return false;
   if (isPlaceholderTaskReport(text)) return false;
   if (hasUnresolvedTemplatePlaceholders(text)) return false;
 
   // A terminal report with at least three markdown sections is complete even
-  // when its headings are not English or it omitted the optional Status line.
+  // when its section headings are not English.
   return hasRequiredReportSections(text) && hasMeaningfulTaskReportBody(text);
 }
 
@@ -877,6 +994,18 @@ export type AutonomousActionOptions = {
   workspaceContext?: string;
   subAgentRunner?: SubAgentRunner;
 };
+
+function autonomousShellInstruction(): string {
+  if (process.platform === "win32") {
+    return `**Shell environment**:
+- The command shell is PowerShell on Windows, not bash.
+- Use PowerShell commands such as Get-ChildItem, Get-Content, Select-String, and Set-Location -LiteralPath.
+- Do not use bash-only commands or syntax such as head, tail, sed, grep, cd /d, &&, or /dev/null.
+- Prefer the tool's workdir option over changing directories inside a command.`;
+  }
+  return `**Shell environment**:
+- The command shell is POSIX-compatible. Use commands and quoting appropriate for that shell.`;
+}
 
 function taskContinuityFields(thought: Thought): Pick<AutonomousTask,
   "intentionId" | "workHandoffId" | "targetProjectRoot" | "acceptanceCriteria" | "maintenanceDomain" | "maintenanceObjective"> {
@@ -1529,6 +1658,8 @@ ${activeGoals || "none"}
 - Trigger: ${thought.triggerDetail}${readOnlyInstruction}${analysisContext}${options.workspaceContext ? `\n- Workspace rules:\n${options.workspaceContext}` : ""}
 ${maintenanceFocusText ? `- Maintenance focus:\n${maintenanceFocusText}\n` : ""}
 
+${autonomousShellInstruction()}
+
 Work like the main OpenClaw agent would when the user directly asks for an improvement:
 - Inspect only the most relevant code, scripts, docs, recent logs.
 - Choose exactly ONE concrete, high-value iteration that can finish within this run.
@@ -1540,10 +1671,17 @@ Work like the main OpenClaw agent would when the user directly asks for an impro
 - If the edit tool fails with a matching error, the file may use CRLF line endings. Do NOT retry edit repeatedly — instead use node -e with fs.readFileSync/fs.writeFileSync to do string replacement, or use the write tool to rewrite the entire file.
 - If you cannot edit after 2 attempts, switch to exec with a node -e script immediately.
 
-**Write your final report to the result file, not in the chat.** Persist your complete report to this path using the write tool:
-${resultFilePath}
-Then write a brief summary to the chat.
+**CRITICAL: Write your result file INCREMENTALLY.**
+1. FIRST — as soon as you have initial findings, write an intermediate report to the result path with Status: partial and what you have found so far.
+2. THEN — do your fix/verification work.
+3. FINALLY — update the file with your complete report and change Status to completed/failed.
 
+This ensures partial progress is saved even if your budget runs out.
+
+Write your final report to the result file using the write tool:
+${resultFilePath}
+
+The first line of the final report MUST be exactly one explicit terminal status: \`Status: completed\`, \`Status: partial\`, \`Status: blocked\`, or \`Status: failed\`.
 Write your final report as markdown with these sections:
 ## Outcome
 What you investigated and the final result.
@@ -1670,13 +1808,9 @@ export async function executeReportFindings(
   }
 
   if (!options.sendMessage || !options.channel || !options.target) {
-    // Can't compose or send — just mark as delivered to stop retrying
-    await updateEgoStore(resolveEgoStorePath(), (e) => {
-      for (const t of e.activeTasks ?? []) {
-        if (isReportableTask(t) && !t.resultDelivered) t.resultDelivered = true;
-      }
-      return e;
-    });
+    // Delivery capability can be temporarily unavailable during startup or a
+    // reconnect. Keep the report pending so a later cycle can retry it.
+    log.warn("Report-findings deferred: missing message sending capability");
     return { result: { type: "report-findings", success: false, error: "Missing message sending capability" }, metricsChanged: [] };
   }
 
@@ -1701,8 +1835,7 @@ export async function executeReportFindings(
     // Natural-language reports are model-composed. Do not leak an English
     // implementation report merely because the multilingual composer is down.
     log.info("Report-findings deferred: no multilingual LLM available");
-    await markCompletedTasksDelivered();
-    return { result: { type: "report-findings", success: true, result: "report-deferred-no-llm" }, metricsChanged: [] };
+    return { result: { type: "report-findings", success: false, error: "report-deferred-no-llm" }, metricsChanged: [] };
   }
 
   const reportLangInstruction = buildUserLanguageInstruction(ego);
@@ -1752,7 +1885,6 @@ Output ONLY the message, nothing else.`;
   } catch (err) {
     // Raw reports are internal protocol, not a safe localization fallback.
     log.warn(`Report-findings composition failed: ${String(err)}`);
-    await markCompletedTasksDelivered();
     return { result: { type: "report-findings", success: false, error: "report-composition-failed" }, metricsChanged: [] };
   }
 
@@ -1795,8 +1927,6 @@ Output ONLY the message, nothing else.`;
     });
     return { result: { type: "report-findings", success: true, result: "skipped-duplicate" }, metricsChanged: [] };
   }
-  recentReportedMessages.set(msgNorm, Date.now());
-
   try {
     await options.sendMessage({
       to: options.target,
@@ -1808,6 +1938,10 @@ Output ONLY the message, nothing else.`;
     log.warn(`Failed to send report: ${String(err)}`);
     return { result: { type: "report-findings", success: false, error: String(err) }, metricsChanged: [] };
   }
+  // Only enter the in-memory dedup cache after confirmed delivery. Otherwise
+  // a transient send failure would make the retry look like a duplicate and
+  // silently mark the durable report delivered.
+  recentReportedMessages.set(msgNorm, Date.now());
 
   // Mark tasks as delivered
   await updateEgoStore(resolveEgoStorePath(), (e) => {
@@ -2603,7 +2737,7 @@ ${acceptanceText}
 ${nextText}`;
 
   await completeTask(taskId, result, taskStatus);
-  if (taskStatus === "awaiting-restart") scheduleGatewayRestart(taskId);
+  if (taskStatus === "awaiting-restart") await requestGatewayRestart(taskId);
 
   return {
     result: {
@@ -2789,6 +2923,8 @@ ${recentAnalyses || "None."}
 
 ${recentAnalyzeResults.length > 0 ? "**IMPORTANT**: A prior analysis identified a specific issue. Implement the fix directly — do NOT re-analyze or re-discover the same problem. Go straight to editing the relevant file(s)." : ""}
 
+${autonomousShellInstruction()}
+
 Work like the main OpenClaw agent would when the user directly asks for a focused improvement:
 1. Inspect only the most relevant source files, scripts, and recent logs.
 2. Identify exactly ONE concrete, high-value improvement that can finish within this run.
@@ -2802,10 +2938,17 @@ Work like the main OpenClaw agent would when the user directly asks for a focuse
 - If the \`edit\` tool fails with a matching error, the file may use CRLF line endings. Do NOT retry edit repeatedly — instead use \`node -e\` with \`fs.readFileSync\`/\`fs.writeFileSync\` to do string replacement, or use the \`write\` tool to rewrite the entire file.
 - If you cannot edit after 2 attempts, switch to \`exec\` with a \`node -e\` script immediately.
 
-**Write your final report to the result file, not in the chat.** Persist your complete report to this path using the write tool first:
-${resultFilePath}
-Then write a brief summary to the chat.
+**CRITICAL: Write your result file INCREMENTALLY.**
+1. FIRST — as soon as you have initial findings, write an intermediate report to the result path with Status: partial and what you have found so far.
+2. THEN — do your fix/verification work.
+3. FINALLY — update the file with your complete report and change Status to completed/failed.
 
+This ensures partial progress is saved even if your budget runs out.
+
+Write your final report to the result file using the write tool:
+${resultFilePath}
+
+The first line of the final report MUST be exactly one explicit terminal status: \`Status: completed\`, \`Status: partial\`, \`Status: blocked\`, or \`Status: failed\`.
 Write your final report as markdown with these sections:
 ## Outcome
 What you investigated and the final result.
@@ -2888,7 +3031,7 @@ Remaining risk or a sensible next improvement.`;
   const success = reportRepresentsSuccessfulCompletion(report);
   log.info(`Subagent-improve ${taskId}: status=${taskStatus}, success=${success}`);
 
-  if (taskStatus === "awaiting-restart") scheduleGatewayRestart(taskId);
+  if (taskStatus === "awaiting-restart") await requestGatewayRestart(taskId);
 
   return {
     result: {
@@ -3015,42 +3158,70 @@ function extractResultFromSessions(task: AutonomousTask, sinceMs: number, zh: bo
       const content = readFileSync(name.fp, "utf-8");
       if (!content.includes("Soul-Autonomous") && !content.includes("[Soul Autonomous")) continue;
       if (markers.length > 0 && !markers.some((marker) => content.includes(marker))) continue;
+      const entries: any[] = [];
+      for (const line of content.split("\n")) {
+        try {
+          entries.push(JSON.parse(line.trim()));
+        } catch {
+          // Skip malformed or partially flushed JSONL lines.
+        }
+      }
+      const taskStartIndex = entries.findIndex((obj) => {
+        if (obj.type !== "message" || obj.message?.role !== "user") return false;
+        const userText = extractSessionText(obj.message.content);
+        const isAutonomousPrompt = /Soul-Autonomous|\[Soul Autonomous/i.test(userText);
+        return isAutonomousPrompt && (markers.length === 0 || markers.some((marker) => userText.includes(marker)));
+      });
+      if (taskStartIndex < 0) continue;
+
+      // A session file can contain many later turns. Scope recovery strictly to
+      // this autonomous user turn so a subsequent heartbeat or unrelated task
+      // cannot become the missing task's "last output".
+      const taskEntries: any[] = [];
+      for (let index = taskStartIndex + 1; index < entries.length; index++) {
+        const obj = entries[index];
+        if (obj.type === "message" && obj.message?.role === "user") break;
+        taskEntries.push(obj);
+      }
+
       let lastAssistantText = "";
       let promptError = "";
       let toolFailure = "";
       const reportCandidates: string[] = [];
-      for (const line of content.split("\n")) {
-        try {
-          const obj = JSON.parse(line.trim());
-          if (obj.type === "custom" && obj.customType === "openclaw:prompt-error") {
-            promptError = String(obj.data?.error ?? "prompt error");
+      const allAssistantTexts: string[] = [];
+      for (const obj of taskEntries) {
+        if (obj.type === "custom" && obj.customType === "openclaw:prompt-error") {
+          promptError = String(obj.data?.error ?? "prompt error");
+        }
+        if (obj.type === "message" && obj.message?.role === "assistant") {
+          const assistantText = extractSessionText(obj.message.content);
+          if (assistantText.length > 20) {
+            lastAssistantText = assistantText;
+            reportCandidates.push(assistantText);
+            if (assistantText.length > 50) allAssistantTexts.push(assistantText);
           }
-          if (obj.type === "message" && obj.message?.role === "assistant") {
-            const assistantText = extractSessionText(obj.message.content);
-            if (assistantText.length > 20) {
-              lastAssistantText = assistantText;
-              reportCandidates.push(assistantText);
-            }
+        }
+        if (obj.type === "message" && obj.message?.role === "toolResult") {
+          const toolText = extractSessionText(obj.message.content);
+          // Tool output often contains source documents or reports from older
+          // tasks. It is a candidate for this task only when it carries this
+          // task's durable identity.
+          if (toolText.length > 0 && markers.some((marker) => toolText.includes(marker))) {
+            reportCandidates.push(toolText);
           }
-          if (obj.type === "message" && obj.message?.role === "toolResult") {
-            const toolText = extractSessionText(obj.message.content);
-            if (toolText.length > 0) {
-              reportCandidates.push(toolText);
-            }
-            if (/ParserError|Command exited with code [1-9]|EnvironmentLocationNotFound|timed out|timeout|error/i.test(toolText)) {
-              toolFailure = toolText.slice(0, 600);
-            }
+          if (/ParserError|Command exited with code [1-9]|EnvironmentLocationNotFound|timed out|timeout|error/i.test(toolText)) {
+            toolFailure = toolText.slice(0, 600);
           }
-          if (obj.type === "tool.result" || obj.type === "toolResult") {
-            const toolText = extractSessionText(obj.data?.output ?? obj.data?.result?.output ?? obj.output ?? obj.result?.output ?? obj.message?.content);
-            if (toolText.length > 0) {
-              reportCandidates.push(toolText);
-            }
-            if (/ParserError|Command exited with code [1-9]|EnvironmentLocationNotFound|timed out|timeout|error/i.test(toolText)) {
-              toolFailure = toolText.slice(0, 600);
-            }
+        }
+        if (obj.type === "tool.result" || obj.type === "toolResult") {
+          const toolText = extractSessionText(obj.data?.output ?? obj.data?.result?.output ?? obj.output ?? obj.result?.output ?? obj.message?.content);
+          if (toolText.length > 0 && markers.some((marker) => toolText.includes(marker))) {
+            reportCandidates.push(toolText);
           }
-        } catch { /* skip malformed lines */ }
+          if (/ParserError|Command exited with code [1-9]|EnvironmentLocationNotFound|timed out|timeout|error/i.test(toolText)) {
+            toolFailure = toolText.slice(0, 600);
+          }
+        }
       }
       for (const candidate of reportCandidates.reverse()) {
         if (isCompleteTaskReport(candidate)) {
@@ -3069,8 +3240,22 @@ function extractResultFromSessions(task: AutonomousTask, sinceMs: number, zh: bo
         return { status: "failed", result: buildFailureTaskReport(task, detail) };
       }
       if (lastAssistantText) {
-        const detail = `Agent session ${name.name} stopped before producing a final result file${task.resultFilePath ? ` (${task.resultFilePath})` : ""}. Last partial output: ${lastAssistantText.slice(0, 1200)}`;
-        const hasUsefulPartial = /\bdone\b|\bfail(?:ed|ure)?\b|\bpasses\b|\bimproved?\b|\bworse\b|\bbug\b|\broot cause\b|\bclear\b|\bmetric\b|\bresult\b|\bverified?\b|\bfixed?\b|\bapplied\b|\bcompleted\b/i.test(lastAssistantText);
+        // Try to find the most informative assistant text by scanning all
+        // assistant messages. The last message is often a brief transition
+        // ("Let me look at where X occurs") while earlier messages contain
+        // the actual analysis. Use the longest substantive message for
+        // both the hasUsefulPartial check and the detail output.
+        // Sort by length descending, pick the longest substantive message
+        // or fall back to the lastAssistantText
+        const bestText = allAssistantTexts.length > 0
+          ? allAssistantTexts.sort((a, b) => b.length - a.length)[0]
+          : lastAssistantText;
+        const detail = `Agent session ${name.name} stopped before producing a final result file${task.resultFilePath ? ` (${task.resultFilePath})` : ""}.${
+          bestText !== lastAssistantText
+            ? ` Best analysis excerpt (${bestText.length} chars): ${bestText.slice(0, 1600)}`
+            : ` Last partial output: ${lastAssistantText.slice(0, 1200)}`
+        }`;
+        const hasUsefulPartial = /\b(done|fail(?:ed|ure)?|passes|improved?|worse|bug|root cause|clear|metric|result|verified?|fixed?|applied|completed|error|issue|analysis|identified?|found|discovered|root|stream|connection|timeout|disconnect)\b/i.test(bestText);
         return {
           status: "failed",
           result: hasUsefulPartial ? buildPartialTaskReport(task, detail) : buildFailureTaskReport(task, detail),
@@ -3096,6 +3281,10 @@ export async function __testOnlyResolveSubagentFinalReport(
 
 export function __testOnlyReportShowsVerifiedCodeChange(result: string): boolean {
   return reportShowsVerifiedCodeChange(result);
+}
+
+export function __testOnlyScheduleGatewayRestart(taskId: string): GatewayRestartScheduleResult {
+  return scheduleGatewayRestart(taskId);
 }
 
 async function readLocalFile(actionName: string, filePath: string): Promise<TaskStep> {
@@ -3179,7 +3368,16 @@ async function persistTask(task: AutonomousTask): Promise<void> {
  * Poll active tasks: check result files, mark stale ones as completed.
  * Returns list of newly completed tasks (with results from file capture).
  */
-export async function pollActiveTasks(storePath: string): Promise<AutonomousTask[]> {
+type PollActiveTaskOptions = {
+  now?: () => number;
+  processStartedAt?: number;
+  restartScheduler?: GatewayRestartScheduler;
+};
+
+export async function pollActiveTasks(
+  storePath: string,
+  options: PollActiveTaskOptions = {},
+): Promise<AutonomousTask[]> {
   // Allow the hook timeout, the report-write grace period, and a small settle
   // window before another polling cycle can declare the task stale.
   const STALE_MS = AUTONOMOUS_AGENT_TIMEOUT_SECONDS * 1000
@@ -3187,45 +3385,70 @@ export async function pollActiveTasks(storePath: string): Promise<AutonomousTask
     + SUBAGENT_STALE_SETTLE_MS;
   const MAX_TASKS = 20;
   const newlyCompleted: AutonomousTask[] = [];
+  const retryActivationTaskIds: string[] = [];
+  const now = options.now?.() ?? Date.now();
+  const processStartedAt = options.processStartedAt ?? PROCESS_STARTED_AT;
 
   await updateEgoStore(storePath, (e) => {
     if (!e.activeTasks) e.activeTasks = [];
 
     for (const task of e.activeTasks) {
       if (task.status === "awaiting-restart") {
-        if (task.activationRequestedAt && task.activationRequestedAt < PROCESS_STARTED_AT) {
+        if (task.activationRequestedAt && task.activationRequestedAt < processStartedAt) {
           task.status = "completed";
-          task.result = markReportActivated(task.result ?? "Status: awaiting-restart");
+          task.result = markReportActivated(task.result ?? "Status: awaiting-restart", processStartedAt);
           writeTaskReportFile(task.resultFilePath, task.result);
-          task.activatedAt = PROCESS_STARTED_AT;
-          task.completedAt = Date.now();
-          task.updatedAt = Date.now();
+          task.activatedAt = processStartedAt;
+          task.activationError = undefined;
+          task.completedAt = now;
+          task.updatedAt = now;
           newlyCompleted.push({ ...task });
-        } else if (task.activationRequestedAt && Date.now() - task.activationRequestedAt > 10 * 60 * 1000) {
-          task.status = "failed";
-          task.result = buildFailureTaskReport(task, "Gateway restart was requested but a later Soul process start was not observed within 10 minutes.");
-          writeTaskReportFile(task.resultFilePath, task.result);
-          task.completedAt = Date.now();
-          task.updatedAt = Date.now();
-          newlyCompleted.push({ ...task });
+        } else if (task.activationRequestedAt) {
+          // Older state files predate activationAttempts. Such tasks already
+          // issued one restart request when entering awaiting-restart.
+          const attempts = task.activationAttempts ?? 1;
+          const lastAttemptAt = task.lastActivationAttemptAt ?? task.activationRequestedAt;
+          const activationAge = now - task.activationRequestedAt;
+          if (attempts < MAX_ACTIVATION_ATTEMPTS && now - lastAttemptAt >= ACTIVATION_RETRY_INTERVAL_MS) {
+            retryActivationTaskIds.push(task.id);
+          } else if (attempts >= MAX_ACTIVATION_ATTEMPTS && activationAge >= ACTIVATION_TIMEOUT_MS) {
+            const detail = `Gateway activation was not confirmed after ${attempts} restart attempts over ${Math.round(activationAge / 60_000)} minutes.${
+              task.activationError ? ` Last scheduling error: ${task.activationError}` : ""
+            } The verified change report above was preserved for diagnosis.`;
+            task.status = "failed";
+            task.result = markReportActivationFailed(task.result ?? "Status: awaiting-restart", detail);
+            writeTaskReportFile(task.resultFilePath, task.result);
+            task.completedAt = now;
+            task.updatedAt = now;
+            newlyCompleted.push({ ...task });
+          }
         }
         continue;
       }
       if (task.status !== "in-progress") continue;
 
-      // Check result file first
-      if (task.resultFilePath && !task.result) {
-        try {
-          const content = readFileSync(task.resultFilePath, "utf-8").trim();
-          if (content && isFinalTaskReport(content)) {
-            task.result = content;
-            task.status = reportStatusToTaskStatus(content);
-            task.completedAt = Date.now();
-            task.updatedAt = Date.now();
-            newlyCompleted.push({ ...task });
-            continue;
-          }
-        } catch { /* file not ready yet */ }
+      // Check result file first — re-read even if task.result exists but
+      // the file was updated after task.updatedAt (the subagent may have
+      // written a complete report slightly after the settle window closed).
+      if (task.resultFilePath) {
+        const fileIsNewer = !!task.result && (() => {
+          try {
+            return statSync(task.resultFilePath).mtimeMs > task.updatedAt;
+          } catch { return false; }
+        })();
+        if (!task.result || fileIsNewer) {
+          try {
+            const content = readFileSync(task.resultFilePath, "utf-8").trim();
+            if (content && isFinalTaskReport(content)) {
+              task.result = content;
+              task.status = reportStatusToTaskStatus(content);
+              task.completedAt = Date.now();
+              task.updatedAt = Date.now();
+              newlyCompleted.push({ ...task });
+              continue;
+            }
+          } catch { /* file not ready yet */ }
+        }
       }
 
       // Fallback: try to extract result from session files — but only after
@@ -3310,6 +3533,16 @@ export async function pollActiveTasks(storePath: string): Promise<AutonomousTask
 
     return e;
   });
+
+  for (const taskId of retryActivationTaskIds) {
+    const result = await requestGatewayRestart(
+      taskId,
+      storePath,
+      options.restartScheduler ?? scheduleGatewayRestart,
+      now,
+    );
+    log.info(`Gateway activation retry for ${taskId}: ${result.ok ? "scheduled" : `failed (${result.error ?? "unknown error"})`}`);
+  }
 
   if (newlyCompleted.length > 0) {
     log.info(`Tasks finished: ${newlyCompleted.map((t) => `${t.id}(${t.status}${t.result ? ",has-result" : ",no-result"})`).join(", ")}`);

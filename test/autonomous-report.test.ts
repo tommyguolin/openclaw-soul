@@ -110,6 +110,122 @@ test("awaiting-restart tasks complete only after a later process start", async (
   }
 });
 
+test("awaiting-restart tasks retry activation without discarding the verified report", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-activation-retry-"));
+  try {
+    const now = Date.now();
+    const storePath = path.join(directory, "ego.json");
+    const resultFilePath = path.join(directory, "result.md");
+    const report = `Status: awaiting-restart
+
+## Outcome
+Applied a verified runtime fix.
+
+## Changes
+Changed src/autonomous-actions.ts.
+
+## Verification
+npm test passed with 0 failures.`;
+    await fs.promises.writeFile(resultFilePath, report, "utf8");
+    const ego = createDefaultEgoState();
+    ego.activeTasks = [{
+      id: "activation-retry-task",
+      title: "Retry gateway activation",
+      description: "retry a restart that was not observed",
+      status: "awaiting-restart",
+      createdAt: now - 20 * 60_000,
+      updatedAt: now - 6 * 60_000,
+      activationRequestedAt: now - 11 * 60_000,
+      activationAttempts: 1,
+      lastActivationAttemptAt: now - 6 * 60_000,
+      steps: [],
+      result: report,
+      resultFilePath,
+      requiresWritePermission: true,
+      resultDelivered: false,
+    }] as any;
+    await saveEgoStore(storePath, { version: 3, ego, createdAt: now, updatedAt: now });
+
+    let scheduledTaskId = "";
+    const { pollActiveTasks } = await import(`../src/autonomous-actions.js?activation-retry=${Date.now()}`);
+    const completed = await pollActiveTasks(storePath, {
+      now: () => now,
+      processStartedAt: now - 60 * 60_000,
+      restartScheduler: (taskId: string) => {
+        scheduledTaskId = taskId;
+        return { ok: false, error: "simulated scheduler outage" };
+      },
+    });
+
+    assert.equal(completed.length, 0);
+    assert.equal(scheduledTaskId, "activation-retry-task");
+    const stored = JSON.parse(await fs.promises.readFile(storePath, "utf8"));
+    const task = stored.ego.activeTasks[0];
+    assert.equal(task.status, "awaiting-restart");
+    assert.equal(task.activationAttempts, 2);
+    assert.equal(task.activationError, "simulated scheduler outage");
+    assert.match(task.result, /Changed src\/autonomous-actions\.ts/);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("activation exhaustion preserves change and verification evidence", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-activation-exhausted-"));
+  try {
+    const now = Date.now();
+    const storePath = path.join(directory, "ego.json");
+    const resultFilePath = path.join(directory, "result.md");
+    const report = `Status: awaiting-restart
+
+## Outcome
+Applied a verified runtime fix.
+
+## Changes
+Changed src/autonomous-actions.ts without losing evidence.
+
+## Verification
+npm test passed with 0 failures.`;
+    await fs.promises.writeFile(resultFilePath, report, "utf8");
+    const ego = createDefaultEgoState();
+    ego.activeTasks = [{
+      id: "activation-exhausted-task",
+      title: "Exhaust gateway activation",
+      description: "preserve the original report after retries",
+      status: "awaiting-restart",
+      createdAt: now - 40 * 60_000,
+      updatedAt: now - 10 * 60_000,
+      activationRequestedAt: now - 31 * 60_000,
+      activationAttempts: 3,
+      lastActivationAttemptAt: now - 10 * 60_000,
+      activationError: "access denied",
+      steps: [],
+      result: report,
+      resultFilePath,
+      requiresWritePermission: true,
+      resultDelivered: false,
+    }] as any;
+    await saveEgoStore(storePath, { version: 3, ego, createdAt: now, updatedAt: now });
+
+    const { pollActiveTasks } = await import(`../src/autonomous-actions.js?activation-exhausted=${Date.now()}`);
+    const completed = await pollActiveTasks(storePath, {
+      now: () => now,
+      processStartedAt: now - 60 * 60_000,
+      restartScheduler: () => { throw new Error("must not retry after exhaustion"); },
+    });
+
+    assert.equal(completed.length, 1);
+    assert.equal(completed[0].status, "failed");
+    assert.match(completed[0].result ?? "", /^Status: failed/m);
+    assert.match(completed[0].result ?? "", /Changed src\/autonomous-actions\.ts without losing evidence/);
+    assert.match(completed[0].result ?? "", /npm test passed with 0 failures/);
+    assert.match(completed[0].result ?? "", /## Activation/);
+    assert.match(completed[0].result ?? "", /access denied/);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("self-change verification treats zero failures as success and nonzero failures as failure", async () => {
   const { __testOnlyReportShowsVerifiedCodeChange } = await import(`../src/autonomous-actions.js?verification-counts=${Date.now()}`);
   const report = (verification: string) => `## Outcome
@@ -176,6 +292,51 @@ Pending.`, "utf8");
     const task = store.ego.activeTasks.find((item: any) => item.id === "placeholder-task");
     assert.equal(task.status, "in-progress");
     assert.equal(task.result, undefined);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("pollActiveTasks never treats an ordinary multi-section document as a final report", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-ordinary-document-"));
+  try {
+    const { pollActiveTasks } = await import(`../src/autonomous-actions.js?ordinary-document=${Date.now()}`);
+    const storePath = path.join(directory, "ego.json");
+    const resultFilePath = path.join(directory, "result.md");
+    await fs.promises.writeFile(resultFilePath, `# Goal-Driven Soul System Design
+
+## Purpose
+Turn Soul into a strict goal-driven system.
+
+## Current Baseline
+The codebase already has goals, maintenance, and task execution.
+
+## Design Goals
+Each objective should be explicit and measurable.
+
+## Verification Strategy
+Run build and regression tests after implementation.`, "utf8");
+
+    const ego = createDefaultEgoState();
+    ego.activeTasks = [{
+      id: "ordinary-document-task",
+      title: "Do not classify source documents as reports",
+      description: "require an explicit terminal status",
+      status: "in-progress",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      steps: [],
+      resultFilePath,
+      requiresWritePermission: true,
+      resultDelivered: false,
+    }] as any;
+    await saveEgoStore(storePath, { version: 3, ego, createdAt: Date.now(), updatedAt: Date.now() });
+
+    const completed = await pollActiveTasks(storePath);
+    assert.equal(completed.length, 0);
+    const stored = JSON.parse(await fs.promises.readFile(storePath, "utf8"));
+    assert.equal(stored.ego.activeTasks[0].status, "in-progress");
+    assert.equal(stored.ego.activeTasks[0].result, undefined);
   } finally {
     await fs.promises.rm(directory, { recursive: true, force: true });
   }
@@ -263,6 +424,102 @@ Finished: 2026-07-20T00:00:00.000Z
     else process.env.HOMEDRIVE = previousHomedrive;
     if (previousHomepath === undefined) delete process.env.HOMEPATH;
     else process.env.HOMEPATH = previousHomepath;
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("session extraction ignores terminal reports read from a different task", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-session-foreign-report-"));
+  const previousUserProfile = process.env.USERPROFILE;
+  const previousHome = process.env.HOME;
+  process.env.USERPROFILE = directory;
+  process.env.HOME = directory;
+
+  try {
+    const { __testOnlyExtractResultFromSessions } = await import(`../src/autonomous-actions.js?foreign-report=${Date.now()}`);
+    const sessionsDir = path.join(directory, ".openclaw", "agents", "main", "sessions");
+    await fs.promises.mkdir(sessionsDir, { recursive: true });
+    const resultFilePath = path.join(directory, "current-result.md");
+    const foreignReport = `Status: completed
+Task: older-task
+
+## Outcome
+An older task completed.
+
+## Changes
+Changed an unrelated file.
+
+## Verification
+The older task's tests passed.`;
+    await fs.promises.writeFile(path.join(sessionsDir, "foreign.jsonl"), [
+      JSON.stringify({ type: "message", message: { role: "user", content: `[Soul Autonomous Improvement Task]\nTask: current-task\n${resultFilePath}` } }),
+      JSON.stringify({ type: "tool.result", data: { output: foreignReport } }),
+    ].join("\n"), "utf8");
+
+    const task = {
+      id: "current-task",
+      title: "Ignore foreign report",
+      description: "Do not reuse a report merely read by a tool",
+      status: "in-progress",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      steps: [],
+      resultFilePath,
+      requiresWritePermission: true,
+      resultDelivered: false,
+    } as any;
+    const recovered = __testOnlyExtractResultFromSessions(task, task.createdAt, false);
+    assert.equal(recovered, null);
+  } finally {
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("session extraction stops at the next user turn instead of capturing a later heartbeat", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-session-boundary-"));
+  const previousUserProfile = process.env.USERPROFILE;
+  const previousHome = process.env.HOME;
+  process.env.USERPROFILE = directory;
+  process.env.HOME = directory;
+
+  try {
+    const { __testOnlyExtractResultFromSessions } = await import(`../src/autonomous-actions.js?session-boundary=${Date.now()}`);
+    const sessionsDir = path.join(directory, ".openclaw", "agents", "main", "sessions");
+    await fs.promises.mkdir(sessionsDir, { recursive: true });
+    const resultFilePath = path.join(directory, "boundary-result.md");
+    const sessionLog = [
+      { type: "message", message: { role: "user", content: `[Soul Autonomous Improvement Task]\nTask: boundary-task\n${resultFilePath}` } },
+      { type: "message", message: { role: "assistant", content: "Analysis found a stream timeout root cause in the autonomous result writer, but verification was not completed before the run ended." } },
+      { type: "message", message: { role: "user", content: "Read HEARTBEAT.md and respond with the current heartbeat status." } },
+      { type: "message", message: { role: "assistant", content: "HEARTBEAT_OK" } },
+    ].map((entry) => JSON.stringify(entry)).join("\n");
+    await fs.promises.writeFile(path.join(sessionsDir, "boundary.jsonl"), sessionLog, "utf8");
+
+    const task = {
+      id: "boundary-task",
+      title: "Session boundary test",
+      description: "Do not attribute later turns to this task",
+      status: "in-progress",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      steps: [],
+      resultFilePath,
+      requiresWritePermission: true,
+      resultDelivered: false,
+    } as any;
+    const recovered = __testOnlyExtractResultFromSessions(task, task.createdAt, false);
+    assert.equal(recovered?.status, "failed");
+    assert.match(recovered?.result ?? "", /stream timeout root cause/);
+    assert.doesNotMatch(recovered?.result ?? "", /HEARTBEAT_OK/);
+  } finally {
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
     await fs.promises.rm(directory, { recursive: true, force: true });
   }
 });
@@ -460,7 +717,7 @@ test("session recovery prefers a complete report written after a prompt error", 
     const sessionsDir = path.join(directory, ".openclaw", "agents", "main", "sessions");
     await fs.promises.mkdir(sessionsDir, { recursive: true });
     const resultFilePath = path.join(directory, "result.md");
-    const finalReport = `Status: completed\n\n## Outcome\nRecovered after a transient prompt error.\n\n## Changes\nKept the complete report.\n\n## Verification\nRecovery test passed.`;
+    const finalReport = `Status: completed\nTask: error-then-report-task\n\n## Outcome\nRecovered after a transient prompt error.\n\n## Changes\nKept the complete report.\n\n## Verification\nRecovery test passed.`;
     await fs.promises.writeFile(path.join(sessionsDir, "recovered.jsonl"), [
       JSON.stringify({ type: "message", message: { role: "user", content: `[Soul Autonomous Improvement Task]\nTask: error-then-report-task\n${resultFilePath}` } }),
       JSON.stringify({ type: "custom", customType: "openclaw:prompt-error", data: { error: "temporary timeout" } }),
@@ -731,6 +988,127 @@ test("completed task reports use completion wording instead of investigation wor
     assert.match(prompt, /Delivery status: COMPLETED/);
     assert.match(prompt, /completion notification/);
     assert.equal(sent, "已完成：子代理报告可靠性问题，已经补上等待窗口并通过测试。");
+  } finally {
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("report composition failure leaves the durable task pending for retry", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-report-composition-retry-"));
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  process.env.OPENCLAW_STATE_DIR = path.join(directory, "state");
+
+  try {
+    const { executeReportFindings } = await import(`../src/autonomous-actions.js?composition-retry=${Date.now()}`);
+    const storePath = path.join(process.env.OPENCLAW_STATE_DIR, "soul", "ego.json");
+    const ego = createDefaultEgoState();
+    ego.userLanguage = "zh-CN";
+    ego.activeTasks = [{
+      id: "composition-retry-task",
+      title: "报告重试",
+      description: "模型过载时保留待投递状态",
+      status: "completed",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      completedAt: Date.now(),
+      steps: [],
+      resultDelivered: false,
+      result: `Status: completed
+
+## Outcome
+修复了投递状态。
+
+## Changes
+更新了报告重试逻辑。
+
+## Verification
+回归测试通过。`,
+      requiresWritePermission: true,
+    }] as any;
+    await saveEgoStore(storePath, { version: 3, ego, createdAt: Date.now(), updatedAt: Date.now() });
+
+    const result = await executeReportFindings({
+      id: "composition-retry-thought",
+      actionType: "report-findings",
+    } as any, ego, {
+      autonomousActions: false,
+      gatewayPort: 18789,
+      channel: "test",
+      target: "user",
+      sendMessage: async () => undefined,
+      llmGenerator: async () => { throw new Error("503 overloaded"); },
+    });
+
+    assert.equal(result.result.success, false);
+    const stored = JSON.parse(await fs.promises.readFile(storePath, "utf8"));
+    assert.equal(stored.ego.activeTasks[0].resultDelivered, false);
+  } finally {
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a failed send is retried and only marked delivered after confirmed delivery", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-report-send-retry-"));
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  process.env.OPENCLAW_STATE_DIR = path.join(directory, "state");
+
+  try {
+    const { executeReportFindings } = await import(`../src/autonomous-actions.js?send-retry=${Date.now()}`);
+    const storePath = path.join(process.env.OPENCLAW_STATE_DIR, "soul", "ego.json");
+    const ego = createDefaultEgoState();
+    ego.userLanguage = "zh-CN";
+    ego.activeTasks = [{
+      id: "send-retry-task",
+      title: "发送重试",
+      description: "通道短暂失败后重试",
+      status: "completed",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      completedAt: Date.now(),
+      steps: [],
+      resultDelivered: false,
+      result: `Status: completed
+
+## Outcome
+已产生一份有价值的报告。
+
+## Changes
+增加了可靠投递。
+
+## Verification
+发送重试测试通过。`,
+      requiresWritePermission: true,
+    }] as any;
+    await saveEgoStore(storePath, { version: 3, ego, createdAt: Date.now(), updatedAt: Date.now() });
+
+    let sendAttempts = 0;
+    const options = {
+      autonomousActions: false,
+      gatewayPort: 18789,
+      channel: "test",
+      target: "user",
+      sendMessage: async () => {
+        sendAttempts++;
+        if (sendAttempts === 1) throw new Error("temporary channel outage");
+      },
+      llmGenerator: async () => "已完成：报告投递可靠性修复，并通过发送重试测试。",
+    };
+    const thought = { id: "send-retry-thought", actionType: "report-findings" } as any;
+
+    const first = await executeReportFindings(thought, ego, options);
+    assert.equal(first.result.success, false);
+    let stored = JSON.parse(await fs.promises.readFile(storePath, "utf8"));
+    assert.equal(stored.ego.activeTasks[0].resultDelivered, false);
+
+    const second = await executeReportFindings(thought, ego, options);
+    assert.equal(second.result.success, true);
+    assert.equal(sendAttempts, 2);
+    stored = JSON.parse(await fs.promises.readFile(storePath, "utf8"));
+    assert.equal(stored.ego.activeTasks[0].resultDelivered, true);
   } finally {
     if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
     else process.env.OPENCLAW_STATE_DIR = previousStateDir;
