@@ -31,6 +31,11 @@ export interface ThoughtCycleJournalRecord {
   };
   opportunities: JournalOpportunity[];
   selectedOpportunity?: JournalOpportunity;
+  opportunityProgress?: {
+    cognitiveMove: string;
+    evidenceIds: string[];
+    stateFingerprint: string;
+  };
   thought?: {
     id: string;
     type: ThoughtType;

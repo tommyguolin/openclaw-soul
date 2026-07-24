@@ -261,6 +261,8 @@ type PluginConfig = {
   workspaceFiles?: string[];
   /** Thought frequency multiplier. Default: 1.0. Set lower (e.g. 0.2) for faster testing. */
   thoughtFrequency?: number;
+  /** User-visible proactive pacing multiplier. Defaults to thoughtFrequency for compatibility. */
+  expressionFrequency?: number;
   /** Private shadow emergence probability per eligible interval. Default: 0.1. */
   shadowThoughtRate?: number;
   /** Cognitive activation mode. "observe" records activation/workspace only. */
@@ -518,6 +520,7 @@ const plugin = {
         onThought: createSoulActionHandler(),
         workspaceFiles,
         thoughtFrequency: config.thoughtFrequency ?? 1.0,
+        expressionFrequency: config.expressionFrequency,
         shadowThoughtRate: config.shadowThoughtRate ?? 0.1,
         cognitionMode: config.cognitionMode ?? "legacy",
         cognitiveTemperament: config.cognitiveTemperament ?? "balanced",

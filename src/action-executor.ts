@@ -378,16 +378,20 @@ const TEST_MODE_MIN_ACTION_COOLDOWNS_MS: Partial<Record<ActionType, number>> = {
 
 const lastActionTime: Record<string, number> = {};
 
+export function getActionCooldownMs(actionType: ActionType, thoughtFrequency = 1.0): number {
+  const scaledCooldownMs = (ACTION_COOLDOWNS_MS[actionType] ?? 30 * 60 * 1000) * thoughtFrequency;
+  const minCooldowns = thoughtFrequency < 0.5 ? TEST_MODE_MIN_ACTION_COOLDOWNS_MS : MIN_ACTION_COOLDOWNS_MS;
+  return thoughtFrequency < 0.5 && TEST_MODE_MIN_ACTION_COOLDOWNS_MS[actionType] !== undefined
+    ? TEST_MODE_MIN_ACTION_COOLDOWNS_MS[actionType]
+    : Math.max(scaledCooldownMs, minCooldowns[actionType] ?? 0);
+}
+
 export function getActionCooldownState(
   actionType: ActionType,
   thoughtFrequency = 1.0,
   now = Date.now(),
 ): { ready: boolean; remainingMs: number; cooldownMs: number; lastTime: number } {
-  const scaledCooldownMs = (ACTION_COOLDOWNS_MS[actionType] ?? 30 * 60 * 1000) * thoughtFrequency;
-  const minCooldowns = thoughtFrequency < 0.5 ? TEST_MODE_MIN_ACTION_COOLDOWNS_MS : MIN_ACTION_COOLDOWNS_MS;
-  const cooldownMs = thoughtFrequency < 0.5 && TEST_MODE_MIN_ACTION_COOLDOWNS_MS[actionType] !== undefined
-    ? TEST_MODE_MIN_ACTION_COOLDOWNS_MS[actionType]
-    : Math.max(scaledCooldownMs, minCooldowns[actionType] ?? 0);
+  const cooldownMs = getActionCooldownMs(actionType, thoughtFrequency);
   const lastTime = lastActionTime[actionType] ?? 0;
   const elapsedMs = now - lastTime;
   const remainingMs = Math.max(0, cooldownMs - elapsedMs);
@@ -797,6 +801,8 @@ export interface ActionExecutorOptions {
   workspaceContext?: string;
   /** Frequency multiplier for action cooldowns. Default: 1.0. Lower = shorter cooldowns. */
   thoughtFrequency?: number;
+  /** Frequency multiplier for user-visible proactive pacing. Defaults to thoughtFrequency for compatibility. */
+  expressionFrequency?: number;
   /** Subagent runner for autonomous task delegation (full tool chain) */
   subAgentRunner?: import("./autonomous-actions.js").SubAgentRunner;
 }
@@ -1043,7 +1049,9 @@ async function executeSendMessage(
     };
   }
 
-  const preGenerationLimit = await getProactiveMessageLimitReason(ego, undefined, options.thoughtFrequency);
+  const preGenerationLimit = await getProactiveMessageLimitReason(
+    ego, undefined, options.expressionFrequency ?? options.thoughtFrequency,
+  );
   if (preGenerationLimit) {
     log.info(`Proactive message skipped: ${preGenerationLimit}`);
     return {
@@ -1084,7 +1092,9 @@ async function executeSendMessage(
     };
   }
 
-  const sendLimit = await getProactiveMessageLimitReason(ego, messageContent, options.thoughtFrequency);
+  const sendLimit = await getProactiveMessageLimitReason(
+    ego, messageContent, options.expressionFrequency ?? options.thoughtFrequency,
+  );
   if (sendLimit) {
     log.info(`Proactive message skipped: ${sendLimit}`);
     return {
@@ -1758,7 +1768,9 @@ export async function executeProactiveResearch(
     return { result: { type: "proactive-research", success: false, error: "No channel/target/sender configured" }, metricsChanged: [] };
   }
 
-  const preGenerationLimit = await getProactiveMessageLimitReason(ego, undefined, options.thoughtFrequency);
+  const preGenerationLimit = await getProactiveMessageLimitReason(
+    ego, undefined, options.expressionFrequency ?? options.thoughtFrequency,
+  );
   if (preGenerationLimit) {
     log.info(`Proactive research skipped: ${preGenerationLimit}`);
     return { result: { type: "proactive-research", success: true, result: preGenerationLimit }, metricsChanged: [] };
@@ -1929,7 +1941,9 @@ Write a complete natural response with the same depth as the main conversation. 
       result: `skipped-${messageQuality.reason ?? "quality-gate"}` }, metricsChanged: [] };
   }
 
-  const sendLimit = await getProactiveMessageLimitReason(ego, cleanedMessage, options.thoughtFrequency);
+  const sendLimit = await getProactiveMessageLimitReason(
+    ego, cleanedMessage, options.expressionFrequency ?? options.thoughtFrequency,
+  );
   if (sendLimit) {
     log.info(`Proactive research skipped: ${sendLimit}`);
     return { result: { type: "proactive-research", success: true, result: sendLimit }, metricsChanged: [] };
@@ -2005,7 +2019,9 @@ async function executeProactiveContentPush(
     return { result: { type: "proactive-content-push", success: false, error: "No channel/target/sender configured" }, metricsChanged: [] };
   }
 
-  const preGenerationLimit = await getProactiveMessageLimitReason(ego, undefined, options.thoughtFrequency);
+  const preGenerationLimit = await getProactiveMessageLimitReason(
+    ego, undefined, options.expressionFrequency ?? options.thoughtFrequency,
+  );
   if (preGenerationLimit) {
     log.info(`Content push skipped: ${preGenerationLimit}`);
     return { result: { type: "proactive-content-push", success: true, result: preGenerationLimit }, metricsChanged: [] };
@@ -2134,7 +2150,9 @@ Write a complete natural response sharing this find, with the same depth as the 
       result: `skipped-${messageQuality.reason ?? "quality-gate"}` }, metricsChanged: [] };
   }
 
-  const sendLimit = await getProactiveMessageLimitReason(ego, cleanedMessage, options.thoughtFrequency);
+  const sendLimit = await getProactiveMessageLimitReason(
+    ego, cleanedMessage, options.expressionFrequency ?? options.thoughtFrequency,
+  );
   if (sendLimit) {
     log.info(`Content push skipped: ${sendLimit}`);
     return { result: { type: "proactive-content-push", success: true, result: sendLimit }, metricsChanged: [] };
@@ -2281,7 +2299,9 @@ Output the message directly, no explanation.`;
     return { result: { type: "proactive-check-in", success: true, result: `skipped-${quality.reason ?? "quality-gate"}` }, metricsChanged: [] };
   }
 
-  const sendLimit = await getProactiveMessageLimitReason(ego, messageContent, options.thoughtFrequency);
+  const sendLimit = await getProactiveMessageLimitReason(
+    ego, messageContent, options.expressionFrequency ?? options.thoughtFrequency,
+  );
   if (sendLimit) {
     log.info(`Proactive check-in skipped: ${sendLimit}`);
     return { result: { type: "proactive-check-in", success: true, result: sendLimit }, metricsChanged: [] };

@@ -74,6 +74,54 @@ test("journal ignores a partial trailing line after a crash", async () => {
   }
 });
 
+test("restart restores the last cognitive move for an optional opportunity family", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-journal-family-move-"));
+  const storePath = path.join(directory, "ego.json");
+  const journalPath = path.join(directory, "thought-cycles.jsonl");
+  const entry = record(7);
+  entry.timestamp = Date.now() - 60_000;
+  entry.selectedOpportunity = {
+    type: "bond-deepen",
+    trigger: "bonding",
+    source: "environmental-change",
+    priority: 75,
+    suggestedAction: "send-message",
+    triggerDetail: "No interaction for 90 minutes",
+    motivation: "Reconnect with useful information",
+  };
+  entry.thought = {
+    id: "bond-causal",
+    type: "bond-deepen",
+    content: "The silence matters because a useful update has changed the next decision.",
+    source: "environmental-change",
+    trigger: "bonding",
+    motivation: "Reconnect with useful information",
+    actionType: "send-message",
+  };
+  entry.opportunityProgress = {
+    cognitiveMove: "causal-analysis",
+    evidenceIds: ["user-update-1", "tool-result-2"],
+    stateFingerprint: "decision|silence|update",
+  };
+  try {
+    await new ThoughtCycleJournal(journalPath).append(entry);
+    const service = new ThoughtService({ storePath });
+    const internals = service as unknown as {
+      restoreDiversityState(): Promise<void>;
+      recentOpportunityMoves: Map<string, string>;
+      recentOpportunityProgress: Map<string, { evidenceIds: string[]; stateFingerprint: string }>;
+    };
+    await internals.restoreDiversityState();
+    assert.equal(internals.recentOpportunityMoves.get("family:relationship-outreach"), "causal-analysis");
+    assert.deepEqual(
+      internals.recentOpportunityProgress.get("family:relationship-outreach")?.evidenceIds,
+      ["user-update-1", "tool-result-2"],
+    );
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("ThoughtService journals a real generation cycle and restores diversity after restart", async () => {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-journal-service-"));
   const storePath = path.join(directory, "ego.json");

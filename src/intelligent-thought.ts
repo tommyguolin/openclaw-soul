@@ -50,6 +50,10 @@ export type LLMThoughtGenerator = (prompt: string) => Promise<string>;
 export interface IntelligentThoughtOptions {
   llmGenerator?: LLMThoughtGenerator;
   recentMemories?: SoulMemory[];
+  /** Recent private conclusions that a new thought must advance, not paraphrase. */
+  recentThoughts?: string[];
+  /** Recent reasoning operations, used to avoid getting stuck in one mental groove. */
+  recentCognitiveMoves?: string[];
   preferOpportunity?: DetectedThoughtOpportunity;
   /** Only operational callers should expand an action into adjacent ideas. */
   expandActionIdeas?: boolean;
@@ -1011,6 +1015,32 @@ export function isExecutionFocusedOpportunity(opportunity: DetectedThoughtOpport
     return isExecutionDirective(`${opportunity.triggerDetail} ${opportunity.motivation}`);
   }
   return false;
+}
+
+/**
+ * Work that must not be dropped by a cognitive-diversity heuristic. Optional
+ * discovery and outreach actions are executable, but still need novelty.
+ */
+export function isDiversityExemptOpportunity(
+  opportunity: Pick<
+    DetectedThoughtOpportunity,
+    "type" | "suggestedAction" | "triggerDetail" | "motivation" | "priority"
+  >,
+): boolean {
+  if (opportunity.type === "threat-warning") return true;
+  const action = opportunity.suggestedAction;
+  if (
+    action === "report-findings"
+    || action === "run-agent-task"
+    || action === "invoke-tool"
+    || (action === "search-web" && opportunity.type === "conversation-replay" && opportunity.priority >= 70)
+    || action === "observe-and-improve"
+    || action === "subagent-improve"
+  ) {
+    return true;
+  }
+  return action === "analyze-problem"
+    && isExecutionDirective(`${opportunity.triggerDetail} ${opportunity.motivation}`);
 }
 
 function hasHandledDirectiveAfter(ego: EgoState, timestamp: number): boolean {
@@ -2493,7 +2523,14 @@ export async function generateIntelligentThought(
   ctx: ThoughtGenerationContext,
   options?: IntelligentThoughtOptions,
 ): Promise<Thought> {
-  const { llmGenerator, preferOpportunity, expandActionIdeas = false, subAgentAvailable } = options ?? {};
+  const {
+    llmGenerator,
+    recentThoughts = [],
+    recentCognitiveMoves = [],
+    preferOpportunity,
+    expandActionIdeas = false,
+    subAgentAvailable,
+  } = options ?? {};
 
   const opportunities = detectThoughtOpportunities(ctx);
 
@@ -2532,7 +2569,12 @@ export async function generateIntelligentThought(
   // which stimulus is considered first; it must not reduce thought quality.
   if (llmGenerator) {
     try {
-      const prompt = await generateLLMThoughtPrompt(selectedOpportunity, ctx);
+      const prompt = await generateLLMThoughtPrompt(
+        selectedOpportunity,
+        ctx,
+        recentThoughts,
+        recentCognitiveMoves,
+      );
       const llmContent = await llmGenerator(prompt);
       const refinedContent = llmContent
         .replace(/<think>[\s\S]*?<\/think>/gi, "")
@@ -2603,6 +2645,8 @@ export async function generateIntelligentThought(
 async function generateLLMThoughtPrompt(
   opportunity: DetectedThoughtOpportunity,
   ctx: ThoughtGenerationContext,
+  recentThoughts: string[] = [],
+  recentCognitiveMoves: string[] = [],
 ): Promise<string> {
   const { ego } = ctx;
 
@@ -2651,6 +2695,15 @@ async function generateLLMThoughtPrompt(
     `Environmental changes: ${ego.mentalContext.environmentalChanges.join("; ") || "none"}`,
     `Maintenance backlog: ${(ego.mentalContext.maintenanceBacklog ?? []).slice(0, 3).map((item) => `${item.label} (${item.score})`).join("; ") || "none"}`,
   ].join("\n");
+  const exploredThoughts = recentThoughts
+    .filter((thought) => thought.trim().length > 0)
+    .slice(-6)
+    .map((thought) => `- ${thought.replace(/\s+/g, " ").trim().slice(0, 260)}`)
+    .join("\n") || "- none";
+  const exploredMoves = recentCognitiveMoves
+    .filter((move) => move && move !== "silence")
+    .slice(-4)
+    .join(", ") || "none";
 
   // Search external memory plugins for relevant context
   const memoryQuery = `${opportunity.triggerDetail} ${opportunity.motivation}`;
@@ -2677,6 +2730,12 @@ ${mentalContext}
 Grounded things learned recently:
 ${learningContext}
 
+Recent private conclusions already explored:
+${exploredThoughts}
+
+Recent reasoning approaches:
+${exploredMoves}
+
 ${memorySection ? `\n${memorySection}\n` : ""}
 Develop the thought that genuinely arises from this context. It may be a
 question, analysis, tension, correction of an earlier interpretation,
@@ -2689,6 +2748,30 @@ that a resolved condition is still broken unless newer direct user/tool evidence
 explicitly reopens it. Old failures are historical context, not current evidence.
 Usually continue the foreground or a genuine residue. Only rarely bridge to a
 distant background concern. Do not force an old phrase into an unrelated topic.
+
+The thought must add information rather than merely add words. It should advance
+the recent context in at least one concrete way:
+- connect two grounded details and state the new implication;
+- introduce new user/tool/web evidence and explain what it changes;
+- correct or narrow an earlier interpretation;
+- give a causal explanation that was not already present;
+- identify a decision-changing question; or
+- derive an actionable conclusion with a clear reason.
+
+For a complex unresolved problem, staying on the same topic and even repeating
+the same reasoning operation is allowed when a new user statement, tool result,
+log, test, or changed state advances the episode. Make the delta explicit:
+current hypothesis -> test or observation -> result -> revised implication.
+Without such a delta, another pass over the same hypothesis is repetition.
+
+Do not restate the lingering stimulus, repeat a recent conclusion in different
+words, narrate a desire to be helpful, or turn "the user has been quiet" into
+content by itself. A different metaphor or structure is not a new angle unless
+it changes the implication. When useful, approach the evidence through a
+different reasoning operation than the recent approaches: causal analysis,
+counterexample, comparison, synthesis, experiment design, or prioritization.
+Never force a different operation when the evidence does not support it. If no
+honest information advance is available, return exactly NO_THOUGHT.
 
 Write the complete thought naturally in the language of the most recent
 conversation. Return the thought itself without discussing these instructions.`;

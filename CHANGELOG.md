@@ -4,6 +4,11 @@
 
 ### Changes
 
+- **Require information gain from ordinary thoughts**: The model now sees recent private conclusions and must contribute new evidence, a new grounded connection, a correction, a causal explanation, a decision-changing question, or an actionable conclusion; otherwise it emits `NO_THOUGHT` instead of paraphrasing an old concern.
+- **Let complex thoughts iterate without looping**: Same-topic and same-reasoning-operation passes are now allowed when a new grounded user/tool/web item or substantive state change advances the episode. Per-family evidence/state progress survives restart; elapsed time and repeated model guesses do not unlock another pass.
+- **Diversify reasoning instead of relabeling repetition**: Optional thoughts now pass a model-independent information-gain gate, rotate across causal analysis, counterexamples, comparison, synthesis, experiment design, prioritization, reframing, and other cognitive moves, and reject empty “I want to help/share” intentions. Relationship outreach and content-push families rest for 24 hours even during accelerated cognition, while explicit execution, task results, and threat warnings remain protected.
+- **Simulate long-running cognition with virtual time**: Thought Laboratory can advance hours or weeks in seconds with deterministic scheduling, configurable virtual step/frequency, read-only cloned Ego state, and novelty/grounding/meaningfulness metrics.
+- **Decouple thinking speed from interruption rate**: `expressionFrequency` can preserve production proactive-message pacing while `thoughtFrequency` accelerates private cognition and action testing.
 - **Make self-modification activation transactional**: Verified Soul code changes now enter an `awaiting-restart` state, persist their report before a detached gateway restart, and become reportable only after a later Soul process confirms that the new build was loaded.
 - **Converge maintenance instead of repeating it**: A maintenance domain with a recent verified success enters a 24-hour observation window, preventing the same report/reliability theme from reopening every cycle without new failure evidence.
 - **Bind built-in maintenance to the linked Soul checkout**: Internal maintenance can no longer drift into the generic OpenClaw workspace; explicit user project roots remain authoritative for user-directed work.

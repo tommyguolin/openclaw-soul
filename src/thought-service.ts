@@ -25,6 +25,7 @@ import {
   buildThoughtFromOpportunity,
   getActionForOpportunity,
   hasUnresolvedLocalEvidenceMissingResult,
+  isDiversityExemptOpportunity,
   isExecutionFocusedOpportunity,
   isLocalProjectEvidenceQuestion,
   buildMaintenanceBacklog,
@@ -73,6 +74,8 @@ import {
 import { ThoughtPool, inferEpistemicNature, resolveThoughtPoolPath, resolveThoughtPoolV31ShadowPath } from "./thought-pool.js";
 import {
   buildSpontaneousPrompt,
+  assessThoughtAdvance,
+  buildThoughtProgressSnapshot,
   classifyCognitiveMove,
   classifyThoughtQualityFlags,
   parseSpontaneousResponse,
@@ -317,6 +320,8 @@ export type ThoughtServiceOptions = {
   workspaceFiles?: string[];
   /** Thought frequency multiplier. Default: 1.0. Lower = more frequent. */
   thoughtFrequency?: number;
+  /** User-visible proactive pacing multiplier. Defaults to thoughtFrequency. */
+  expressionFrequency?: number;
   /** Probability of private shadow emergence when the shadow interval elapses. Default: 0.1. */
   shadowThoughtRate?: number;
   /** Cognitive activation path. Default: legacy. */
@@ -353,10 +358,17 @@ export class ThoughtService {
   private workspaceContext: string;
   private workspaceFiles: string[];
   private thoughtFrequency: number;
+  private expressionFrequency: number;
   private lastWorkspaceRefresh = 0;
   private recentThoughtTypes: string[] = [];
   private recentThoughtTopics: string[] = [];
+  private recentThoughtContents: string[] = [];
   private recentCognitiveMoves: string[] = [];
+  private recentOpportunityMoves = new Map<string, string>();
+  private recentOpportunityProgress = new Map<string, {
+    evidenceIds: string[];
+    stateFingerprint: string;
+  }>();
   private recentActionHistory: string[] = [];
   private thoughtJournal: ThoughtCycleJournal;
   private thoughtPool: ThoughtPool;
@@ -420,6 +432,10 @@ export class ThoughtService {
     this.workspaceContext = options.workspaceContext ?? "";
     this.workspaceFiles = options.workspaceFiles ?? ["SOUL.md", "AGENTS.md", "MEMORY.md", "USER.md"];
     this.thoughtFrequency = Math.max(0.1, Math.min(5, options.thoughtFrequency ?? 1.0));
+    this.expressionFrequency = Math.max(
+      0.1,
+      Math.min(5, options.expressionFrequency ?? this.thoughtFrequency),
+    );
     this.shadowThoughtRate = Math.max(0, Math.min(1, options.shadowThoughtRate ?? 0.1));
     this.cognitionMode = options.cognitionMode === "observe" || options.cognitionMode === "shadow" || options.cognitionMode === "primary"
       ? options.cognitionMode : "legacy";
@@ -461,7 +477,10 @@ export class ThoughtService {
       this.expressionPolicy = "legacy";
     }
     if (this.thoughtFrequency !== 1.0) {
-      log.info(`Thought frequency: ${this.thoughtFrequency}x (all intervals ×${this.thoughtFrequency})`);
+      log.info(`Thought/action frequency: ${this.thoughtFrequency}x`);
+    }
+    if (this.expressionFrequency !== this.thoughtFrequency) {
+      log.info(`Expression frequency: ${this.expressionFrequency}x (decoupled from thought/action frequency)`);
     }
 
     // Initialize LLM generator from config
@@ -825,6 +844,7 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
     try {
       const restored = await this.thoughtJournal.restoreDiversityState();
       this.recentThoughtTypes = restored.thoughtTypes;
+      this.recentThoughtContents = restored.thoughtContents;
       this.recentThoughtTopics = restored.thoughtContents.map((content) => topicSignature(content));
       this.recentActionHistory = ego?.behaviorLog?.length
         ? ego.behaviorLog.slice(-5).map((entry) => entry.actionType)
@@ -833,6 +853,16 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
       for (const cycle of recentCycles) {
         if (cycle.outcome === "generated" && cycle.selectedOpportunity) {
           this.suppressOpportunityFamilyAfterSelection(cycle.selectedOpportunity, cycle.timestamp);
+          if (cycle.thought && !isDiversityExemptOpportunity(cycle.selectedOpportunity)) {
+            const diversityKey = this.opportunityDiversityKey(cycle.selectedOpportunity);
+            this.recentOpportunityMoves.set(diversityKey, classifyCognitiveMove(cycle.thought.content));
+            if (cycle.opportunityProgress) {
+              this.recentOpportunityProgress.set(diversityKey, {
+                evidenceIds: cycle.opportunityProgress.evidenceIds,
+                stateFingerprint: cycle.opportunityProgress.stateFingerprint,
+              });
+            }
+          }
         }
         if (cycle.outcome === "generated" && cycle.selectedOpportunity?.triggerDetail.startsWith("Thought Pool attention:")) {
           this.lastPoolAttentionAt = Math.max(this.lastPoolAttentionAt, cycle.timestamp);
@@ -867,6 +897,13 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
       if (params.thought && !params.thought.cognitiveKind) {
         params.thought.cognitiveKind = inferCognitiveKind(params.thought);
       }
+      const opportunityProgress = params.thought && params.selectedOpportunity
+        && !isDiversityExemptOpportunity(params.selectedOpportunity)
+        ? {
+          cognitiveMove: classifyCognitiveMove(params.thought.content),
+          ...buildThoughtProgressSnapshot(params.selectedOpportunity, params.ctx.ego.memories.slice(-20)),
+        }
+        : undefined;
       await this.thoughtJournal.append({
         version: 1,
         cycleId: params.cycleId,
@@ -885,6 +922,7 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
         ...(params.selectedOpportunity
           ? { selectedOpportunity: compactJournalOpportunity(params.selectedOpportunity) }
           : {}),
+        ...(opportunityProgress ? { opportunityProgress } : {}),
         ...(params.thought ? { thought: compactJournalThought(params.thought) } : {}),
         recentStateBefore: params.recentStateBefore,
       });
@@ -1134,7 +1172,16 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
   }
 
   private privateStimulusIntervalMs(): number {
-    return this.thoughtFrequency < 0.5 ? 5 * 60 * 1000 : 15 * 60 * 1000;
+    return 60 * 60 * 1000;
+  }
+
+  private opportunityDiversityKey(
+    opportunity: { type: string; source: string; suggestedAction?: string; triggerDetail: string },
+  ): string {
+    const family = this.opportunityFamily(opportunity);
+    if (family) return `family:${family}`;
+    return `${opportunity.type}|${opportunity.source}|${topicSignature(opportunity.triggerDetail).slice(0, 240)}`
+      .replace(/\d+(?:\.\d+)?/g, "#");
   }
 
   private filterSuppressedOpportunities<T extends DetectedThoughtOpportunity>(opportunities: T[]): T[] {
@@ -1146,7 +1193,7 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
       const family = this.opportunityFamily(opportunity);
       const familyUntil = family ? this.suppressedThoughtOpportunities.get(`family:${family}`) ?? 0 : 0;
       if (familyUntil > now) return false;
-      if (isExecutionFocusedOpportunity(opportunity)) return true;
+      if (isDiversityExemptOpportunity(opportunity)) return true;
       const stimulusUntil = this.suppressedThoughtOpportunities.get(`stimulus:${this.privateStimulusKey(opportunity)}`) ?? 0;
       if (stimulusUntil > now) return false;
       const exactUntil = this.suppressedThoughtOpportunities.get(this.opportunityKey(opportunity)) ?? 0;
@@ -1155,7 +1202,9 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
   }
 
   private opportunityFamily(opportunity: { type: string; source: string; suggestedAction?: string }): string | undefined {
-    if (opportunity.type === "bond-deepen") return "bond-deepen";
+    if (opportunity.type === "bond-deepen" || opportunity.suggestedAction === "proactive-check-in") {
+      return "relationship-outreach";
+    }
     if (opportunity.suggestedAction === "proactive-content-push") return "proactive-content-push";
     if (opportunity.type === "opportunity-detected" && opportunity.source === "system-monitor" && !opportunity.suggestedAction) {
       return "generic-system-goal";
@@ -1179,8 +1228,8 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
   }
 
   private suppressRepeatedOpportunity(opportunity: DetectedThoughtOpportunity | undefined): void {
-    if (!opportunity || isExecutionFocusedOpportunity(opportunity)) return;
-    const durationMs = this.thoughtFrequency < 0.5 ? 5 * 60 * 1000 : 15 * 60 * 1000;
+    if (!opportunity || isDiversityExemptOpportunity(opportunity)) return;
+    const durationMs = 2 * 60 * 60 * 1000;
     const until = Date.now() + durationMs;
     this.suppressedThoughtOpportunities.set(this.opportunityKey(opportunity), until);
     log.info(
@@ -1190,12 +1239,11 @@ Say Soul is available and will only interrupt when there is concrete value. Do n
   }
 
   private opportunityFamilySuppressionMs(family: string): number {
-    if (this.thoughtFrequency < 0.5) {
-      if (family === "bond-deepen") return 15 * 60 * 1000;
-      return 15 * 60 * 1000;
-    }
-    if (family === "bond-deepen") return 60 * 60 * 1000;
-    return 30 * 60 * 1000;
+    // Topic rest is cognitive hygiene, not throughput. Accelerated thought
+    // frequency must not make Soul obsess over the same family more often.
+    if (family === "relationship-outreach") return 24 * 60 * 60 * 1000;
+    if (family === "proactive-content-push") return 24 * 60 * 60 * 1000;
+    return 3 * 60 * 60 * 1000;
   }
 
   private async tick(): Promise<void> {
@@ -1815,6 +1863,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
       `maturity=${result.candidate.maturity.toFixed(2)}, action=none`,
     );
     this.recentCognitiveMoves = [...this.recentCognitiveMoves, cognitiveMove].slice(-3);
+    this.recentThoughtContents = [...this.recentThoughtContents, thought.content].slice(-10);
     if (opportunity) {
       this.suppressedThoughtOpportunities.set(
         `stimulus:${this.privateStimulusKey(opportunity)}`,
@@ -1860,6 +1909,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
       return current;
     });
     this.recentThoughtTypes = [...this.recentThoughtTypes, thought.type].slice(-3);
+    this.recentThoughtContents = [...this.recentThoughtContents, thought.content].slice(-10);
     this.recentThoughtTopics = [...this.recentThoughtTopics, topicSignature(thought.content)].slice(-10);
 
     const date = new Date(now);
@@ -1970,6 +2020,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
         hooksToken: this.hooksToken,
         workspaceContext: this.workspaceContext || undefined,
         thoughtFrequency: this.thoughtFrequency,
+        expressionFrequency: this.expressionFrequency,
         subAgentRunner: this.subAgentRunner,
       });
     } catch (error) {
@@ -2277,7 +2328,7 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
           }
           const selectionPool = unsuppressedOpportunities;
           const nonRepeatingOpportunities = this.recentThoughtTypes.length > 0
-            ? selectionPool.filter((o) => isExecutionFocusedOpportunity(o)
+            ? selectionPool.filter((o) => isDiversityExemptOpportunity(o)
               || this.getOpportunityAction(o, ego) === "send-message"
               || !this.recentThoughtTypes.includes(o.type))
             : selectionPool;
@@ -2311,6 +2362,8 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
 
           thought = await generateIntelligentThought(ctx, {
             llmGenerator: availableLLMGenerator,
+            recentThoughts: this.recentThoughtContents,
+            recentCognitiveMoves: this.recentCognitiveMoves,
             preferOpportunity: selectedOpportunity,
             subAgentAvailable: Boolean(this.subAgentRunner),
           });
@@ -2325,10 +2378,20 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
           // Skip if this thought overlaps significantly with a recent one.
           // Give one retry with a different opportunity type. If that also
           // repeats, apply backoff to prevent infinite same-topic loops.
-          if (!this.isExecutionThought(thought, selectedOpportunity) && this.isRepeatTopic(thought.content)) {
+          const advance = selectedOpportunity && !isDiversityExemptOpportunity(selectedOpportunity)
+            ? assessThoughtAdvance(thought.content, this.recentThoughtContents, this.recentCognitiveMoves)
+            : undefined;
+          if (
+            selectedOpportunity
+            && !isDiversityExemptOpportunity(selectedOpportunity)
+            && (advance?.accepted === false || this.isRepeatTopic(thought.content))
+          ) {
             this.suppressRepeatedOpportunity(selectedOpportunity);
             thought = null;
-            log.info("Skipping thought — topic too similar (will retry with different opportunity)");
+            log.info(
+              `Skipping thought — no information advance (${advance?.reason ?? "topic-repeat"}); ` +
+              `retrying a different opportunity`,
+            );
             // Try again with a different opportunity type
             const remainingOpportunities = nonRepeatingOpportunities.filter(
               (o) => o.type !== selectedOpportunity?.type,
@@ -2338,6 +2401,8 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
               try {
                 thought = await generateIntelligentThought(ctx, {
                   llmGenerator: availableLLMGenerator,
+                  recentThoughts: this.recentThoughtContents,
+                  recentCognitiveMoves: this.recentCognitiveMoves,
                   preferOpportunity: selectedOpportunity,
                   subAgentAvailable: Boolean(this.subAgentRunner),
                 });
@@ -2345,13 +2410,17 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
                   await recordCycle("skipped", "aborted after retry generation");
                   return;
                 }
-                if (
-                  thought
-                  && !this.isExecutionThought(thought, selectedOpportunity)
-                  && this.isRepeatTopic(thought.content)
-                ) {
+                const retryAdvance = thought && selectedOpportunity
+                  && !isDiversityExemptOpportunity(selectedOpportunity)
+                  ? assessThoughtAdvance(thought.content, this.recentThoughtContents, this.recentCognitiveMoves)
+                  : undefined;
+                if (thought && selectedOpportunity
+                  && !isDiversityExemptOpportunity(selectedOpportunity)
+                  && (retryAdvance?.accepted === false || this.isRepeatTopic(thought.content))) {
                   this.suppressRepeatedOpportunity(selectedOpportunity);
-                  log.info("Retry also repeated — backing off this tick");
+                  log.info(
+                    `Retry also lacked information advance (${retryAdvance?.reason ?? "topic-repeat"}) — backing off`,
+                  );
                   thought = null;
                 }
               } catch {
@@ -2399,11 +2468,11 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
         }
         const selectionPool = unsuppressedOpportunities;
         const nonRepeatingOpportunities = this.recentThoughtTypes.length > 0
-          ? selectionPool.filter((o) => isExecutionFocusedOpportunity(o) || !this.recentThoughtTypes.includes(o.type))
+          ? selectionPool.filter((o) => isDiversityExemptOpportunity(o) || !this.recentThoughtTypes.includes(o.type))
           : selectionPool;
         // Also filter out opportunities whose topic overlaps recent thoughts
         const novelOpportunities = nonRepeatingOpportunities.filter(
-          (o) => isExecutionFocusedOpportunity(o) || !this.isRepeatTopic(o.motivation || o.triggerDetail),
+          (o) => isDiversityExemptOpportunity(o) || !this.isRepeatTopic(o.motivation || o.triggerDetail),
         );
         selectedOpportunity = this.selectBestOpportunity(novelOpportunities, ego)
           ?? this.selectBestOpportunity(nonRepeatingOpportunities, ego);
@@ -2438,6 +2507,44 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
       this.applySkipBackoff("LLM error content");
       await recordCycle("failed", "LLM error content");
       return;
+    }
+
+    if (selectedOpportunity && !isDiversityExemptOpportunity(selectedOpportunity)) {
+      const diversityKey = this.opportunityDiversityKey(selectedOpportunity);
+      const currentProgress = buildThoughtProgressSnapshot(
+        selectedOpportunity,
+        ctx.ego.memories.slice(-20),
+      );
+      const previousProgress = this.recentOpportunityProgress.get(diversityKey);
+      const advance = assessThoughtAdvance(
+        thought.content,
+        this.recentThoughtContents,
+        this.recentCognitiveMoves,
+        {
+          evidenceIds: currentProgress.evidenceIds,
+          previousEvidenceIds: previousProgress?.evidenceIds,
+          stateFingerprint: currentProgress.stateFingerprint,
+          previousStateFingerprint: previousProgress?.stateFingerprint,
+        },
+      );
+      const repeatsFamilyMove =
+        this.recentOpportunityMoves.get(diversityKey) === advance.cognitiveMove
+        && !advance.verifiedProgress;
+      const repeatsTopic = this.isRepeatTopic(thought.content) && !advance.verifiedProgress;
+      if (!advance.accepted || repeatsFamilyMove || repeatsTopic) {
+        this.suppressRepeatedOpportunity(selectedOpportunity);
+        this.recentCognitiveMoves = [...this.recentCognitiveMoves, "silence"].slice(-4);
+        await this.thoughtPool.recordObservation(true);
+        await recordCycle(
+          "skipped",
+          repeatsFamilyMove
+            ? `same opportunity family repeated cognitive move: ${advance.cognitiveMove}`
+            : `no information advance: ${advance.reason ?? "topic-repeat"}`,
+        );
+        return;
+      }
+      this.recentOpportunityMoves.set(diversityKey, advance.cognitiveMove);
+      this.recentOpportunityProgress.set(diversityKey, currentProgress);
     }
 
     if (!this.autonomousActions
@@ -2484,11 +2591,22 @@ Explain that autonomousActions is disabled. Ask whether to enable it. Explain th
       // Track recent thought topics to prevent revisiting the same subject.
       // Store topic terms plus angle markers so broad topics can continue
       // through new angles without being treated as duplicate thoughts.
-      const signature = this.isExecutionThought(thought) ? "" : topicSignature(thought.content);
+      const diversityExempt = selectedOpportunity
+        ? isDiversityExemptOpportunity(selectedOpportunity)
+        : false;
+      const signature = diversityExempt ? "" : topicSignature(thought.content);
       if (signature) {
+        this.recentThoughtContents.push(thought.content);
+        if (this.recentThoughtContents.length > 10) {
+          this.recentThoughtContents.shift();
+        }
         this.recentThoughtTopics.push(signature);
         if (this.recentThoughtTopics.length > 10) {
           this.recentThoughtTopics.shift();
+        }
+        this.recentCognitiveMoves.push(classifyCognitiveMove(thought.content));
+        if (this.recentCognitiveMoves.length > 4) {
+          this.recentCognitiveMoves.shift();
         }
       }
     }

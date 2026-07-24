@@ -297,6 +297,130 @@ Pending.`, "utf8");
   }
 });
 
+test("pollActiveTasks refreshes a stored placeholder result from the result file", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-refresh-final-report-"));
+  try {
+    const { pollActiveTasks } = await import(`../src/autonomous-actions.js?refresh-final=${Date.now()}`);
+    const storePath = path.join(directory, "ego.json");
+    const resultFilePath = path.join(directory, "result.md");
+    const finalReport = `Status: completed
+
+## Outcome
+完整报告已经落盘。
+
+## Changes
+修复了父进程对非最终结果的短路读取。
+
+## Verification
+pollActiveTasks 会重新读取结果文件。`;
+    await fs.promises.writeFile(resultFilePath, finalReport, "utf8");
+
+    const now = Date.now();
+    const ego = createDefaultEgoState();
+    ego.activeTasks = [{
+      id: "refresh-final-report-task",
+      title: "刷新最终报告",
+      description: "验证非最终存储结果不会挡住结果文件",
+      status: "in-progress",
+      createdAt: now - 10_000,
+      updatedAt: now + 60_000,
+      sourceThoughtId: "poll-test",
+      steps: [],
+      result: `Status: completed
+
+Task: refresh-final-report-task
+Finished: 2026-07-24T00:00:00.000Z
+
+## Outcome
+Autonomous work has started. This placeholder must be replaced with a final report before the task is considered done.
+
+## Changes
+Pending.
+
+## Verification
+Pending.
+
+## Metrics
+Pending.
+
+## Next
+Pending.`,
+      resultFilePath,
+      requiresWritePermission: false,
+      resultDelivered: false,
+    }] as any;
+    await saveEgoStore(storePath, { version: 3, ego, createdAt: now, updatedAt: now });
+
+    const completed = await pollActiveTasks(storePath, { now: () => now });
+    assert.equal(completed.length, 1);
+    assert.equal(completed[0].status, "completed");
+    assert.match(completed[0].result ?? "", /完整报告已经落盘/);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("pollActiveTasks refreshes a completed stored placeholder result from the result file", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-refresh-completed-final-report-"));
+  try {
+    const { pollActiveTasks } = await import(`../src/autonomous-actions.js?refresh-completed-final=${Date.now()}`);
+    const storePath = path.join(directory, "ego.json");
+    const resultFilePath = path.join(directory, "result.md");
+    const finalReport = `Status: completed
+
+## Outcome
+完成态任务在派发前被结果文件刷新。
+
+## Changes
+修复了已完成任务不再回读结果文件的短路。
+
+## Verification
+pollActiveTasks 会刷新 completed 任务的最终报告.`;
+    await fs.promises.writeFile(resultFilePath, finalReport, "utf8");
+
+    const now = Date.now();
+    const ego = createDefaultEgoState();
+    ego.activeTasks = [{
+      id: "refresh-completed-final-report-task",
+      title: "刷新完成态最终报告",
+      description: "验证已完成但未派发的任务仍会回读结果文件",
+      status: "completed",
+      createdAt: now - 10_000,
+      updatedAt: now,
+      completedAt: now,
+      sourceThoughtId: "poll-test",
+      steps: [],
+      result: `Status: partial
+
+## Outcome
+The task finished, but the complete report file was still settling when the parent wrote this fallback.
+
+## Changes
+No changes were confirmed in this fallback summary.
+
+## Verification
+No verification was captured in this fallback summary.
+
+## Metrics
+No metrics were captured in this fallback summary.
+
+## Next
+Re-read the result file once the child finishes flushing the final report.`,
+      resultFilePath,
+      requiresWritePermission: false,
+      resultDelivered: false,
+    }] as any;
+    await saveEgoStore(storePath, { version: 3, ego, createdAt: now, updatedAt: now });
+
+    const completed = await pollActiveTasks(storePath, { now: () => now });
+    assert.equal(completed.length, 1);
+    assert.equal(completed[0].status, "completed");
+    assert.match(completed[0].result ?? "", /完成态任务在派发前被结果文件刷新/);
+  } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("pollActiveTasks never treats an ordinary multi-section document as a final report", async () => {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-ordinary-document-"));
   try {
@@ -784,6 +908,65 @@ test("timed out subagent output can still recover a complete final report", asyn
     assert.match(report, /^Status: completed/m);
     assert.match(report, /输出回收路径/);
   } finally {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("subagent improvement returns the full final report instead of a truncated summary", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-long-final-report-"));
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  process.env.OPENCLAW_STATE_DIR = path.join(directory, "state");
+
+  try {
+    const { executeSubagentImprove } = await import(`../src/autonomous-actions.js?long-final-report=${Date.now()}`);
+    const ego = createDefaultEgoState();
+    ego.activeTasks = [];
+
+    const tailMarker = "TAIL_MARKER_9f2d1c";
+    const longBody = `${"长报告内容 ".repeat(1800)}${tailMarker}`;
+    const finalReport = `Status: completed
+
+## Outcome
+${longBody}
+
+## Changes
+- src/autonomous-actions.ts: removed truncation from returned subagent reports.
+
+## Verification
+The long report reached the caller intact.`;
+
+    const thought = {
+      id: "long-final-report-thought",
+      type: "self-improvement-monitor",
+      content: "Preserve the entire final report when returning subagent improvement results.",
+      motivation: "subagent reliability",
+      targetMetrics: [],
+      priority: 100,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      actionType: "subagent-improve",
+      actionParams: { maintenanceFocus: "subagent-reliability" },
+    } as any;
+
+    const result = await executeSubagentImprove(thought, ego, {
+      autonomousActions: false,
+      gatewayPort: 18789,
+      workspaceContext: "K:\\test_code\\openclaw-soul",
+      subAgentRunner: async () => ({
+        runId: "long-report-run",
+        success: true,
+        output: finalReport,
+        error: "",
+      }),
+    } as any);
+
+    assert.equal(result.result.success, true);
+    assert.equal(result.result.result, finalReport);
+    assert.match(result.result.result ?? "", /TAIL_MARKER_9f2d1c/);
+    assert.match(result.result.result ?? "", /## Verification/);
+  } finally {
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
     await fs.promises.rm(directory, { recursive: true, force: true });
   }
 });

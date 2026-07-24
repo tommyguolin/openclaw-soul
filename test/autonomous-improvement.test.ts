@@ -270,6 +270,84 @@ test("autonomous improvement reports concrete verified changes and never complet
   }
 });
 
+test("subagent-improve returns the full final report instead of truncating it to a short preview", async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-subagent-report-full-"));
+  const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+  process.env.OPENCLAW_STATE_DIR = path.join(directory, "state");
+  try {
+    const projectDir = path.join(directory, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+    await fs.promises.writeFile(path.join(projectDir, "package.json"), JSON.stringify({ name: "project" }), "utf8");
+    await fs.promises.writeFile(path.join(projectDir, "index.js"), "console.log('ok');\n", "utf8");
+
+    const [{ executeAutonomousAction }, { createDefaultEgoState }] = await Promise.all([
+      import(`../src/autonomous-actions.js?subagent-full-report=${Date.now()}`),
+      import("../src/ego-store.js"),
+    ]);
+
+    const ego = createDefaultEgoState();
+    ego.userLanguage = "zh-CN";
+    const filler = Array.from({ length: 40 }, (_, i) => `补充说明 ${String(i).padStart(2, "0")}：这是一段用于跨过 500 字符阈值的报告正文。`).join("\n");
+    const finalReport = [
+      "Status: completed",
+      "",
+      "## Outcome",
+      "子代理已经生成了完整的最终报告。",
+      "",
+      "## Changes",
+      "修改了报告返回链路，避免只返回短预览。",
+      filler,
+      "",
+      "## Verification",
+      "验证命令已执行并通过。",
+      "",
+      "## Metrics",
+      "这段说明专门放在 500 字符之后，用来验证返回值没有被截断。",
+      "",
+      "## Next",
+      "末尾校验：返回值仍应包含这一整段，而不只是开头预览。",
+    ].join("\n");
+
+    const thought = {
+      id: "subagent-full-report-test",
+      type: "self-improvement-monitor",
+      content: `Improve ${projectDir}`,
+      motivation: "verify the complete report is returned",
+      targetMetrics: [],
+      priority: 80,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      executed: false,
+      relatedNeeds: ["growth"],
+      actionType: "subagent-improve",
+      actionParams: {
+        projectRoot: projectDir,
+        maintenanceFocus: "subagent-reliability",
+        maintenanceObjective: "return the complete final report",
+      },
+    } as any;
+
+    const result = await executeAutonomousAction("subagent-improve", thought, ego, {
+      autonomousActions: true,
+      gatewayPort: 18789,
+      subAgentRunner: async () => ({
+        runId: "subagent-full-report-run",
+        success: true,
+        output: finalReport,
+      }),
+    });
+
+    assert.equal(result.result.success, true);
+    assert.match(result.result.result ?? "", /末尾校验：返回值仍应包含这一整段/);
+    assert.match(result.result.result ?? "", /## Metrics/);
+    assert.ok((result.result.result ?? "").length > 500);
+  } finally {
+    if (previousStateDir === undefined) delete process.env.OPENCLAW_STATE_DIR;
+    else process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("autonomous improvement keeps deep evidence excerpts in the final report", async () => {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-improvement-evidence-"));
   const projectDir = path.join(directory, "sample-project");

@@ -181,6 +181,37 @@ test("low thoughtFrequency shortens proactive action cooldowns for observation r
   assert.equal(observation.cooldownMs, 20 * 60 * 1000);
 });
 
+test("expression frequency can preserve production pacing during accelerated cognition", () => {
+  const service = new ThoughtService({ thoughtFrequency: 0.3, expressionFrequency: 1 });
+  type FrequencyInternals = {
+    thoughtFrequency: number;
+    expressionFrequency: number;
+  };
+  const internals = service as unknown as FrequencyInternals;
+  assert.equal(internals.thoughtFrequency, 0.3);
+  assert.equal(internals.expressionFrequency, 1);
+
+  const now = Date.now();
+  const recentProactive: SoulMemory = {
+    id: "recent-proactive",
+    type: "interaction",
+    content: "A previous grounded update.",
+    emotion: 0,
+    valence: "neutral",
+    importance: 0.7,
+    timestamp: now - 30 * 60 * 1000,
+    tags: ["conversation", "outbound", "proactive"],
+  };
+  assert.equal(
+    getProactiveMessageLimitReasonForMemories([recentProactive], "A different grounded update.", 0.3),
+    null,
+  );
+  assert.equal(
+    getProactiveMessageLimitReasonForMemories([recentProactive], "A different grounded update.", 1),
+    "skipped-rate-limit",
+  );
+});
+
 test("low thoughtFrequency startup greeting uses observation-mode cooldown", async () => {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "soul-startup-greeting-"));
   try {
@@ -1380,4 +1411,51 @@ test("LLM thought context excludes stale turns outside the current conversation 
   });
   assert(prompt.includes("Können Maschinen"));
   assert.equal(prompt.includes("usage.json"), false);
+});
+
+test("LLM thought context requires an information advance over recent private conclusions", async () => {
+  const ego = createDefaultEgoState();
+  ego.goals = [];
+  ego.memories.push({
+    id: "current-problem",
+    type: "interaction",
+    content: "The gateway restart breaks autonomous task verification.",
+    emotion: 0,
+    valence: "neutral",
+    importance: 0.8,
+    timestamp: Date.now() - 10 * 60 * 1000,
+    tags: ["conversation", "inbound"],
+    semanticSignals: ["problem"],
+  });
+  const ctx = context(ego);
+  const opportunity: DetectedThoughtOpportunity = {
+    type: "conversation-replay",
+    trigger: "curiosity",
+    triggerDetail: "restart interrupts verification",
+    priority: 80,
+    source: "user-interaction",
+    relatedNeeds: ["growth"],
+    motivation: "understand the unresolved reliability gap",
+  };
+  let prompt = "";
+  await generateIntelligentThought(ctx, {
+    preferOpportunity: opportunity,
+    recentThoughts: [
+      "The task lifecycle needs a persistent checkpoint after gateway restart.",
+      "Verification must happen after the new gateway process becomes ready.",
+    ],
+    recentCognitiveMoves: ["reflection", "causal-analysis"],
+    llmGenerator: async (value) => {
+      prompt = value;
+      return "The restart acknowledgement should carry the task checkpoint generation.";
+    },
+  });
+
+  assert.match(prompt, /Recent private conclusions already explored/);
+  assert.match(prompt, /persistent checkpoint/);
+  assert.match(prompt, /Recent reasoning approaches/);
+  assert.match(prompt, /causal-analysis/);
+  assert.match(prompt, /counterexample, comparison, synthesis, experiment design/);
+  assert.match(prompt, /add information rather than merely add words/);
+  assert.match(prompt, /return exactly NO_THOUGHT/);
 });

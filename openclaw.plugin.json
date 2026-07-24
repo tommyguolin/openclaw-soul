@@ -23,6 +23,11 @@
         "type": "number",
         "description": "Thought frequency multiplier. Default: 1.0. Lower = more frequent (e.g. 0.2 for testing)"
       },
+      "expressionFrequency": {
+        "type": "number",
+        "minimum": 0.1,
+        "description": "User-visible proactive pacing multiplier. Defaults to thoughtFrequency. Set to 1.0 while lowering thoughtFrequency to test cognition quickly without increasing message frequency"
+      },
       "shadowThoughtRate": {
         "type": "number",
         "minimum": 0,

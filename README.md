@@ -226,6 +226,14 @@ This creates a closed loop: **observe → analyze → fix → verify → report*
 
 Each eligible thought cycle is appended to `~/.openclaw/soul/thought-cycles.jsonl`, including its context, candidates, selection, result, and recent diversity state. On restart, Soul restores recent thought types, topics, and actions from this journal instead of forgetting its diversity history.
 
+Deduplication is progress-aware rather than topic-averse. Soul may revisit a
+complex problem—and may reuse the same reasoning operation—when a new grounded
+user/tool/web item or a substantive state change advances the episode. The
+journal persists the evidence IDs and state fingerprint for that opportunity
+family across restarts. Repeating the same hypothesis against the same evidence
+is still suppressed; a productive episode follows hypothesis → test/observation
+→ result → revision.
+
 Need deficits, goal percentages, and self-improvement checks stay in background maintenance rather than masquerading as thoughts. Both ordinary non-operational reflections and spontaneous associations enter `~/.openclaw/soul/thought-pool.json` as private seeds instead of immediately learning, searching, or messaging. Most spontaneous associations continue the recent foreground or cognitive residue; only a small minority use a distant-memory bridge.
 
 Thought Pool candidates mature only when a similar thought reappears through semantically related, independently grounded user/tool/web evidence. Model-generated guesses and changed memory IDs do not count as new evidence. Version 3 also persists resolution tombstones: a thought whose premise conflicts with a currently resolved state is rejected before incubation, and superseded facts are excluded from current-context prompts and opportunity detection. A candidate needs at least three distinct activations, sufficient coherence/maturity, no quality flags, and an attention score of at least 0.65 before the private Attention Gate can notice it. Attention remains private and actionless. After a separate pause, a mature, coherent, user-relevant candidate gets one independent expression review through the normal value, factuality, deduplication, cooldown, and delivery gates; it may still remain unspoken.
@@ -248,13 +256,15 @@ All options have sensible defaults. Only configure what you need.
 |--------|---------|---------|
 | `autonomousActions` | `false` | `openclaw config set plugins.entries.soul.config.autonomousActions true` |
 | `thoughtFrequency` | `1.0` | `openclaw config set plugins.entries.soul.config.thoughtFrequency 0.5` |
+| `expressionFrequency` | same as `thoughtFrequency` | `openclaw config set plugins.entries.soul.config.expressionFrequency 1.0` |
 | `cognitionMode` | `legacy` | `openclaw config set plugins.entries.soul.config.cognitionMode observe` |
 | `cognitiveTemperament` | `balanced` | `openclaw config set plugins.entries.soul.config.cognitiveTemperament expansive` |
 | `expressionPolicy` | `legacy` | `openclaw config set plugins.entries.soul.config.expressionPolicy observe` |
 | `checkIntervalMs` | `60000` | `openclaw config set plugins.entries.soul.config.checkIntervalMs 300000` |
 
 - **`autonomousActions`** — Allow Soul to edit files and run commands. When `false`, Soul can still read files and run diagnostics, but cannot modify anything. When `true`, Soul can fix bugs, edit its own code, and run any command.
-- **`thoughtFrequency`** — How often Soul thinks and messages. `0.2`-`0.4` for testing and faster proactive outreach, `1.0` for default, `2.0` for quiet.
+- **`thoughtFrequency`** — How often Soul thinks and attempts actions. `0.2`-`0.4` is useful for accelerated testing, `1.0` for default, `2.0` for quiet.
+- **`expressionFrequency`** — Ordinary user-visible proactive pacing. Set `thoughtFrequency=0.3` and `expressionFrequency=1.0` to observe cognition quickly without making the assistant three times chattier. Task-result delivery and startup greetings follow their own rules.
 - **`cognitionMode`** — `legacy` keeps current behavior. `observe` records activation without an LLM. `shadow` generates private thoughts into an isolated experiment pool. `primary` makes Activation/Workspace the ordinary private-thought source while keeping operational detectors and every existing expression/action safety gate; Activation-origin outreach is capped at one sent item per 24 hours.
 - **`cognitiveTemperament`** — Controls associative breadth inside private cognition: `focused` favors near continuity, `balanced` is the default, and `expansive` permits more structurally bridged material. Active troubleshooting automatically narrows regardless of this setting.
 - **`expressionPolicy`** — `legacy` disables the feedback layer. With `cognitionMode=primary`, `observe` records objective reply/no-reply observations without changing behavior, while `adaptive` lets high-confidence explicit feedback adjust expression waiting time and value threshold only. No reply is recorded as uncertain, never as automatic rejection or annoyance.
@@ -315,6 +325,31 @@ Run the current detector pipeline without model calls:
 npm run thought-lab -- --store /path/to/ego.json --runs 200 --mode baseline
 ```
 
+Simulate a full week of production-like scheduling in seconds. The laboratory
+advances a virtual clock by 30 minutes per cycle, updates only its cloned Ego,
+does not execute external actions, and never waits in real time:
+
+```bash
+npm run thought-lab -- \
+  --store /path/to/ego.json \
+  --simulated-hours 168 \
+  --step-minutes 30 \
+  --thought-frequency 1.0 \
+  --seed 20260724 \
+  --mode baseline
+```
+
+Use `--respect-scheduling false` to evaluate every virtual step as an eligible
+thought cycle. This is useful for stress-testing novelty and repetition gates
+without conflating them with production timing.
+
+Optional thoughts are accepted only when they add information. Reworded
+conclusions, repeated cognitive moves for the same opportunity family, and
+empty intentions to help or share become natural silence. Relationship outreach
+and proactive content families retain production-scale 24-hour topic rest even
+when `thoughtFrequency` is accelerated; explicit user-directed work, task-result
+delivery, and threat warnings are never discarded by this diversity gate.
+
 Run the minimal 80/20 experiment (80% current pipeline, 20% remote-memory spontaneous path):
 
 ```bash
@@ -328,13 +363,36 @@ npm run thought-lab -- \
 
 The provider API key is resolved from its normal environment variable. Use `--api-key-env`, `--base-url`, `--spontaneous-rate`, `--seed`, `--output`, or `--max-tokens` to override defaults. Lab model calls default to 192 output tokens. Model-backed runs make one generation call per cycle, so start with a small run before a 200-cycle comparison.
 
+To reuse the local OpenClaw gateway and its configured provider without copying
+credentials into the command line, pass the existing configuration file:
+
+```bash
+npm run thought-lab -- \
+  --store /path/to/ego.json \
+  --simulated-hours 24 \
+  --step-minutes 360 \
+  --provider internal \
+  --model Agent-Model \
+  --openclaw-config /path/to/openclaw.json
+```
+
 Recalculate current metrics from an existing JSONL without making model calls:
 
 ```bash
 npm run thought-lab -- --input /path/to/existing-run.jsonl
 ```
 
-Reported metrics include opportunity, thought, action and cognitive-move distributions; no-op and repetition rates; lexical semantic diversity; source-memory age/diversity; cross-topic association rate; and explicit meta-framing, task-pressure, and truncation leakage rates. Remote pairs are chosen across coarse topic clusters before lexical distance, so two differently worded trading memories are no longer mislabeled as cross-topic. The spontaneous path records exact source memories; baseline records label source-memory matches as lexical inference because the production detector does not preserve provenance IDs. “Useful surprise” and “nonsense” remain explicit blind-review measures rather than pretending a heuristic can judge them.
+Reported metrics include opportunity, thought, action and cognitive-move
+distributions; no-op and repetition rates; lexical semantic diversity;
+source-memory age/diversity; cross-topic association rate; virtual-time
+throughput; novelty, grounding and meaningful-thought rates; and explicit
+meta-framing, empty-intention, task-pressure, and truncation leakage rates. Remote pairs are
+chosen across coarse topic clusters before lexical distance, so two differently
+worded trading memories are no longer mislabeled as cross-topic. The
+spontaneous path records exact source memories; baseline records label
+source-memory matches as lexical inference because the production detector does
+not preserve provenance IDs. “Useful surprise” and “nonsense” remain explicit
+blind-review measures rather than pretending a heuristic can judge them.
 
 The Activation Observer also exposes `runCognitionLab()` from `src/cognition/lab.ts`. It reuses the exact production `CognitionRunner`, writes only lab-local activation state/journal files, and reports pre-generation silence, active-set/workspace size, trace diversity, and resolved suppression without modifying the Ego snapshot.
 

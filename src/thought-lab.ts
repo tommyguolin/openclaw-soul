@@ -1,10 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { getActionCooldownMs } from "./action-executor.js";
 import {
   buildThoughtFromOpportunity,
   detectThoughtOpportunities,
-  isExecutionFocusedOpportunity,
+  isDiversityExemptOpportunity,
 } from "./intelligent-thought.js";
 import type { DetectedThoughtOpportunity, LLMThoughtGenerator } from "./intelligent-thought.js";
 import { loadEgoStore, resolveEgoStorePath } from "./ego-store.js";
@@ -12,6 +13,8 @@ import { createSoulLLMGenerator } from "./soul-llm.js";
 import type { SoulLLMConfig } from "./soul-llm.js";
 import {
   buildSpontaneousPrompt,
+  assessThoughtAdvance,
+  buildThoughtProgressSnapshot,
   parseSpontaneousResponse,
   classifyCognitiveMove,
   classifyThoughtQualityFlags,
@@ -22,6 +25,8 @@ import {
   type RandomSource,
 } from "./thought-emergence.js";
 export {
+  assessThoughtAdvance,
+  buildThoughtProgressSnapshot,
   classifyCognitiveMove,
   classifyThoughtQualityFlags,
   contentTokens,
@@ -43,15 +48,35 @@ export type ThoughtLabPath = "current" | "spontaneous";
 export interface ThoughtLabOptions {
   storePath?: string;
   runs?: number;
+  /** Virtual duration to simulate. When set, runs defaults to duration / step. */
+  simulatedHours?: number;
+  /** Minutes advanced between virtual cycles. Default: 30. */
+  stepMinutes?: number;
+  /** Epoch milliseconds for the first virtual cycle. Default: current time. */
+  startTime?: number;
+  /** Production thought-frequency multiplier used by the scheduling model. */
+  thoughtFrequency?: number;
+  /** Respect deterministic production-like scheduling. Defaults to true for timed simulations. */
+  respectScheduling?: boolean;
   mode?: ThoughtLabMode;
   spontaneousRate?: number;
   seed?: number;
   outputPath?: string;
   llmGenerator?: LLMThoughtGenerator;
+  /**
+   * Optional trusted evidence injected along the virtual timeline. This makes
+   * it possible to test a multi-stage problem in seconds without mutating Ego.
+   */
+  evidenceTimeline?: Array<{
+    atHour: number;
+    memory: SoulMemory;
+  }>;
 }
 
 export interface ThoughtLabRecord {
   run: number;
+  simulatedAt: number;
+  elapsedMinutes: number;
   path: ThoughtLabPath;
   context: {
     currentHour: number;
@@ -77,6 +102,9 @@ export interface ThoughtLabRecord {
   cognitiveMove: string;
   qualityFlags: string[];
   topicKey: string;
+  noveltyScore: number;
+  grounded: boolean;
+  meaningful: boolean;
   recentStateBefore: {
     thoughtTypes: string[];
     topicKeys: string[];
@@ -89,6 +117,8 @@ export interface ThoughtLabMetrics {
   runs: number;
   generated: number;
   skipped: number;
+  simulatedHours: number;
+  generatedPerSimulatedDay: number;
   distributions: {
     path: Record<string, number>;
     opportunitySource: Record<string, number>;
@@ -109,10 +139,18 @@ export interface ThoughtLabMetrics {
   spontaneousMetaLeakageRate: number;
   spontaneousTaskPressureRate: number;
   truncatedThoughtRate: number;
+  meaningfulThoughtRate: number;
+  groundedThoughtRate: number;
+  averageNoveltyScore: number;
   reviewNeeded: string[];
 }
 
 type Random = RandomSource;
+type OpportunityProgressState = {
+  cognitiveMove: string;
+  evidenceIds: string[];
+  stateFingerprint: string;
+};
 
 function mulberry32(seed: number): Random {
   let state = seed >>> 0;
@@ -129,7 +167,30 @@ function topicKey(content: string): string {
   return contentTokens(content).slice(0, 5).sort().join("|");
 }
 
-function buildContext(ego: EgoState, now: number): ThoughtGenerationContext {
+function opportunityDiversityKey(opportunity: DetectedThoughtOpportunity): string {
+  if (opportunity.type === "bond-deepen" || opportunity.suggestedAction === "proactive-check-in") {
+    return "family:relationship-outreach";
+  }
+  if (opportunity.suggestedAction === "proactive-content-push") return "family:proactive-content-push";
+  const stableDetail = opportunity.triggerDetail
+    .toLocaleLowerCase()
+    .replace(/\d+(?:\.\d+)?/g, "#")
+    .replace(/\s+/g, " ")
+    .slice(0, 180);
+  return `${opportunity.suggestedAction ?? opportunity.type}|${opportunity.source}|${stableDetail}`;
+}
+
+function opportunityRestMs(opportunity: DetectedThoughtOpportunity): number {
+  if (opportunity.type === "bond-deepen" || opportunity.suggestedAction === "proactive-check-in") {
+    return 24 * 60 * 60_000;
+  }
+  if (opportunity.suggestedAction === "proactive-content-push") return 24 * 60 * 60_000;
+  if (opportunity.type === "memory-resurface") return 24 * 60 * 60_000;
+  if (opportunity.type === "conversation-replay") return 12 * 60 * 60_000;
+  return 6 * 60 * 60_000;
+}
+
+function buildContext(ego: EgoState, now: number, thoughtFrequency = 1): ThoughtGenerationContext {
   return {
     ego,
     recentInteractions: ego.totalInteractions,
@@ -144,7 +205,19 @@ function buildContext(ego: EgoState, now: number): ThoughtGenerationContext {
     recentMemories: [...ego.memories].sort((a, b) => b.timestamp - a.timestamp).slice(0, 5),
     activeGoals: ego.goals.filter((goal) => goal.status === "active"),
     contextHints: [],
+    thoughtFrequency,
   };
+}
+
+function labCycleDue(ctx: ThoughtGenerationContext): boolean {
+  const frequency = Math.max(0.1, Math.min(5, ctx.thoughtFrequency ?? 1));
+  if (ctx.timeSinceLastThought < 3 * 60_000 * frequency) return false;
+  if (ctx.timeSinceLastInteraction < 3 * 60_000 * frequency) return false;
+  if (ctx.urgentNeeds.length > 0) return ctx.timeSinceLastThought >= 5 * 60_000 * frequency;
+  if (ctx.timeSinceLastInteraction > 60 * 60_000 * frequency) {
+    return ctx.timeSinceLastThought >= 45 * 60_000 * frequency;
+  }
+  return ctx.timeSinceLastThought >= 15 * 60_000 * frequency;
 }
 
 function compactOpportunity(opportunity: DetectedThoughtOpportunity): DetectedThoughtOpportunity {
@@ -162,8 +235,30 @@ function inferSourceMemories(opportunity: DetectedThoughtOpportunity, ego: EgoSt
     .map(({ memory }) => memory);
 }
 
-function currentThoughtPrompt(opportunity: DetectedThoughtOpportunity, ctx: ThoughtGenerationContext): string {
+function inferThoughtSourceMemories(thought: Thought, ego: EgoState): SoulMemory[] {
+  const needle = contentTokens(thought.content);
+  if (needle.length === 0) return [];
+  return ego.memories
+    .map((memory) => ({
+      memory,
+      score: jaccard(needle, contentTokens(`${memory.content} ${memory.tags.join(" ")}`)),
+    }))
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3)
+    .map(({ memory }) => memory);
+}
+
+function currentThoughtPrompt(
+  opportunity: DetectedThoughtOpportunity,
+  ctx: ThoughtGenerationContext,
+  recentContents: string[],
+  recentMoves: string[],
+): string {
   const recent = ctx.recentMemories.map((memory) => `- ${memory.content.slice(0, 160)}`).join("\n") || "- none";
+  const explored = recentContents.slice(-6)
+    .map((content) => `- ${content.replace(/\s+/g, " ").slice(0, 200)}`)
+    .join("\n") || "- none";
   return `Generate one private thought for an AI companion from the selected opportunity.
 
 Opportunity: ${opportunity.triggerDetail}
@@ -171,50 +266,93 @@ Motivation: ${opportunity.motivation}
 Recent memory snapshot:
 ${recent}
 
-Write 1-2 specific sentences. Preserve the intent of the opportunity. Do not explain your answer.`;
+Recent thoughts already explored:
+${explored}
+
+Recent reasoning approaches: ${recentMoves.filter((move) => move !== "silence").slice(-4).join(", ") || "none"}
+
+Add a new grounded connection, correction, causal explanation,
+counterexample, comparison, synthesis, experiment design, decision-changing
+question, or actionable conclusion. Prefer a useful reasoning approach that has
+not just dominated. Do not paraphrase a recent thought. If there is no
+information advance, return exactly NO_THOUGHT.
+Silence, elapsed time, or a desire to reconnect is not evidence by itself. Do
+not force an unrelated technical memory into a relationship or outreach
+justification. Return NO_THOUGHT when the opportunity has no concrete value.
+For a complex problem, the same topic and reasoning approach may continue only
+when new user/tool/web evidence or changed state advances
+hypothesis -> test/observation -> result -> revision. State that delta.
+Write the complete thought directly without explaining these instructions.`;
 }
 
 async function generateCurrent(
   ctx: ThoughtGenerationContext,
   recentTypes: string[],
   recentContents: string[],
+  recentMoves: string[],
+  lastStimulusAt: Map<string, number>,
+  lastStimulusProgress: Map<string, OpportunityProgressState>,
+  now: number,
   llmGenerator?: LLMThoughtGenerator,
 ): Promise<{ opportunities: DetectedThoughtOpportunity[]; selected: DetectedThoughtOpportunity | null; thought: Thought | null }> {
   const opportunities = detectThoughtOpportunities(ctx);
-  const nonRepeating = opportunities.filter((opportunity) =>
-    isExecutionFocusedOpportunity(opportunity) || !recentTypes.includes(opportunity.type),
+  const restedOpportunities = opportunities.filter((opportunity) => {
+    if (isDiversityExemptOpportunity(opportunity)) return true;
+    const lastAt = lastStimulusAt.get(opportunityDiversityKey(opportunity)) ?? 0;
+    return lastAt === 0 || now - lastAt >= opportunityRestMs(opportunity);
+  });
+  const diverse = restedOpportunities.filter((opportunity) =>
+    isDiversityExemptOpportunity(opportunity) || !recentTypes.includes(opportunity.type),
   );
-  let selected = nonRepeating[0] ?? opportunities[0] ?? null;
-  if (!selected) return { opportunities, selected: null, thought: null };
+  const candidates = [
+    ...diverse,
+    ...restedOpportunities.filter((opportunity) => !diverse.includes(opportunity)),
+  ];
+  if (candidates.length === 0) return { opportunities, selected: null, thought: null };
 
-  const build = async (opportunity: DetectedThoughtOpportunity): Promise<Thought> => {
+  const build = async (opportunity: DetectedThoughtOpportunity): Promise<Thought | null> => {
     const thought = buildThoughtFromOpportunity(opportunity, ctx.ego);
-    if (llmGenerator && opportunity.priority > 30 && !isExecutionFocusedOpportunity(opportunity)) {
-      const generated = (await llmGenerator(currentThoughtPrompt(opportunity, ctx)))
+    if (llmGenerator && opportunity.priority > 30) {
+      const generated = (await llmGenerator(currentThoughtPrompt(
+        opportunity,
+        ctx,
+        recentContents,
+        recentMoves,
+      )))
         .replace(/<think>[\s\S]*?<\/think>/gi, "")
         .trim();
-      if (generated) thought.content = generated.slice(0, 500);
+      if (generated) thought.content = generated;
     }
+    if (isDiversityExemptOpportunity(opportunity)) return thought;
+    const key = opportunityDiversityKey(opportunity);
+    const sourceMemories = inferSourceMemories(opportunity, ctx.ego);
+    const currentProgress = buildThoughtProgressSnapshot(opportunity, sourceMemories);
+    const previousProgress = lastStimulusProgress.get(key);
+    const assessment = assessThoughtAdvance(thought.content, recentContents, recentMoves, {
+      evidenceIds: currentProgress.evidenceIds,
+      previousEvidenceIds: previousProgress?.evidenceIds,
+      stateFingerprint: currentProgress.stateFingerprint,
+      previousStateFingerprint: previousProgress?.stateFingerprint,
+    });
+    if (!assessment.accepted) return null;
+    if (previousProgress?.cognitiveMove === assessment.cognitiveMove && !assessment.verifiedProgress) return null;
+    lastStimulusProgress.set(key, {
+      cognitiveMove: assessment.cognitiveMove,
+      ...currentProgress,
+    });
     return thought;
   };
 
-  let thought = await build(selected);
-  const repeatsRecentTopic = (content: string) => recentContents.some((recent) =>
-    jaccard(contentTokens(recent), contentTokens(content)) >= 0.55,
-  );
-  if (!isExecutionFocusedOpportunity(selected) && repeatsRecentTopic(thought.content)) {
-    const retry = nonRepeating.find((opportunity) => opportunity.type !== selected?.type);
-    if (retry) {
-      selected = retry;
-      thought = await build(retry);
-      if (!isExecutionFocusedOpportunity(retry) && repeatsRecentTopic(thought.content)) {
-        return { opportunities, selected, thought: null };
-      }
-    } else {
-      return { opportunities, selected, thought: null };
+  let lastSelected: DetectedThoughtOpportunity | null = candidates[0] ?? null;
+  for (const candidate of candidates.slice(0, 12)) {
+    lastSelected = candidate;
+    if (!isDiversityExemptOpportunity(candidate)) {
+      lastStimulusAt.set(opportunityDiversityKey(candidate), now);
     }
+    const thought = await build(candidate);
+    if (thought) return { opportunities, selected: candidate, thought };
   }
-  return { opportunities, selected, thought };
+  return { opportunities, selected: lastSelected, thought: null };
 }
 
 async function generateSpontaneous(
@@ -222,8 +360,9 @@ async function generateSpontaneous(
   random: Random,
   llmGenerator: LLMThoughtGenerator,
   usageCounts?: Map<string, number>,
+  now = Date.now(),
 ): Promise<{ selected: DetectedThoughtOpportunity; thought: Thought; memories: SoulMemory[] }> {
-  const memories = selectRemoteMemoryPair(ctx.ego.memories, random, Date.now(), usageCounts);
+  const memories = selectRemoteMemoryPair(ctx.ego.memories, random, now, usageCounts);
   if (memories.length < 2) {
     throw new Error("Spontaneous path needs at least two usable memories in the snapshot");
   }
@@ -298,6 +437,20 @@ export function calculateThoughtLabMetrics(records: ThoughtLabRecord[]): Thought
   let associationRecords = 0;
   let pairDistanceTotal = 0;
   let pairCount = 0;
+  const effectiveMove = (record: ThoughtLabRecord): string =>
+    record.thought ? classifyCognitiveMove(record.thought.content) : "none";
+  const effectiveMeaningful = (record: ThoughtLabRecord): boolean => {
+    if (!record.thought) return false;
+    const flags = classifyThoughtQualityFlags(record.thought.content);
+    const disqualified = flags.some((flag) =>
+      flag === "meta-framing"
+      || flag === "forced-association"
+      || flag === "empty-intention"
+      || flag === "truncated");
+    return !disqualified
+      && (record.noveltyScore ?? 0) >= 0.45
+      && (record.grounded === true || Boolean(record.actionType && record.actionType !== "none"));
+  };
 
   records.forEach((record) => {
     increment(distributions.path, record.path);
@@ -312,7 +465,7 @@ export function calculateThoughtLabMetrics(records: ThoughtLabRecord[]): Thought
     increment(distributions.thoughtType, record.thoughtType ?? "none");
     increment(distributions.actionType, record.actionType ?? "none");
     if (record.thought) {
-      increment(distributions.cognitiveMove, record.cognitiveMove);
+      increment(distributions.cognitiveMove, effectiveMove(record));
       const qualityFlags = classifyThoughtQualityFlags(record.thought.content);
       for (const flag of qualityFlags) increment(distributions.qualityFlag, flag);
       for (const memory of record.sourceMemories) {
@@ -337,7 +490,7 @@ export function calculateThoughtLabMetrics(records: ThoughtLabRecord[]): Thought
     const previous = generated[index - 1];
     if (!previous?.thought || !record.thought) return;
     if (jaccard(contentTokens(previous.thought.content), contentTokens(record.thought.content)) >= 0.55) sameTopic += 1;
-    if (previous.cognitiveMove === record.cognitiveMove) repeatedMove += 1;
+    if (effectiveMove(previous) === effectiveMove(record)) repeatedMove += 1;
   });
 
   const semanticSample = generated.slice(0, 100);
@@ -353,10 +506,18 @@ export function calculateThoughtLabMetrics(records: ThoughtLabRecord[]): Thought
 
   const transitions = Math.max(0, generated.length - 1);
   const spontaneous = generated.filter((record) => record.path === "spontaneous");
+  const simulatedHours = records.length > 0
+    ? Math.max(0, ...records.map((record) => record.elapsedMinutes ?? 0)) / 60
+    : 0;
+  const noveltyTotal = generated.reduce((sum, record) => sum + (record.noveltyScore ?? 0), 0);
   return {
     runs: records.length,
     generated: generated.length,
     skipped: records.length - generated.length,
+    simulatedHours: Number(simulatedHours.toFixed(2)),
+    generatedPerSimulatedDay: simulatedHours > 0
+      ? Number((generated.length / simulatedHours * 24).toFixed(2))
+      : generated.length,
     distributions,
     noOpRate: rate(generated.filter((record) => !record.actionType || record.actionType === "none").length, generated.length),
     sameTopicRepetitionRate: rate(sameTopic, transitions),
@@ -377,6 +538,9 @@ export function calculateThoughtLabMetrics(records: ThoughtLabRecord[]): Thought
       generated.filter((record) => classifyThoughtQualityFlags(record.thought?.content ?? "").includes("truncated")).length,
       generated.length,
     ),
+    meaningfulThoughtRate: rate(generated.filter(effectiveMeaningful).length, generated.length),
+    groundedThoughtRate: rate(generated.filter((record) => record.grounded === true).length, generated.length),
+    averageNoveltyScore: generated.length === 0 ? 0 : Number((noveltyTotal / generated.length).toFixed(4)),
     reviewNeeded: [
       "useful surprise rate requires blind human review",
       "nonsense rate requires blind human review",
@@ -393,7 +557,14 @@ export async function runThoughtLab(options: ThoughtLabOptions = {}): Promise<{
   records: ThoughtLabRecord[];
   metrics: ThoughtLabMetrics;
 }> {
-  const runs = Math.max(1, Math.floor(options.runs ?? 200));
+  const stepMinutes = Math.max(1, options.stepMinutes ?? 30);
+  const simulatedRuns = options.simulatedHours === undefined
+    ? undefined
+    : Math.ceil(Math.max(0, options.simulatedHours) * 60 / stepMinutes) + 1;
+  const runs = Math.max(1, Math.floor(options.runs ?? simulatedRuns ?? 200));
+  const startTime = options.startTime ?? Date.now();
+  const thoughtFrequency = Math.max(0.1, Math.min(5, options.thoughtFrequency ?? 1));
+  const respectScheduling = options.respectScheduling ?? options.simulatedHours !== undefined;
   const mode = options.mode ?? "baseline";
   const spontaneousRate = mode === "experiment"
     ? Math.max(0, Math.min(1, options.spontaneousRate ?? 0.2))
@@ -409,13 +580,24 @@ export async function runThoughtLab(options: ThoughtLabOptions = {}): Promise<{
   const recentTypes: string[] = [];
   const recentTopics: string[] = [];
   const recentContents: string[] = [];
+  const recentMoves: string[] = [];
   const recentActions: string[] = [];
   const spontaneousMemoryUse = new Map<string, number>();
+  const lastActionAt = new Map<ActionType, number>();
+  const lastStimulusAt = new Map<string, number>();
+  const lastStimulusProgress = new Map<string, OpportunityProgressState>();
   const records: ThoughtLabRecord[] = [];
-  const now = Date.now();
-  const ctx = buildContext(ego, now);
+  const injectedEvidence = new Set<string>();
 
   for (let index = 0; index < runs; index += 1) {
+    const now = startTime + index * stepMinutes * 60_000;
+    const elapsedHours = (now - startTime) / 3_600_000;
+    for (const event of options.evidenceTimeline ?? []) {
+      if (event.atHour > elapsedHours || injectedEvidence.has(event.memory.id)) continue;
+      ego.memories.push({ ...event.memory, tags: [...event.memory.tags], timestamp: now });
+      injectedEvidence.add(event.memory.id);
+    }
+    const ctx = buildContext(ego, now, thoughtFrequency);
     const pathChoice: ThoughtLabPath = random() < spontaneousRate ? "spontaneous" : "current";
     const before = {
       thoughtTypes: [...recentTypes],
@@ -429,13 +611,24 @@ export async function runThoughtLab(options: ThoughtLabOptions = {}): Promise<{
     let skippedReason: string | undefined;
 
     try {
-      if (pathChoice === "spontaneous") {
-        const result = await generateSpontaneous(ctx, random, options.llmGenerator!, spontaneousMemoryUse);
+      if (respectScheduling && !labCycleDue(ctx)) {
+        skippedReason = "schedule-not-due";
+      } else if (pathChoice === "spontaneous") {
+        const result = await generateSpontaneous(ctx, random, options.llmGenerator!, spontaneousMemoryUse, now);
         selected = result.selected;
         thought = result.thought;
         sourceMemories = result.memories;
       } else {
-        const result = await generateCurrent(ctx, recentTypes, recentContents, options.llmGenerator);
+        const result = await generateCurrent(
+          ctx,
+          recentTypes,
+          recentContents,
+          recentMoves,
+          lastStimulusAt,
+          lastStimulusProgress,
+          now,
+          options.llmGenerator,
+        );
         opportunities = result.opportunities;
         selected = result.selected;
         thought = result.thought;
@@ -446,12 +639,49 @@ export async function runThoughtLab(options: ThoughtLabOptions = {}): Promise<{
       skippedReason = error instanceof Error ? error.message : String(error);
     }
 
+    if (thought && /^NO_THOUGHT[.!]?$/i.test(thought.content.trim())) {
+      thought = null;
+      skippedReason = "model-reported-no-information-advance";
+    }
+    if (thought) {
+      const resolved = [...sourceMemories, ...inferThoughtSourceMemories(thought, ego)];
+      sourceMemories = [...new Map(resolved.map((memory) => [memory.id, memory])).values()].slice(0, 3);
+    }
+    if (thought?.actionType && thought.actionType !== "none") {
+      const lastAt = lastActionAt.get(thought.actionType) ?? 0;
+      const cooldownMs = getActionCooldownMs(thought.actionType, thoughtFrequency);
+      if (lastAt > 0 && now - lastAt < cooldownMs) {
+        skippedReason = `action-cooldown:${thought.actionType}`;
+        thought = null;
+      }
+    }
     const key = thought ? topicKey(thought.content) : "";
     const move = thought ? classifyCognitiveMove(thought.content) : "none";
     const qualityFlags = thought ? classifyThoughtQualityFlags(thought.content) : [];
     const action = thought?.actionType ?? null;
+    const maxRecentSimilarity = thought
+      ? recentContents.reduce((highest, recent) => Math.max(
+        highest,
+        jaccard(contentTokens(recent), contentTokens(thought!.content)),
+      ), 0)
+      : 0;
+    const noveltyScore = thought ? Number((1 - maxRecentSimilarity).toFixed(4)) : 0;
+    const grounded = sourceMemories.length > 0;
+    const disqualifyingQuality = qualityFlags.some((flag) =>
+      flag === "meta-framing"
+      || flag === "forced-association"
+      || flag === "empty-intention"
+      || flag === "truncated");
+    const meaningful = Boolean(
+      thought
+      && !disqualifyingQuality
+      && noveltyScore >= 0.45
+      && (grounded || (action !== null && action !== "none")),
+    );
     records.push({
       run: index + 1,
+      simulatedAt: now,
+      elapsedMinutes: index * stepMinutes,
       path: pathChoice,
       context: {
         currentHour: ctx.currentHour,
@@ -486,18 +716,45 @@ export async function runThoughtLab(options: ThoughtLabOptions = {}): Promise<{
       cognitiveMove: move,
       qualityFlags,
       topicKey: key,
+      noveltyScore,
+      grounded,
+      meaningful,
       recentStateBefore: before,
       ...(skippedReason ? { skippedReason } : {}),
     });
 
     if (thought) {
+      ego.lastThoughtTime = now;
+      ego.totalThoughts += 1;
+      if (action && action !== "none") {
+        lastActionAt.set(action, now);
+        ego.behaviorLog.push({
+          id: `lab-${index + 1}-${action}`,
+          actionType: action,
+          thoughtType: thought.type,
+          hourOfDay: ctx.currentHour,
+          urgentNeeds: [...ctx.urgentNeeds],
+          outcome: "success",
+          timestamp: now,
+          resolvedAt: now,
+        });
+        if (action === "report-findings") {
+          for (const task of ego.activeTasks ?? []) {
+            if ((task.status === "completed" || task.status === "failed") && task.result) {
+              task.resultDelivered = true;
+            }
+          }
+        }
+      }
       recentTypes.push(thought.type);
       recentTopics.push(key);
       recentContents.push(thought.content);
+      recentMoves.push(move);
       recentActions.push(action ?? "none");
       if (recentTypes.length > 3) recentTypes.shift();
       if (recentTopics.length > 10) recentTopics.shift();
-      if (recentContents.length > 10) recentContents.shift();
+      if (recentContents.length > 32) recentContents.shift();
+      if (recentMoves.length > 6) recentMoves.shift();
       if (recentActions.length > 10) recentActions.shift();
     }
   }
@@ -505,7 +762,11 @@ export async function runThoughtLab(options: ThoughtLabOptions = {}): Promise<{
   return { records, metrics: calculateThoughtLabMetrics(records) };
 }
 
-type CliOptions = ThoughtLabOptions & { llmConfig?: SoulLLMConfig; inputPath?: string };
+type CliOptions = ThoughtLabOptions & {
+  llmConfig?: SoulLLMConfig;
+  inputPath?: string;
+  openclawConfigPath?: string;
+};
 
 function parseCliArgs(args: string[]): CliOptions {
   const parsed: CliOptions = {};
@@ -517,6 +778,11 @@ function parseCliArgs(args: string[]): CliOptions {
     if (key === "--store") parsed.storePath = value;
     else if (key === "--input") parsed.inputPath = value;
     else if (key === "--runs") parsed.runs = Number(value);
+    else if (key === "--simulated-hours") parsed.simulatedHours = Number(value);
+    else if (key === "--step-minutes") parsed.stepMinutes = Number(value);
+    else if (key === "--start-time") parsed.startTime = Number(value);
+    else if (key === "--thought-frequency") parsed.thoughtFrequency = Number(value);
+    else if (key === "--respect-scheduling") parsed.respectScheduling = value !== "false";
     else if (key === "--mode" && (value === "baseline" || value === "experiment")) parsed.mode = value;
     else if (key === "--spontaneous-rate") parsed.spontaneousRate = Number(value);
     else if (key === "--seed") parsed.seed = Number(value);
@@ -525,10 +791,21 @@ function parseCliArgs(args: string[]): CliOptions {
     else if (key === "--model") parsed.llmConfig = { ...parsed.llmConfig, model: value };
     else if (key === "--api-key-env") parsed.llmConfig = { ...parsed.llmConfig, apiKeyEnv: value };
     else if (key === "--base-url") parsed.llmConfig = { ...parsed.llmConfig, baseUrl: value };
+    else if (key === "--openclaw-config") parsed.openclawConfigPath = value;
     else if (key === "--max-tokens") parsed.llmConfig = { ...parsed.llmConfig, maxTokens: Number(value) };
     else throw new Error(`Unknown or invalid argument: ${key} ${value}`);
   }
   if (parsed.runs !== undefined && (!Number.isFinite(parsed.runs) || parsed.runs < 1)) throw new Error("--runs must be >= 1");
+  if (parsed.simulatedHours !== undefined && (!Number.isFinite(parsed.simulatedHours) || parsed.simulatedHours < 0)) {
+    throw new Error("--simulated-hours must be >= 0");
+  }
+  if (parsed.stepMinutes !== undefined && (!Number.isFinite(parsed.stepMinutes) || parsed.stepMinutes < 1)) {
+    throw new Error("--step-minutes must be >= 1");
+  }
+  if (parsed.startTime !== undefined && !Number.isFinite(parsed.startTime)) throw new Error("--start-time must be epoch milliseconds");
+  if (parsed.thoughtFrequency !== undefined && (!Number.isFinite(parsed.thoughtFrequency) || parsed.thoughtFrequency <= 0)) {
+    throw new Error("--thought-frequency must be > 0");
+  }
   if (parsed.seed !== undefined && !Number.isFinite(parsed.seed)) throw new Error("--seed must be a number");
   return parsed;
 }
@@ -552,7 +829,12 @@ async function main(): Promise<void> {
       throw new Error("Both --provider and --model are required when enabling LLM generation");
     }
     options.llmConfig.maxTokens ??= 192;
-    options.llmGenerator = await createSoulLLMGenerator(options.llmConfig) ?? undefined;
+    let openclawConfig: Parameters<typeof createSoulLLMGenerator>[1];
+    if (options.openclawConfigPath) {
+      const rawConfig = await fs.promises.readFile(path.resolve(options.openclawConfigPath), "utf8");
+      openclawConfig = JSON.parse(rawConfig) as Parameters<typeof createSoulLLMGenerator>[1];
+    }
+    options.llmGenerator = await createSoulLLMGenerator(options.llmConfig, openclawConfig) ?? undefined;
     if (!options.llmGenerator) throw new Error("Could not create LLM generator; check API key configuration");
   }
   const result = await runThoughtLab(options);

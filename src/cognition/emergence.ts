@@ -24,10 +24,10 @@ If no distinct verbal thought forms, output exactly NO_THOUGHT.
 ${language ? `Use language compatible with: ${language}.` : "Use the natural language of the materials."}
 
 Otherwise return only compact JSON in this exact shape:
-{"thought":"the private thought","cognitiveMove":"question|analogy|speculation|recommendation|research|problem-solving|outreach|follow-up|confusion|reflection","qualityFlags":[]}
+{"thought":"the private thought","cognitiveMove":"question|analogy|speculation|recommendation|research|problem-solving|causal-analysis|counterexample|comparison|synthesis|experiment-design|prioritization|reframing|release|outreach|follow-up|confusion|reflection","qualityFlags":[]}
 
 Classify cognitiveMove and qualityFlags by meaning regardless of the language used in thought.
-qualityFlags may contain "meta-framing", "forced-association", or "task-pressure". Do not add markdown.`;
+qualityFlags may contain "meta-framing", "forced-association", "task-pressure", or "empty-intention". Do not add markdown.`;
 }
 
 function cleanOutput(raw: string): string {

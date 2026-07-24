@@ -29,7 +29,14 @@ For periodic self-improvement, Soul uses the full `subagent-improve` tool chain 
 | **Default** | `1.0` |
 | **Command** | `openclaw config set plugins.entries.soul.config.thoughtFrequency 0.5` |
 
-Multiplier for how often Soul generates thoughts and sends messages. Values below `0.5` enter observation-test mode: thought budgets are higher, proactive outreach cooldowns are minutes rather than hours, and startup greetings can repeat after about 30 minutes.
+Multiplier for how often Soul generates thoughts and attempts actions. By
+default it also controls proactive message pacing for backward compatibility.
+Set `expressionFrequency` separately when you want accelerated cognition without
+accelerated user-visible messages. Values below `0.5` enter observation-test
+mode: thought budgets are higher, action cooldowns are shorter, and startup
+greetings can repeat after about 30 minutes. Topic-family rest is deliberately
+not shortened: relationship outreach and proactive content retain a 24-hour
+cognitive cooldown so accelerated tests do not train or hide obsessive loops.
 
 | Value | Behavior |
 |-------|----------|
@@ -37,6 +44,26 @@ Multiplier for how often Soul generates thoughts and sends messages. Values belo
 | `0.5` | Chatty — 2x more active than default |
 | `1.0` | Default — balanced (8-12 min active, 20-45 min away) |
 | `2.0` | Quiet — 2x less frequent |
+
+### `expressionFrequency`
+
+| | |
+|---|---|
+| **Type** | `number` |
+| **Default** | same as `thoughtFrequency` |
+| **Command** | `openclaw config set plugins.entries.soul.config.expressionFrequency 1.0` |
+
+Controls the minimum interval between ordinary user-visible proactive messages.
+Task-result delivery and startup greetings follow their own rules.
+This is the recommended testing configuration:
+
+```bash
+openclaw config set plugins.entries.soul.config.thoughtFrequency 0.3
+openclaw config set plugins.entries.soul.config.expressionFrequency 1.0
+```
+
+Soul then thinks and tests actions quickly while preserving normal production
+message pacing.
 
 ### `enabled`
 
@@ -108,6 +135,12 @@ Controls associative breadth only within the private Activation/Workspace path.
 The setting never bypasses evidence, Attention, Expression, permission, or
 delivery gates. Active troubleshooting and explicit task pressure narrow the
 workspace automatically in every mode.
+
+Thought diversity does not force topic switching during complex work. A
+same-topic or same-operation pass is accepted when trusted user/tool/web
+evidence or the observed problem state has changed since the prior pass. Merely
+waiting longer, regenerating the same model claim, or paraphrasing it does not
+count as progress.
 
 ### `expressionPolicy`
 

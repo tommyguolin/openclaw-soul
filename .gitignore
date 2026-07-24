@@ -7,3 +7,8 @@ dist/
 !.env.example
 *.tsbuildinfo
 openclaw-soul-next-chat-handoff-*.md
+results/*.jsonl
+results/*.summary.json
+results/*synthetic*ego*.json
+resultsthought-*.jsonl
+resultsthought-*.summary.json

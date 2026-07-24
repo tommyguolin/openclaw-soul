@@ -1556,7 +1556,7 @@ async function executeBoundedLocalAgentTask(
     result: {
       type: "run-agent-task",
       success: status === "partial",
-      result: report.slice(0, 500),
+      result: report,
       data: { taskId, resultFilePath, status, filesInspected: sourceFiles.length },
     },
     metricsChanged: [
@@ -1773,7 +1773,7 @@ Remaining risk or a sensible next improvement.`;
     result: {
       type: "run-agent-task",
       success,
-      result: report.slice(0, 500),
+      result: report,
       data: { taskId, resultFilePath, status: taskStatus, runId: subResult.runId },
     },
     metricsChanged: [
@@ -3037,7 +3037,7 @@ Remaining risk or a sensible next improvement.`;
     result: {
       type: "subagent-improve",
       success,
-      result: report.slice(0, 500),
+      result: report,
       data: {
         taskId,
         resultFilePath,
@@ -3425,18 +3425,24 @@ export async function pollActiveTasks(
         }
         continue;
       }
-      if (task.status !== "in-progress") continue;
+      const isTerminalTask = task.status === "completed" || task.status === "failed";
+      if (task.status !== "in-progress" && !(isTerminalTask && !task.resultDelivered)) continue;
 
       // Check result file first — re-read even if task.result exists but
-      // the file was updated after task.updatedAt (the subagent may have
-      // written a complete report slightly after the settle window closed).
+      // the task currently holds a non-final result or the file was updated
+      // after task.updatedAt (the subagent may have written a complete report
+      // slightly after the settle window closed).
       if (task.resultFilePath) {
+        const storedResultIsFinal = !!task.result && isFinalTaskReport(task.result);
         const fileIsNewer = !!task.result && (() => {
           try {
             return statSync(task.resultFilePath).mtimeMs > task.updatedAt;
           } catch { return false; }
         })();
-        if (!task.result || fileIsNewer) {
+        const shouldReadResultFile = isTerminalTask
+          ? !task.resultDelivered
+          : !storedResultIsFinal || fileIsNewer;
+        if (shouldReadResultFile) {
           try {
             const content = readFileSync(task.resultFilePath, "utf-8").trim();
             if (content && isFinalTaskReport(content)) {
@@ -3450,6 +3456,8 @@ export async function pollActiveTasks(
           } catch { /* file not ready yet */ }
         }
       }
+
+      if (isTerminalTask) continue;
 
       // Fallback: try to extract result from session files — but only after
       // the stale timeout has elapsed. Running this while the session is still
